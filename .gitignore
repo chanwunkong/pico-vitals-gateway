@@ -1,0 +1,13 @@
+# CMake build output
+build/
+
+# 編輯器/工具產生的暫存檔
+.vscode/
+.claude/
+*.o
+*.obj
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
