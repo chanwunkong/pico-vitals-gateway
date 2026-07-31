@@ -1,6 +1,8 @@
 # pico — Raspberry Pi Pico W 生理訊號中繼裝置
 
-專案規劃與目前進度見 [PROJECT_PLAN.md](PROJECT_PLAN.md)。
+專案規劃與目前進度見 [PROJECT_PLAN.md](PROJECT_PLAN.md)（含「在新電腦上接續開發」步驟）。
+
+GitHub（private）：https://github.com/chanwunkong/pico-vitals-gateway
 
 ## 開發環境（已裝好）
 
@@ -32,6 +34,6 @@ copy build\pico_gateway.uf2 D:\
 
 - 狀態機（開機 BOOTSEL 視窗 → 熱點設定 / BLE 接收 / 上傳）、LED 燈號、flash/RAM 儲存已建立並在實機驗證正常運作。
 - **BLE 接收模式已完整打通**，實測能連線 FORA IR42 額溫槍並正確解析出體溫數值。真實協定跟一開始從官方標準文件假設的完全不同，細節見 [PROJECT_PLAN.md](PROJECT_PLAN.md) 第 7.1 節。
-- `src/upload_api.c` 仍是 TODO stub，等實際上傳 API 規格確定後再實作。
-- `src/mode_ap_config.c` 已寫好但尚未實機驗證，需要的 `dhcpserver.c`/`dnsserver.c` 已放在專案根目錄（複製自 pico-examples）。
+- `src/upload_api.c` 仍是 TODO stub，還沒接上任何伺服器。`test_server/app.py` 是本機測試用的簡易上傳伺服器（純 Python 標準函式庫，`python test_server/app.py` 直接跑），已驗證能收 POST、網頁顯示收到的資料，API 格式見 `test_server/README.md`。下次接續開發建議優先把 `upload_api.c` 接上這個測試伺服器。
+- `src/mode_ap_config.c` 已寫好、相依的 `dhcpserver.c`/`dnsserver.c` 也已放進專案根目錄，但整個熱點設定流程尚未實機驗證。
 - 已知待辦：FORA IR42 量測後會持續廣播一段時間，目前每次掃到都會重新連線觸發，同一次量測可能被重複記錄，見 PROJECT_PLAN.md 第 7 節第 8 點。

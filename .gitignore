@@ -11,3 +11,6 @@ build/
 *.bin
 *.hex
 *.map
+
+# 本機測試伺服器執行時的 log
+test_server/server.log

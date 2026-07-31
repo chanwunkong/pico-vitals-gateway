@@ -5,10 +5,26 @@
 - ✅ 開發環境（pico-sdk v2.3.0、ARM 工具鏈、CMake、Ninja、MinGW）已裝好，可在本機編譯燒錄。
 - ✅ 專案骨架（狀態機、BOOTSEL 開機視窗、LED 燈號、flash/RAM 儲存）已建立，實機驗證運作正常。
 - ✅ **BLE 接收模式已完整打通，實機驗證能正確收到真實體溫數值**（FORA IR42 實測 37.00°C）。實際協定跟一開始從官方標準文件假設的完全不同，細節記錄在第 7.1 節，之後接其他裝置時務必先看過。
-- ⬜ 上傳模式（`upload_api.c`）仍是 TODO stub，等實際 API 規格才能實作。
-- ⬜ 熱點設定模式（`mode_ap_config.c`）程式碼已寫好但尚未實機驗證（還缺 `dhcpserver.c`/`dnsserver.c`，見第 7 節第 6 點）。
+- ✅ `dhcpserver.c/.h`、`dnsserver.c/.h` 已複製進專案根目錄，`mode_ap_config.c` 的相依已補齊（但整體尚未實機驗證，見下）。
+- ✅ 本機測試用上傳伺服器 `test_server/app.py`（純 Python 標準函式庫，免安裝）已寫好並驗證能收 POST、顯示網頁，見 `test_server/README.md` 的暫定 API 格式。
+- ✅ 專案已建立 git repo 並備份到 GitHub private repo：`https://github.com/chanwunkong/pico-vitals-gateway`。
+- ⬜ **上傳模式（`upload_api.c`）尚未實作**：還沒接上 `test_server`，需要用 lwIP `altcp` API 手刻 HTTP POST（見第 7 節第 2 點）。這是下次接續開發建議優先做的項目。
+- ⬜ 熱點設定模式（`mode_ap_config.c`）程式碼已寫好但尚未實機驗證。
 - ⬜ 待傳資料目前只放在 RAM，尚未落地到 flash（見第 7 節第 4 點）。
-- ⬜ 已知問題：裝置量測後會持續廣播一段時間，目前每次掃到都會重新連線觸發，同一次量測可能被重複記錄成好幾筆一樣的資料，尚未加防重複機制。
+- ⬜ 已知問題：裝置量測後會持續廣播一段時間，目前每次掃到都會重新連線觸發，同一次量測可能被重複記錄成好幾筆一樣的資料，尚未加防重複機制（見第 7 節第 8 點）。
+
+## 0. 在新電腦上接續開發
+
+這份專案的 git 內容（原始碼、`PROJECT_PLAN.md`、`README.md`）已經備份到 GitHub，但**開發環境（pico-sdk、工具鏈）不在 git 裡**，換一台電腦要重新裝。步驟：
+
+1. `git clone https://github.com/chanwunkong/pico-vitals-gateway.git`（private repo，要先用 `gh auth login` 或個人帳號登入過 git 才 clone 得到）。
+2. 裝 VSCode 官方 **"Raspberry Pi Pico"** 擴充套件，跑一次 **Import Pico Project** 指向這個資料夾，讓它自動下載 SDK/工具鏈（最簡單，交給官方工具處理）。
+   - 或手動照這次的做法：`winget install Kitware.CMake`、`winget install Ninja-build.Ninja`、`winget install Arm.GnuArmEmbeddedToolchain`、`winget install BrechtSanders.WinLibs.POSIX.UCRT`（host 端編譯 pioasm/picotool 需要），再 `git clone --branch 2.3.0 --depth 1 --recurse-submodules --shallow-submodules https://github.com/raspberrypi/pico-sdk.git` 到本機任一路徑，並把該路徑設成使用者環境變數 `PICO_SDK_PATH`。
+3. 編譯：`cmake -S . -B build -G Ninja` 然後 `cmake --build build`。
+4. 燒錄：裝置接電腦、進 BOOTSEL 模式（若已在跑舊韌體，可用 `picotool reboot -u -f` 觸發），把 `build/pico_gateway.uf2` 複製到出現的 `RPI-RP2` 磁碟機。
+5. 除錯：VSCode 裝 **Serial Monitor** 擴充套件（`ms-vscode.vscode-serial-monitor`）看即時 log。
+
+下次建議先做的事：把 `upload_api.c` 接上 `test_server/app.py`（先在同一台機器上跑 server + 燒錄韌體測試，確認上傳流程能動之後，再確認 Pico 之後實際部署環境的 WiFi 是否能連到目標 API）。
 
 ## 1. 產品概述
 
@@ -137,7 +153,7 @@ pico/
 3. ~~**開發環境**~~ 已完成（2026-07-31）：pico-sdk v2.3.0、ARM 工具鏈、CMake、Ninja、MinGW（host 端編譯 pioasm/picotool 用）均已安裝並驗證可編譯燒錄，韌體已在實機上跑起來、確認 BLE 掃描與 USB 序列 log 正常。
 4. **待傳生理資料的持久化**：骨架階段 `storage.c` 只把待傳紀錄放在 RAM 環狀陣列（裝置設定則確實寫入 flash），原因是要正確手刻一個會被 24/7 連續寫入、跨 flash page 的 ring buffer，在沒有實機可編譯測試的情況下風險偏高，容易寫出「看起來合理但實際會壞資料」的程式碼。目前設計下，正常流程裡待傳資料在裝置手上的時間最多略多於 60 秒（BLE接收→上傳→清空），影響範圍是「上傳前意外斷電/重開機」才會遺失資料。正式量產前務必評估：(a) 改用 littlefs 做 wear-leveling 的持久化 ring buffer，或 (b) 至少把待傳資料落地成簡單的 flash 多 sector 輪替寫入，並在實機上驗證。
 5. **擴充其他廠牌裝置**：`fora_protocol.c` 之後可抽成通用 `ble_device_driver` 介面，讓 `mode_ble_receive.c` 依裝置類型分派解析器，目前先以單一 FORA 實作驗證整體流程可行。
-6. **`dhcpserver.c/.h`、`dnsserver.c/.h`**：`mode_ap_config.c` 需要這兩組 pico-examples 共用工具程式（`pico-examples/pico_w/wifi/dhcpserver/`、`.../dnsserver/`），骨架階段尚未複製進來，需在環境就緒後手動加入，見 `CMakeLists.txt` 底部註解。
+6. ~~**`dhcpserver.c/.h`、`dnsserver.c/.h`**~~ 已完成（2026-07-31）：這兩組 pico-examples 共用工具程式（來源 `pico-examples/pico_w/wifi/access_point_wifi_provisioning/{dhcpserver,dnsserver}/`）已複製進專案根目錄並加進 `CMakeLists.txt` 的編譯來源，`mode_ap_config.c` 的相依已補齊。但整個熱點設定模式流程本身尚未實機測試過。
 7. **熱點設定網頁**：`mode_ap_config.c` 用 lwIP raw TCP API 手刻一個極簡單的單連線 HTTP server（而非官方範例的 lwIP httpd + `makefsdata` codegen），換取骨架階段不需要額外建置工具鏈依賴；之後若要做更完整的設定頁（例如即時回顯目前設定值）可再評估要不要改回 httpd。
 8. **同一次量測重複記錄**：FORA IR42 量測後會持續廣播一段時間，目前 `mode_ble_receive.c` 每次掃到符合的廣播就會重新連線、送觸發指令，同一次量測可能因此被重複連線好幾次、`storage_append_record()` 被呼叫多次寫入完全相同的數值。需要加防重複機制，例如：記住最近一次已成功讀取的數值+時間，短時間內（例如 30~60 秒）看到同一顆裝置的廣播就不再重新連線；或是讀完之後暫停對該裝置的掃描比對一段時間。
 
