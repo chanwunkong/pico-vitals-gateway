@@ -25,6 +25,8 @@ typedef enum {
     VITAL_TYPE_TEMPERATURE,
     VITAL_TYPE_SPO2,
     VITAL_TYPE_PULSE_RATE,
+    VITAL_TYPE_SYSTOLIC,
+    VITAL_TYPE_DIASTOLIC,
 } vital_type_t;
 
 typedef enum {

@@ -12,7 +12,7 @@
 #include <stdio.h>
 
 #define BOOT_CONFIG_WINDOW_MS      4000
-#define BLE_IDLE_UPLOAD_TRIGGER_MS 60000
+#define BLE_IDLE_UPLOAD_TRIGGER_MS 5000
 
 typedef enum {
     STATE_AP_CONFIG,

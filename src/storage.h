@@ -7,9 +7,11 @@
 // 設定資料存在 flash 最後一個保留 sector，寫入透過 flash_safe_execute() 執行，
 // 讀取直接用 XIP 位址存取（讀取不需要暫停中斷）。
 //
-// 生理資料（vital_record_t）骨架階段先用 RAM 環狀陣列存放待傳紀錄，
-// 尚未落地到 flash——裝置重開機會遺失尚未上傳的資料。
-// 正式量產前需評估升級成 littlefs（wear leveling），見 PROJECT_PLAN.md 第7節。
+// 生理資料（vital_record_t）待傳清單同樣會整份寫回 flash（config 前面再保留
+// 幾個 sector），每次新增/標記上傳結果都整份覆寫一次，所以斷電或上傳失敗
+// 都不會遺失尚未成功上傳的資料，重開機會自動讀回繼續重試。
+// 這個做法沒有 wear leveling，寫入頻率高的話會較快耗損那幾個 sector；
+// 正式量產前如果讀值頻率提高，需評估升級成 littlefs，見 PROJECT_PLAN.md 第7節。
 
 void storage_init(void);
 

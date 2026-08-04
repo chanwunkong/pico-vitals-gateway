@@ -13,7 +13,26 @@ records = []  # list of dict: {patient_id, type, value, received_at_ms, uploaded
 HOST = "0.0.0.0"
 PORT = 5000
 
-VITAL_TYPE_NAMES = {0: "unknown", 1: "temperature", 2: "spo2", 3: "pulse_rate"}
+VITAL_TYPE_NAMES = {
+    0: "unknown",
+    1: "temperature",
+    2: "spo2",
+    3: "pulse_rate",
+    4: "systolic",
+    5: "diastolic",
+}
+
+
+def format_received_at(ms):
+    if ms is None:
+        return ""
+    # 校時成功的話 received_at_ms 是真實世界的 epoch ms（一定是很大的數字，
+    # 對應到 2020 年以後）；沒校時成功會是 boot-relative ms（開機以來經過的
+    # 毫秒數，數值小很多），兩種用大小判斷、分開顯示，別把後者誤標成日期。
+    EPOCH_MS_THRESHOLD = 1_500_000_000_000  # 約 2017-07
+    if ms >= EPOCH_MS_THRESHOLD:
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{ms} (未校時，開機經過時間)"
 
 
 def render_html():
@@ -24,7 +43,7 @@ def render_html():
             rows += (
                 f"<tr><td>{r['uploaded_at']}</td><td>{r.get('patient_id', '')}</td>"
                 f"<td>{VITAL_TYPE_NAMES.get(r.get('type'), r.get('type'))}</td>"
-                f"<td>{r.get('value')}</td><td>{r.get('received_at_ms')}</td></tr>"
+                f"<td>{r.get('value')}</td><td>{format_received_at(r.get('received_at_ms'))}</td></tr>"
             )
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="5">
@@ -37,7 +56,7 @@ th{{background:#f4f4f4;}}
 </style></head><body>
 <h2>Pico 中繼裝置 - 收到的生理資料（測試用，每 5 秒自動重新整理）</h2>
 <p>目前累計 {count} 筆</p>
-<table><tr><th>收到時間(伺服器)</th><th>個案編號</th><th>類型</th><th>數值</th><th>裝置量測時間(ms since boot)</th></tr>
+<table><tr><th>收到時間(伺服器)</th><th>個案編號</th><th>類型</th><th>數值</th><th>裝置量測時間</th></tr>
 {rows}
 </table></body></html>"""
 

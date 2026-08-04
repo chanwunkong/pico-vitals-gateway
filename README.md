@@ -1,17 +1,16 @@
-# pico — Raspberry Pi Pico W 生理訊號中繼裝置
+# pico-vitals-gateway — Raspberry Pi Pico W 生理訊號中繼裝置
 
-專案規劃與目前進度見 [PROJECT_PLAN.md](PROJECT_PLAN.md)（含「在新電腦上接續開發」步驟）。
+專案規劃、目前進度、支援裝置協定細節、**測試交接事項**見 [PROJECT_PLAN.md](PROJECT_PLAN.md)。逐檔案程式碼導覽見 [FIRMWARE_FILES.md](FIRMWARE_FILES.md)。
 
 GitHub（private）：https://github.com/chanwunkong/pico-vitals-gateway
 
-## 開發環境（已裝好）
+## 開發環境
 
-本機已安裝並驗證可編譯燒錄：
-
-- pico-sdk v2.3.0（clone 在 `C:\Users\307\pico-sdk`，`PICO_SDK_PATH` 已設成使用者環境變數）
+- pico-sdk v2.3.0（`PICO_SDK_PATH` 設成使用者環境變數，指向 clone 的路徑）
 - ARM GNU Toolchain 14.2、CMake、Ninja（透過 winget 安裝）
-- MinGW-w64（WinLibs，供 host 端編譯 pioasm/picotool 用）
-- VSCode 官方 "Raspberry Pi Pico" 擴充套件（也提供了自己的一份 SDK/工具鏈於 `~/.pico-sdk`，內含含 USB 支援的 `picotool`，燒錄時優先用這份）
+- MinGW-w64（WinLibs，供 host 端編譯 pioasm/picotool 用——**這個常被漏掉**，漏了會導致編譯最後一步轉 `.uf2` 失敗）
+
+詳細安裝步驟、PowerShell 環境變數的已知問題，見 [PROJECT_PLAN.md](PROJECT_PLAN.md) 第 0 節。
 
 編譯：
 
@@ -20,20 +19,14 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ```
 
-燒錄（裝置目前若已在跑韌體，用 picotool 直接觸發重開機進 BOOTSEL 再複製 `.uf2`）：
+燒錄：**這台機器本機建置的 `picotool.exe` 沒有 `libusb-1.0.dll`，遠端觸發重開機（`picotool reboot -u -f`）用不了。** 改用手動方式：按住 BOOTSEL 讓裝置變成 `RPI-RP2` USB 隨身碟，再把 `.uf2` 複製過去：
 
 ```
-"C:\Users\307\.pico-sdk\picotool\2.3.0\picotool\picotool.exe" reboot -u -f
-# 等 D:\ 出現 RPI-RP2 磁碟機後
-copy build\pico_gateway.uf2 D:\
+copy build\pico_gateway.uf2 <RPI-RP2磁碟機>:\
 ```
 
-除錯：裝 VSCode 的 **Serial Monitor** 擴充套件（`ms-vscode.vscode-serial-monitor`），`Ctrl+Shift+P` → `Serial Monitor: Start Monitoring` → 選裝置的 COM port、baud rate 115200，即可即時看到韌體的 log。
+除錯：裝置會出現一個 USB CDC 序列埠，baud rate 115200，可用 VSCode 的 **Serial Monitor** 擴充套件或任何序列埠工具查看即時 log。
 
 ## 專案現況
 
-- 狀態機（開機 BOOTSEL 視窗 → 熱點設定 / BLE 接收 / 上傳）、LED 燈號、flash/RAM 儲存已建立並在實機驗證正常運作。
-- **BLE 接收模式已完整打通**，實測能連線 FORA IR42 額溫槍並正確解析出體溫數值。真實協定跟一開始從官方標準文件假設的完全不同，細節見 [PROJECT_PLAN.md](PROJECT_PLAN.md) 第 7.1 節。
-- `src/upload_api.c` 仍是 TODO stub，還沒接上任何伺服器。`test_server/app.py` 是本機測試用的簡易上傳伺服器（純 Python 標準函式庫，`python test_server/app.py` 直接跑），已驗證能收 POST、網頁顯示收到的資料，API 格式見 `test_server/README.md`。下次接續開發建議優先把 `upload_api.c` 接上這個測試伺服器。
-- `src/mode_ap_config.c` 已寫好、相依的 `dhcpserver.c`/`dnsserver.c` 也已放進專案根目錄，但整個熱點設定流程尚未實機驗證。
-- 已知待辦：FORA IR42 量測後會持續廣播一段時間，目前每次掃到都會重新連線觸發，同一次量測可能被重複記錄，見 PROJECT_PLAN.md 第 7 節第 8 點。
+三種 FORA 裝置（額溫槍、血氧計、血壓計）的連線與協定解析、WiFi 上傳、熱點設定模式都已實作並大致驗證過；血壓計的量測資料解析、24 小時等級的耐用性測試還沒做。**完整現況、已知問題、測試交接清單請看 [PROJECT_PLAN.md](PROJECT_PLAN.md)**，不要只看這份 README。

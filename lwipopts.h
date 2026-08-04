@@ -1,6 +1,8 @@
 #ifndef LWIPOPTS_H
 #define LWIPOPTS_H
 
+#include <stdint.h>
+
 // 改編自 pico-examples 各 pico_w wifi 範例共用的 lwipopts.h 樣板（NO_SYS=1，
 // 搭配 pico_cyw43_arch_lwip_threadsafe_background）。實際編譯若 lwIP 抱怨缺少
 // 巨集，請對照 pico-examples/pico_w/wifi/*/lwipopts.h 調整。
@@ -24,6 +26,27 @@
 #define LWIP_UDP                    1
 #define LWIP_DHCP                   1
 #define LWIP_DNS                    1
+
+// 開機時沒有網路，沒辦法知道真實時間；只有上傳那一刻 WiFi 連上時才有機會問
+// 網路上的 NTP 伺服器校時，把量測時的 boot-relative ms 換算成真實世界時間，
+// 見 wall_clock.c。SNTP_SET_SYSTEM_TIME_US 收到 NTP 回應時被 lwIP 呼叫，
+// wall_clock_sntp_set_system_time_us() 定義在 wall_clock.c。
+#define SNTP_SERVER_DNS             1
+#ifdef __cplusplus
+extern "C" {
+#endif
+void wall_clock_sntp_set_system_time_us(uint32_t sec, uint32_t us);
+#ifdef __cplusplus
+}
+#endif
+#define SNTP_SET_SYSTEM_TIME_US(sec, us) wall_clock_sntp_set_system_time_us(sec, us)
+// lwIP sntp.c 的註解要求用 SNTP 就要多留一個 timeout 插槽。
+#define MEMP_NUM_SYS_TIMEOUT        12
+
+// 上傳功能要打公開網際網路上的 https 網址（見 upload_api.c），需要 altcp + TLS。
+#define LWIP_ALTCP                  1
+#define LWIP_ALTCP_TLS              1
+#define LWIP_ALTCP_TLS_MBEDTLS      1
 #define LWIP_DHCP_DOES_ARP_CHECK    0
 #define LWIP_DHCP_DOESNT_CALL_NETIF_SET_UP 1
 
@@ -53,6 +76,11 @@
 #define LWIP_DEBUG                  1
 #define LWIP_STATS                  1
 #define LWIP_STATS_DISPLAY          1
+// 需要重新診斷 DHCP/WiFi 連線問題時，把這兩行取消註解（注意：這個 project
+// 目前是 Release build 會定義 NDEBUG，所以要暫時拿掉 NDEBUG 或搬到這個
+// #ifndef 區塊外面才會真的生效）。
+// #define DHCP_DEBUG                  LWIP_DBG_ON
+// #define NETIF_DEBUG                 LWIP_DBG_ON
 #endif
 
 #endif // LWIPOPTS_H
