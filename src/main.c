@@ -1,6 +1,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 
+#include "display_status.h"
 #include "led_status.h"
 #include "state_machine.h"
 #include "storage.h"
@@ -24,6 +25,12 @@ int main(void) {
 
     led_status_init();
     storage_init();
+
+    // Phase 1 硬體驗證畫面（display_status_show_boot_test()）不在正常開機流程
+    // 自動顯示——那是給開發/除錯用的技術性畫面，不是給使用者看的內容，開機後
+    // 幾乎立刻就會進 AP_CONFIG 或 BLE_RECEIVE，讓那個真正有意義的畫面接手。
+    // 需要重新確認接線/硬體是否正常時，可以暫時手動呼叫這個函式來測。
+    display_status_init();
 
     state_machine_run(); // 不會返回
     return 0;

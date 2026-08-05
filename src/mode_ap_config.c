@@ -1,6 +1,7 @@
 #include "mode_ap_config.h"
 
 #include "common.h"
+#include "display_status.h"
 #include "led_status.h"
 #include "storage.h"
 
@@ -461,6 +462,7 @@ void mode_ap_config_run(void) {
 
     printf("[AP_CONFIG] starting hotspot ssid=\"%s\"\n", AP_SSID);
     cyw43_arch_enable_ap_mode(AP_SSID, AP_PASSWORD, CYW43_AUTH_WPA2_AES_PSK);
+    display_status_show_ap_config(AP_SSID, AP_PASSWORD, s_have_current_config ? &s_current_config : NULL);
 
     ip4_addr_t gw, mask;
     IP4_ADDR(&gw, 192, 168, 4, 1);

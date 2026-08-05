@@ -54,6 +54,14 @@ typedef struct {
     struct altcp_pcb *pcb;
     volatile bool done;
     volatile bool success;
+    // 累積收到的回應開頭幾個 byte，跨越多次 on_recv() 呼叫——回應可能被
+    // TLS record／pbuf 邊界切成好幾段送達，如果只看「這一次」收到的那一小段
+    // 找 "200"，狀態列 "HTTP/1.1 200 OK" 剛好被切在中間（例如這次只收到
+    // "HTTP/1.1 2"，下次才收到 "00 OK..."）就會兩次都比對不到，明明伺服器
+    // 真的回了 200 也會被誤判成失敗（2026-08-05 實測抓到：伺服器端 log 顯示
+    // 資料確實收到、回應也是 200，但裝置這邊一直印 result: failed）。
+    char header_buf[128];
+    size_t header_len;
 } upload_ctx_t;
 
 static char s_request[REQUEST_BUF_SIZE];
@@ -71,6 +79,30 @@ static void append(char *buf, size_t buf_size, size_t *len, const char *fmt, ...
         size_t written = (size_t)n;
         size_t space = buf_size - *len - 1;
         *len += (written < space) ? written : space;
+    }
+}
+
+// 把字串當成 JSON 字串內容附加進 buf（外層的引號不包含在內，呼叫端自己包）。
+// patient_id 是 AP_CONFIG 表單的自由輸入欄位，內容完全不受控制——2026-08-05
+// 實測抓到一次真實案例：flash 裡存的 patient_id 混進了幾個控制字元（`\x01`、
+// `\x06`、`\x14`，很可能是很久以前某次測試殘留的資料，原因不明），沒有跳脫
+// 就直接塞進 JSON，導致伺服器端 `json.loads()` 解析失敗、每次上傳都回
+// 400 Bad Request，卻只回報「failed」看不出原因，直到加了這行請求內容的
+// debug log 才抓到。跟 `display_status.c` 的 WiFi QR code 那邊處理 SSID/
+// 密碼是同一個道理：使用者自由輸入的欄位，在塞進任何有格式規則的地方
+// （JSON、QR code）之前都要先跳脫/過濾，不能假設內容一定乾淨。
+static void append_json_escaped(char *buf, size_t buf_size, size_t *len, const char *text) {
+    if (text == NULL) {
+        return;
+    }
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) {
+        if (*p == '"' || *p == '\\') {
+            append(buf, buf_size, len, "\\%c", *p);
+        } else if (*p < 0x20) {
+            append(buf, buf_size, len, "\\u%04x", *p);
+        } else {
+            append(buf, buf_size, len, "%c", *p);
+        }
     }
 }
 
@@ -98,8 +130,9 @@ static size_t build_request(const char *patient_id, const vital_record_t *record
     char body[REQUEST_BUF_SIZE - 256];
     size_t body_len = 0;
 
-    append(body, sizeof(body), &body_len, "{\"patient_id\":\"%s\",\"readings\":[",
-           patient_id ? patient_id : "");
+    append(body, sizeof(body), &body_len, "{\"patient_id\":\"");
+    append_json_escaped(body, sizeof(body), &body_len, patient_id);
+    append(body, sizeof(body), &body_len, "\",\"readings\":[");
 
     for (size_t i = 0; i < count; i++) {
         char value_str[16];
@@ -144,13 +177,18 @@ static err_t on_recv(void *arg, struct altcp_pcb *conn, struct pbuf *p, err_t er
         return ERR_OK;
     }
 
-    char peek[RESPONSE_PEEK_SIZE];
-    uint16_t copy_len = p->tot_len < sizeof(peek) - 1 ? p->tot_len : sizeof(peek) - 1;
-    pbuf_copy_partial(p, peek, copy_len, 0);
-    peek[copy_len] = '\0';
+    // 累積進 header_buf（不是每次只看這次收到的片段），這樣「200」剛好被
+    // TCP/TLS 切成兩段送達也不會漏判，見 upload_ctx_t 裡的說明。
+    if (!ctx->success && ctx->header_len + 1 < sizeof(ctx->header_buf)) {
+        size_t space = sizeof(ctx->header_buf) - 1 - ctx->header_len;
+        uint16_t copy_len = p->tot_len < space ? p->tot_len : (uint16_t)space;
+        pbuf_copy_partial(p, ctx->header_buf + ctx->header_len, copy_len, 0);
+        ctx->header_len += copy_len;
+        ctx->header_buf[ctx->header_len] = '\0';
 
-    if (strstr(peek, "200") != NULL) {
-        ctx->success = true;
+        if (strstr(ctx->header_buf, "200") != NULL) {
+            ctx->success = true;
+        }
     }
 
     altcp_recved(conn, p->tot_len);
@@ -191,6 +229,11 @@ bool upload_api_post_batch(const char *patient_id, const vital_record_t *records
     }
 
     build_request(patient_id, records, count);
+    // 排查過伺服器回 400 Bad Request（代表 JSON 解析失敗）的問題，印出實際
+    // 組出來的請求，方便直接比對是不是 JSON 格式本身有問題（例如 patient_id
+    // 裡含有沒跳脫的雙引號／反斜線——AP_CONFIG 表單的 patient_id 是自由輸入
+    // 欄位，build_request() 目前組 JSON 時沒有對它做任何跳脫）。
+    printf("[UPLOAD_API] request:\n%s\n", s_request);
 
     // 1. 先解析 UPLOAD_SERVER_HOST 的 IP（tunnel 位址不是固定 IP，且 altcp_connect
     //    只接受 IP，SNI hostname 另外用 mbedtls_ssl_set_hostname() 設定）。
@@ -276,5 +319,12 @@ bool upload_api_post_batch(const char *patient_id, const vital_record_t *records
 
     altcp_tls_free_config(tls_config);
     printf("[UPLOAD_API] result: %s\n", ctx.success ? "success" : "failed");
+    if (!ctx.success) {
+        // 印出實際收到的回應開頭，方便排查——伺服器端可能其實有收到資料、
+        // 也回了 200，但這裡沒能正確判斷出來（曾經真的是這個原因，見
+        // on_recv() 的說明），或者伺服器真的回了別的狀態碼/完全沒回應。
+        printf("[UPLOAD_API]   response so far (%u bytes): %s\n",
+               (unsigned)ctx.header_len, ctx.header_len > 0 ? ctx.header_buf : "(none)");
+    }
     return ctx.success;
 }

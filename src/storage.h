@@ -31,4 +31,20 @@ size_t storage_pending_records(vital_record_t *out, size_t max_count);
 // 上傳成功的紀錄會被移除，失敗的保留供下次重試。
 void storage_mark_uploaded(size_t count, uint64_t uploaded_at_ms, bool success);
 
+// 查詢某一種生理數值「這次開機以來」最後一次收到的讀值，跟有沒有上傳成功無關
+// ——上傳成功的紀錄會從待傳佇列被移除（見 storage_mark_uploaded()），但畫面
+// 顯示需要「最後量到多少」這個資訊，所以另外留一份，只存在 RAM，不跨開機
+// 持久化（重開機後要等收到新讀值才會再有值，這是刻意的簡化，見
+// PROJECT_PLAN.md 第 12.6 節）。回傳 false 代表這次開機還沒收過這種類型。
+bool storage_get_last_reading(vital_type_t type, vital_record_t *out);
+
+// 目前待上傳（PENDING 或 FAILED）的紀錄筆數，畫面顯示用。
+size_t storage_pending_count(void);
+
+// 查詢「這次開機以來」最後一次成功上傳的時間（跟 storage_append_record()
+// 的 received_at_ms 是同一種時間基準——mode_upload.c 目前傳進來的一律是
+// boot-relative ms，不是換算過的真實世界時間）。回傳 false 代表這次開機
+// 還沒有成功上傳過。
+bool storage_get_last_upload_time(uint64_t *out_ms);
+
 #endif // STORAGE_H

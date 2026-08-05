@@ -55,6 +55,7 @@ th,td{{border:1px solid #ccc;padding:8px;text-align:left;}}
 th{{background:#f4f4f4;}}
 </style></head><body>
 <h2>Pico 中繼裝置 - 收到的生理資料（測試用，每 5 秒自動重新整理）</h2>
+<p>本專案原始碼（韌體 + 測試伺服器）：<a href="https://github.com/chanwunkong/pico-vitals-gateway" target="_blank">https://github.com/chanwunkong/pico-vitals-gateway</a></p>
 <p>目前累計 {count} 筆</p>
 <table><tr><th>收到時間(伺服器)</th><th>個案編號</th><th>類型</th><th>數值</th><th>裝置量測時間</th></tr>
 {rows}

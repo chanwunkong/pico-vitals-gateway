@@ -24,15 +24,31 @@ add_executable(pico_gateway
     src/mode_upload.c
     src/upload_api.c
     src/led_status.c
+    src/display_status.c
     src/storage.c
     src/wall_clock.c
     dhcpserver.c
     dnsserver.c
+    # Waveshare Pico-ePaper-2.9 驅動，從 Pico_ePaper_Code 複製，見 PROJECT_PLAN.md 第 12.2 節。
+    epd/DEV_Config.c
+    epd/EPD_2in9_V2.c
+    epd/GUI_Paint.c
+    epd/Fonts/font8.c
+    epd/Fonts/font12.c
+    epd/Fonts/font16.c
+    epd/Fonts/font20.c
+    epd/Fonts/font24.c
+    # QR code 編碼器（Nayuki QR-Code-generator），AP_CONFIG 畫面的 WiFi QR code 用，
+    # 見 PROJECT_PLAN.md 第 12.7 節。
+    qrcode/qrcodegen.c
 )
 
 target_include_directories(pico_gateway PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/src
+    ${CMAKE_CURRENT_LIST_DIR}/epd
+    ${CMAKE_CURRENT_LIST_DIR}/epd/Fonts
+    ${CMAKE_CURRENT_LIST_DIR}/qrcode
 )
 
 pico_enable_stdio_usb(pico_gateway 1)
@@ -47,6 +63,7 @@ target_link_libraries(pico_gateway
     pico_lwip_mbedtls
     pico_lwip_sntp
     hardware_flash
+    hardware_spi
     pico_flash
 )
 
