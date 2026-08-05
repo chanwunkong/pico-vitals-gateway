@@ -7,6 +7,7 @@
 
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
+#include "pico/unique_id.h"
 
 #include "lwip/ip4_addr.h"
 #include "lwip/pbuf.h"
@@ -23,9 +24,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define AP_SSID "PicoGateway-Setup"
-// TODO: 正式版建議改成每台裝置唯一密碼（例如印在裝置貼紙上），不要硬編在原始碼裡。
-#define AP_PASSWORD "gateway123"
 #define HTTP_PORT 80
 // 真實手機瀏覽器（尤其 iOS 彈出的 captive portal 內嵌瀏覽器）送出的請求標頭
 // 一般比簡單測試工具大很多，1024 bytes 實測會把表單 body 截斷。
@@ -39,6 +37,38 @@ typedef struct {
     char ssid[33];
     int16_t rssi;
 } scanned_network_t;
+
+// 每台裝置專屬的熱點密碼，不寫死在原始碼裡（正式量產前的已知限制之一，見
+// PROJECT_PLAN.md 第 9 節）。用 RP2040 flash 晶片燒錄時就固定的 64-bit 全球
+// 唯一序號（pico_get_unique_board_id()，同一顆晶片每次讀出來都一樣，不需要
+// 額外存進我們自己的 flash sector）衍生出來，同一台裝置每次進這個模式密碼都
+// 相同（方便印在裝置貼紙上，或直接讓使用者從下面 display_status_show_ap_config()
+// 顯示在電子紙螢幕上的密碼讀出來，兩種管道都拿得到同一組密碼）。8 位十六進位
+// 字元滿足 WPA2 最短 8 字元的要求。
+static void generate_ap_password(char *out, size_t out_size) {
+    pico_unique_board_id_t id;
+    pico_get_unique_board_id(&id);
+    snprintf(out, out_size, "pico-%02x%02x%02x%02x",
+             id.id[4], id.id[5], id.id[6], id.id[7]);
+}
+
+// 熱點名稱也不寫死，同樣的理由：多台裝置部署在同一個場所（例如同一層病房）
+// 時，如果每台都叫一模一樣的 "PicoGateway-Setup"，使用者手機的 WiFi 列表會
+// 看到好幾個同名網路，分不出要連哪一台。改用 CYW43 晶片的出廠 MAC 位址
+// （`cyw43_wifi_get_mac()`，`main.c` 開機時 `cyw43_arch_init()` 就會準備好，
+// 這裡呼叫不需要額外前置條件）取後 2 bytes 組成 4 位十六進位字尾，同一台
+// 裝置每次開熱點名稱都相同，且會顯示在電子紙螢幕上，使用者不需要另外知道
+// MAC 位址是多少，看螢幕上完整的 SSID 字串去手機的 WiFi 列表比對就好。
+static void generate_ap_ssid(char *out, size_t out_size) {
+    uint8_t mac[6];
+    int err = cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_AP, mac);
+    if (err != 0) {
+        // 理論上不會發生（見上面的說明），保底退回固定名稱，至少熱點還是能用。
+        snprintf(out, out_size, "PicoGateway-Setup");
+        return;
+    }
+    snprintf(out, out_size, "PicoGateway-Setup-%02X%02X", mac[4], mac[5]);
+}
 
 static scanned_network_t s_scanned[MAX_SCANNED_NETWORKS];
 static int s_scanned_count = 0;
@@ -225,8 +255,16 @@ static void render_config_form_response(void) {
     if (has_cfg) {
         html_append_escaped(body, sizeof(body), &body_len, s_current_config.case_manager_info);
     }
+    html_append(body, sizeof(body), &body_len, "'><br>上傳伺服器網址: <input name='api_host' value='");
+    if (has_cfg) {
+        html_append_escaped(body, sizeof(body), &body_len, s_current_config.upload_server_host);
+    }
     html_append(body, sizeof(body), &body_len,
-        "'><br>"
+        "' placeholder='留空 = 使用測試預設值'><br>"
+        "上傳認證金鑰: <input name='api_key' type='password' placeholder='%s'><br>",
+        has_cfg && s_current_config.upload_api_key[0] != '\0'
+            ? "留空 = 不變更目前金鑰" : "留空 = 不使用認證");
+    html_append(body, sizeof(body), &body_len,
         "<button type='submit'>儲存並重新啟動</button>"
         "</form></body></html>");
 
@@ -326,6 +364,20 @@ static void parse_and_store_form(const char *body) {
     extract_field(body, "pname", cfg.patient_name, sizeof(cfg.patient_name));
     extract_field(body, "pid", cfg.patient_id, sizeof(cfg.patient_id));
     extract_field(body, "cm", cfg.case_manager_info, sizeof(cfg.case_manager_info));
+
+    // 伺服器網址/認證金鑰留空 = 不變更（跟 WiFi 密碼同一個慣例），不是清空——
+    // 使用者只想改個案資訊時，不用每次都重填這兩個欄位。
+    extract_field(body, "api_host", cfg.upload_server_host, sizeof(cfg.upload_server_host));
+    if (cfg.upload_server_host[0] == '\0' && s_have_current_config) {
+        strncpy(cfg.upload_server_host, s_current_config.upload_server_host, sizeof(cfg.upload_server_host) - 1);
+        cfg.upload_server_host[sizeof(cfg.upload_server_host) - 1] = '\0';
+    }
+    extract_field(body, "api_key", cfg.upload_api_key, sizeof(cfg.upload_api_key));
+    if (cfg.upload_api_key[0] == '\0' && s_have_current_config) {
+        strncpy(cfg.upload_api_key, s_current_config.upload_api_key, sizeof(cfg.upload_api_key) - 1);
+        cfg.upload_api_key[sizeof(cfg.upload_api_key) - 1] = '\0';
+    }
+
     cfg.valid = true;
 
     s_pending_config = cfg;
@@ -460,9 +512,14 @@ void mode_ap_config_run(void) {
     scan_nearby_wifi();
     render_config_form_response();
 
-    printf("[AP_CONFIG] starting hotspot ssid=\"%s\"\n", AP_SSID);
-    cyw43_arch_enable_ap_mode(AP_SSID, AP_PASSWORD, CYW43_AUTH_WPA2_AES_PSK);
-    display_status_show_ap_config(AP_SSID, AP_PASSWORD, s_have_current_config ? &s_current_config : NULL);
+    char ap_password[16];
+    generate_ap_password(ap_password, sizeof(ap_password));
+    char ap_ssid[32];
+    generate_ap_ssid(ap_ssid, sizeof(ap_ssid));
+
+    printf("[AP_CONFIG] starting hotspot ssid=\"%s\"\n", ap_ssid);
+    cyw43_arch_enable_ap_mode(ap_ssid, ap_password, CYW43_AUTH_WPA2_AES_PSK);
+    display_status_show_ap_config(ap_ssid, ap_password, s_have_current_config ? &s_current_config : NULL);
 
     ip4_addr_t gw, mask;
     IP4_ADDR(&gw, 192, 168, 4, 1);

@@ -12,6 +12,12 @@
 // 都不會遺失尚未成功上傳的資料，重開機會自動讀回繼續重試。
 // 這個做法沒有 wear leveling，寫入頻率高的話會較快耗損那幾個 sector；
 // 正式量產前如果讀值頻率提高，需評估升級成 littlefs，見 PROJECT_PLAN.md 第7節。
+//
+// 上傳成功的紀錄不會立刻從本機消失：另外用一個環狀緩衝（最近
+// MAX_UPLOAD_HISTORY 筆，見 storage.c）保留一份已上傳歷史，一樣持久化在
+// flash（待傳佇列前面再保留幾個 sector），供之後查驗/除錯用，見
+// storage_get_upload_history()。這是主持人明確提出的需求，見 PROJECT_PLAN.md
+// 第 5 節。
 
 void storage_init(void);
 
@@ -46,5 +52,11 @@ size_t storage_pending_count(void);
 // boot-relative ms，不是換算過的真實世界時間）。回傳 false 代表這次開機
 // 還沒有成功上傳過。
 bool storage_get_last_upload_time(uint64_t *out_ms);
+
+// 取出最近上傳成功的歷史紀錄，最舊的排在前面，最新的排在最後，最多取
+// max_count 筆，回傳實際取出筆數。見 storage.h 開頭「上傳成功的紀錄不會
+// 立刻從本機消失」的說明——這份資料獨立於待傳佇列之外，紀錄一旦上傳成功
+// 就會同時進到這裡，滿了（MAX_UPLOAD_HISTORY 筆）會覆蓋最舊的一筆。
+size_t storage_get_upload_history(vital_record_t *out, size_t max_count);
 
 #endif // STORAGE_H

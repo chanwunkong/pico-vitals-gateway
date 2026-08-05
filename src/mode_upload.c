@@ -20,6 +20,15 @@
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 #define MAX_BATCH_SIZE 32
 
+// 血壓計自己回報的量測時間戳（device_measured_key）不保證裝置內部時鐘校時
+// 過——電池換過、從沒設定過、韌體預設值都可能讓這個時鐘跟真實時間差很多年。
+// 跟 Pico 自己 NTP 校時過的現在時間比對，差距超過這個範圍就不信任裝置時鐘，
+// 退回用 Pico 收到 BLE 通知的時間（見 fora_protocol_measured_key_to_epoch_ms()
+// 呼叫端的判斷）。7 天遠大於正常情況下「量測到上傳」的延遲（整個系統設計下
+// 最慢也只有幾分鐘等級，見 DEVICE_RECONNECT_COOLDOWN_MS），足以只在裝置時鐘
+// 明顯錯誤（差好幾個月/年）時才觸發，不會誤傷正常情況。
+#define DEVICE_CLOCK_SANITY_WINDOW_MS (7ULL * 24 * 60 * 60 * 1000)
+
 // 認證模式不寫死——分享器種類很多，依常見程度排序嘗試，直到成功或全部試完。
 static const uint32_t WIFI_AUTH_MODES_TO_TRY[] = {
     CYW43_AUTH_WPA2_AES_PSK,
@@ -126,18 +135,42 @@ void mode_upload_run(void) {
         // 值，不影響上傳本身，只是這批資料的時間看起來還是不準）。
         wall_clock_sync(8000);
         for (size_t i = 0; i < count; i++) {
+            bool used_device_clock = false;
             if (batch[i].device_measured_key != 0) {
                 // 裝置本身有認證過的量測時間戳（目前只有血壓計，見
                 // fora_protocol.h 的說明），比「Pico 收到 BLE 通知的時間」更
                 // 準確——裝置量完到被 Pico 連上讀到資料之間可能有延遲，甚至
-                // 不需要靠 NTP 校時（這個時間戳跟 wall_clock 完全無關）。
-                batch[i].received_at_ms = fora_protocol_measured_key_to_epoch_ms(batch[i].device_measured_key);
-            } else {
+                // 不需要靠 NTP 校時（這個時間戳跟 wall_clock 完全無關）。但
+                // 裝置自己的時鐘不保證校時過（電池換過、從沒設定過、韌體
+                // 預設值都可能差好幾年），跟 Pico 已校時過的現在時間比對一下
+                // 合理性，差距太大就不信任，退回用 Pico 收到時間。
+                uint64_t device_epoch_ms = fora_protocol_measured_key_to_epoch_ms(batch[i].device_measured_key);
+                if (wall_clock_is_synced()) {
+                    uint64_t now_epoch_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
+                    uint64_t diff_ms = device_epoch_ms > now_epoch_ms
+                        ? device_epoch_ms - now_epoch_ms : now_epoch_ms - device_epoch_ms;
+                    if (diff_ms <= DEVICE_CLOCK_SANITY_WINDOW_MS) {
+                        batch[i].received_at_ms = device_epoch_ms;
+                        used_device_clock = true;
+                    } else {
+                        printf("[UPLOAD] device clock for record %u looks wrong (off by %llu ms), "
+                               "falling back to Pico's receive time.\n", (unsigned)i,
+                               (unsigned long long)diff_ms);
+                    }
+                } else {
+                    // Pico 自己都還沒校時過，沒有基準可以比對合理性，這種
+                    // 情況下裝置時間戳是唯一可用的真實時間來源，照樣採用。
+                    batch[i].received_at_ms = device_epoch_ms;
+                    used_device_clock = true;
+                }
+            }
+            if (!used_device_clock) {
                 batch[i].received_at_ms = wall_clock_to_epoch_ms(batch[i].received_at_ms);
             }
         }
 
-        bool success = upload_api_post_batch(config.patient_id, batch, count);
+        bool success = upload_api_post_batch(config.patient_id, config.upload_server_host,
+                                              config.upload_api_key, batch, count);
         printf("[UPLOAD] upload_api_post_batch() -> %s\n", success ? "success" : "failed");
         storage_mark_uploaded(count, to_ms_since_boot(get_absolute_time()), success);
 

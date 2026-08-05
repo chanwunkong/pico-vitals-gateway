@@ -16,6 +16,8 @@
 #define PATIENT_NAME_MAX_LEN 64
 #define PATIENT_ID_MAX_LEN   32
 #define CASE_MANAGER_MAX_LEN 64
+#define UPLOAD_SERVER_HOST_MAX_LEN 96
+#define UPLOAD_API_KEY_MAX_LEN     64
 
 // 熱點設定模式收集的裝置設定。
 typedef struct {
@@ -24,6 +26,13 @@ typedef struct {
     char patient_name[PATIENT_NAME_MAX_LEN];
     char patient_id[PATIENT_ID_MAX_LEN];
     char case_manager_info[CASE_MANAGER_MAX_LEN];
+    // 空字串 = 使用 upload_api.c 內建的測試預設值（見該檔案的
+    // UPLOAD_SERVER_HOST_DEFAULT）。正式部署時透過 AP_CONFIG 表單填入真正的
+    // 伺服器位址，不用重新燒錄韌體換網址。
+    char upload_server_host[UPLOAD_SERVER_HOST_MAX_LEN];
+    // 空字串 = 上傳請求不帶認證標頭（跟目前測試伺服器一樣不做驗證）。有值的話
+    // upload_api.c 會加一個 X-API-Key 標頭，伺服器端要驗證這個值。
+    char upload_api_key[UPLOAD_API_KEY_MAX_LEN];
     bool valid;
 } device_config_t;
 
@@ -34,9 +43,10 @@ typedef enum {
     VITAL_TYPE_PULSE_RATE,
     VITAL_TYPE_SYSTOLIC,
     VITAL_TYPE_DIASTOLIC,
-    // 2026-08-05 先保留欄位：FORA D40 是血壓血糖二合一裝置，血糖部分還沒實作
-    // （協定還沒確認，見 PROJECT_PLAN.md 第 7 節第 2 點），但畫面/資料型別先
-    // 把欄位留著，之後接上血糖協定時不用再改動 storage/display 這幾層。
+    // FORA D40 是血壓血糖二合一裝置，血糖跟血壓走同一套指令/資料管道，靠
+    // 回應裡的一個旗標 bit 分辨，見 fora_protocol.h 開頭註解跟
+    // PROJECT_PLAN.md 第 6.3/6.4 節。協定已反推確認，但只比對過官方反編譯
+    // 原始碼，還沒有實機量測比對過。
     VITAL_TYPE_GLUCOSE,
     VITAL_TYPE_COUNT, // 型別數量，不是實際的量測類型，只用來宣告陣列大小
 } vital_type_t;

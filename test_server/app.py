@@ -20,6 +20,7 @@ VITAL_TYPE_NAMES = {
     3: "pulse_rate",
     4: "systolic",
     5: "diastolic",
+    6: "glucose",
 }
 
 

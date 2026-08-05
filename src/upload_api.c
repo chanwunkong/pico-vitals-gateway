@@ -17,6 +17,7 @@
 #include "mbedtls/ssl.h"
 
 #include "led_status.h"
+#include "upload_tls_ca_cert.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -30,12 +31,12 @@ mbedtls_ms_time_t mbedtls_ms_time(void) {
     return (mbedtls_ms_time_t)to_ms_since_boot(get_absolute_time());
 }
 
-// TODO: 正式版要讓伺服器位址可透過 AP 設定頁面輸入；device_config_t 目前沒有
-// 這個欄位，測試階段先寫死方便驗證「BLE 收到 -> WiFi 上傳 -> 網站看得到」整條路
-// 能不能打通，且不假設 Pico 部署現場的 WiFi 能連到跟開發機同一個區網，直接走
-// 公開網際網路（Cloudflare Tunnel）。之後要接正式後端時，這裡要換成真實 endpoint、
-// 認證方式，且 tunnel 網址是暫時的，每次重啟 cloudflared 都會換一個新的。
-#define UPLOAD_SERVER_HOST "clip-perth-individual-andale.trycloudflare.com"
+// 伺服器位址現在可以透過 AP_CONFIG 表單設定（device_config_t.upload_server_host，
+// 見 upload_api_post_batch() 的 server_host 參數），這裡的常數只是「沒設定過
+// 時」的測試預設值，方便開發階段驗證「BLE 收到 -> WiFi 上傳 -> 網站看得到」
+// 整條路能不能打通，不用先跑一次 AP_CONFIG。目前指向 Cloudflare Tunnel 的
+// 臨時測試網址，重開 `cloudflared` 就會換掉，不是給正式環境用的。
+#define UPLOAD_SERVER_HOST_DEFAULT "clip-perth-individual-andale.trycloudflare.com"
 #define UPLOAD_SERVER_PORT 443
 #define UPLOAD_SERVER_PATH "/api/vitals"
 
@@ -126,7 +127,8 @@ static void format_value(char *out, size_t out_size, vital_type_t type, float va
     }
 }
 
-static size_t build_request(const char *patient_id, const vital_record_t *records, size_t count) {
+static size_t build_request(const char *patient_id, const char *server_host, const char *api_key,
+                             const vital_record_t *records, size_t count) {
     char body[REQUEST_BUF_SIZE - 256];
     size_t body_len = 0;
 
@@ -144,15 +146,35 @@ static size_t build_request(const char *patient_id, const vital_record_t *record
     }
     append(body, sizeof(body), &body_len, "]}");
 
+    // 認證金鑰是 AP_CONFIG 的自由輸入欄位，跟 patient_id 一樣不受韌體控制，
+    // 理論上可能包含 CRLF 之類會破壞 HTTP 標頭格式的字元；這裡簡單起見只
+    // 允許可印出 ASCII、遇到會弄亂標頭格式的字元就整段跳過不送出這個標頭，
+    // 比送出格式錯誤的請求安全（伺服器端收不到認證標頭會直接拒絕，不會
+    // 誤判成通過）。
+    char auth_header[UPLOAD_API_KEY_MAX_LEN + 32] = "";
+    if (api_key != NULL && api_key[0] != '\0') {
+        bool key_is_safe = true;
+        for (const char *p = api_key; *p != '\0'; p++) {
+            if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) {
+                key_is_safe = false;
+                break;
+            }
+        }
+        if (key_is_safe) {
+            snprintf(auth_header, sizeof(auth_header), "X-API-Key: %s\r\n", api_key);
+        }
+    }
+
     int n = snprintf(s_request, sizeof(s_request),
                       "POST %s HTTP/1.1\r\n"
                       "Host: %s\r\n"
                       "Content-Type: application/json\r\n"
                       "Content-Length: %u\r\n"
+                      "%s"
                       "Connection: close\r\n\r\n"
                       "%s",
-                      UPLOAD_SERVER_PATH, UPLOAD_SERVER_HOST,
-                      (unsigned)body_len, body);
+                      UPLOAD_SERVER_PATH, server_host,
+                      (unsigned)body_len, auth_header, body);
     return n > 0 ? (size_t)n : 0;
 }
 
@@ -223,23 +245,29 @@ static err_t on_connected(void *arg, struct altcp_pcb *conn, err_t err) {
     return ERR_OK;
 }
 
-bool upload_api_post_batch(const char *patient_id, const vital_record_t *records, size_t count) {
+bool upload_api_post_batch(const char *patient_id, const char *server_host, const char *api_key,
+                           const vital_record_t *records, size_t count) {
     if (count == 0) {
         return true;
     }
 
-    build_request(patient_id, records, count);
+    const char *effective_host =
+        (server_host != NULL && server_host[0] != '\0') ? server_host : UPLOAD_SERVER_HOST_DEFAULT;
+
+    build_request(patient_id, effective_host, api_key, records, count);
     // 排查過伺服器回 400 Bad Request（代表 JSON 解析失敗）的問題，印出實際
     // 組出來的請求，方便直接比對是不是 JSON 格式本身有問題（例如 patient_id
     // 裡含有沒跳脫的雙引號／反斜線——AP_CONFIG 表單的 patient_id 是自由輸入
-    // 欄位，build_request() 目前組 JSON 時沒有對它做任何跳脫）。
+    // 欄位，build_request() 目前組 JSON 時沒有對它做任何跳脫）。**注意**：
+    // 這行會把認證金鑰明文印進序列埠 log，只在開發除錯階段這樣做，正式環境
+    // 若序列埠 log 會被留存/上傳，要拿掉這行或遮蔽金鑰。
     printf("[UPLOAD_API] request:\n%s\n", s_request);
 
-    // 1. 先解析 UPLOAD_SERVER_HOST 的 IP（tunnel 位址不是固定 IP，且 altcp_connect
+    // 1. 先解析伺服器主機名的 IP（tunnel 位址不是固定 IP，且 altcp_connect
     //    只接受 IP，SNI hostname 另外用 mbedtls_ssl_set_hostname() 設定）。
     dns_ctx_t dns_ctx = { .done = false, .ok = false };
     cyw43_arch_lwip_begin();
-    err_t dns_err = dns_gethostbyname(UPLOAD_SERVER_HOST, &dns_ctx.addr, dns_found_cb, &dns_ctx);
+    err_t dns_err = dns_gethostbyname(effective_host, &dns_ctx.addr, dns_found_cb, &dns_ctx);
     cyw43_arch_lwip_end();
 
     if (dns_err == ERR_OK) {
@@ -256,14 +284,28 @@ bool upload_api_post_batch(const char *patient_id, const vital_record_t *records
     }
 
     if (!dns_ctx.ok) {
-        printf("[UPLOAD_API] DNS resolve of \"%s\" failed or timed out\n", UPLOAD_SERVER_HOST);
+        printf("[UPLOAD_API] DNS resolve of \"%s\" failed or timed out\n", effective_host);
         return false;
     }
 
-    // 2. 建立 TLS 連線。沒有內嵌 CA 憑證，預設 authmode 是 MBEDTLS_SSL_VERIFY_OPTIONAL，
-    //    握手會照常完成但不驗證憑證鏈——測試階段先求連得通，正式部署前要內嵌信任的
-    //    CA 憑證並改成要求驗證，否則有中間人攻擊風險。
-    struct altcp_tls_config *tls_config = altcp_tls_create_config_client(NULL, 0);
+    // 2. 建立 TLS 連線。有沒有驗證伺服器憑證鏈完全取決於 UPLOAD_CA_CERT_PEM
+    //    有沒有內容（見 upload_tls_ca_cert.h 的說明）：lwIP 的 altcp_tls 封裝
+    //    收到非空的 CA 內容會自動把驗證模式設成 MBEDTLS_SSL_VERIFY_REQUIRED，
+    //    沒有的話退回 MBEDTLS_SSL_VERIFY_OPTIONAL（等同不驗證，握手照常完成，
+    //    中間人偽造的憑證也會被接受）——目前還沒有正式後端網址可以嵌入真正
+    //    的憑證，所以是空字串，只適合開發測試階段，見 upload_tls_ca_cert.h。
+    size_t ca_cert_len = sizeof(UPLOAD_CA_CERT_PEM) > 1 ? sizeof(UPLOAD_CA_CERT_PEM) : 0;
+    if (ca_cert_len == 0) {
+        static bool s_warned_no_verify = false;
+        if (!s_warned_no_verify) {
+            printf("[UPLOAD_API] WARNING: no CA certificate embedded (see upload_tls_ca_cert.h) - "
+                   "TLS connections are NOT verifying the server certificate, vulnerable to "
+                   "man-in-the-middle. Do not deploy like this in production.\n");
+            s_warned_no_verify = true;
+        }
+    }
+    struct altcp_tls_config *tls_config = altcp_tls_create_config_client(
+        ca_cert_len > 0 ? (const uint8_t *)UPLOAD_CA_CERT_PEM : NULL, ca_cert_len);
     if (tls_config == NULL) {
         printf("[UPLOAD_API] altcp_tls_create_config_client failed\n");
         return false;
@@ -284,7 +326,7 @@ bool upload_api_post_batch(const char *patient_id, const vital_record_t *records
     // SNI：把目標主機名告訴 TLS 層，Cloudflare 這類多租戶邊緣節點靠這個決定要
     // 把連線轉給哪個 tunnel，沒設定的話交握可能失敗或連到錯的後端。
     altcp_mbedtls_state_t *tls_state = (altcp_mbedtls_state_t *)altcp_tls_context(pcb);
-    mbedtls_ssl_set_hostname(&tls_state->ssl_context, UPLOAD_SERVER_HOST);
+    mbedtls_ssl_set_hostname(&tls_state->ssl_context, effective_host);
 
     altcp_arg(pcb, &ctx);
     altcp_recv(pcb, on_recv);
@@ -300,7 +342,7 @@ bool upload_api_post_batch(const char *patient_id, const vital_record_t *records
     }
 
     printf("[UPLOAD_API] POST %u reading(s) to https://%s%s\n",
-           (unsigned)count, UPLOAD_SERVER_HOST, UPLOAD_SERVER_PATH);
+           (unsigned)count, effective_host, UPLOAD_SERVER_PATH);
 
     absolute_time_t deadline = make_timeout_time_ms(UPLOAD_TIMEOUT_MS);
     while (!ctx.done && !time_reached(deadline)) {

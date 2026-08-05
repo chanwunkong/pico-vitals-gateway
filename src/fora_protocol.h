@@ -61,7 +61,7 @@ extern const uint8_t FORA_TRIGGER_COMMAND[8];
 // 8 bytes 的實際佈局（跟標準 SIG 格式完全不同，是這台裝置自己的私有格式）：
 //   byte[0] = 日期低位元組（day bits0-4、month 低3 bit 在 bits5-7）
 //   byte[1] = 日期高位元組（month 最高 1 bit、year=(byte1>>1)+2000）
-//   byte[2] = 分鐘(bits0-5)、心律不整旗標(bit6)
+//   byte[2] = 分鐘(bits0-5)、心律不整旗標(bit6)、**記錄類型旗標(bit7)**
 //   byte[3] = 小時(bits0-4)、IHB 狀態(bits5-6)、是否為平均值(bit7)
 //   byte[4] = 收縮壓（直接是整數 mmHg，不是 SFLOAT）
 //   byte[5] = 平均壓（目前不取）
@@ -69,6 +69,21 @@ extern const uint8_t FORA_TRIGGER_COMMAND[8];
 //   byte[7] = 脈搏（直接是整數 bpm）
 // 日期/心律不整/IHB 狀態目前沒有解析（vital_record_t 沒有對應欄位存），只取
 // 收縮壓/舒張壓/脈搏三個數值。
+//
+// **這台裝置是血壓血糖二合一**：上面「問目前這一筆記錄」的指令（0x25/0x26）
+// 回傳的可能是血壓、也可能是血糖，靠 byte[2] 的 bit7 分辨（0=血糖、1=血壓，
+// 這是反編譯官方程式 GenBgmAndBpmMeter.GetRecord() 得到的分流邏輯，同一支
+// DLL 裡的 BloodGlucose2in1 class 用同一套 byte[0..3] 日期編碼，只是
+// byte[4..7] 的意義完全不同）。血糖格式：
+//   byte[4..5] = 血糖值，16-bit 小端：glucose = byte[5]*256 + byte[4]，
+//                單位 mg/dL；glucose==65535 或 255 視為無效讀值。
+//   byte[6]    = 環境溫度（目前不用）
+//   byte[7]    = codeNo(bits0-5，不用) | 測試時機(bits6-7：0=一般、1=飯前、
+//                2=飯後、3=品管，目前不用)
+// fora_protocol_parse_reading() 收到組好的 8 bytes 後會先檢查這個 bit 再決定
+// 要回傳 VITAL_TYPE_SYSTOLIC/DIASTOLIC/PULSE_RATE 還是 VITAL_TYPE_GLUCOSE。
+// 這個分流/血糖格式**只比對過官方反編譯原始碼，還沒有實機量測比對過**，如果
+// 之後發現跟真實裝置對不上，以實機為準。
 //
 // 想問裝置目前有幾筆記錄（目前用不到，但一起記錄協定）：
 //   送 { 0x51, 0x2B, userNo, 0, 0, 0, 0xA3, checksum } → 回應 byte[2] | (byte[3]<<8) = 筆數
@@ -101,9 +116,11 @@ void fora_protocol_measured_key_to_datetime(
 // 「裝置實際量測的時間」（裝置量完到被 Pico 連上讀到資料之間可能有延遲）。
 uint64_t fora_protocol_measured_key_to_epoch_ms(uint32_t key);
 
-// 手上目前有的三種 FORA OEM 裝置。額溫槍跟血氧計服務/特徵值 UUID 完全相同
-// （同一套 Nordic LED/Button Service 傳輸管道），只有封包格式不同；血壓計走
-// 標準 Blood Pressure Service（見上）。UNKNOWN 用來代表「名稱含 FORA，但不
+// 手上目前有的三種 FORA OEM 裝置，三種都走同一套 Nordic LED/Button Service
+// 自訂 pipe（見上面 FORA_SERVICE_UUID128／FORA_CHARACTERISTIC_UUID128），只
+// 有封包格式不同；血壓計這個 kind 實際上涵蓋血壓+血糖兩種資料（見上面的
+// 說明），血糖不是獨立的 kind，因為裝置廣播/連線階段沒辦法分辨，要連線問到
+// 記錄之後才知道這筆是血壓還是血糖。UNKNOWN 用來代表「名稱含 FORA，但不
 // 認得是哪一種」，呼叫端應該當作陌生裝置處理（不要連線）。
 typedef enum {
     FORA_DEVICE_UNKNOWN = 0,
@@ -131,10 +148,13 @@ bool fora_protocol_matches_advertisement(
 //     有效回應，SpO2 = (byte[3]<<8 | byte[2]) & 0x0FFF（單位 %，不用除 10），
 //     脈搏 = byte[5]（單位 bpm，整數）。byte[4]/byte[6]/byte[7] 目前不知道
 //     用途，先忽略。
-//   血壓計（3 筆：收縮壓/舒張壓/脈搏）：這裡的 value/len 不是原始 GATT
-//     封包，是呼叫端已經組好的 8 bytes「記錄」（見上面 FORA_BP_CMD_* 那段
-//     說明），直接照那邊列的 byte[4]/byte[6]/byte[7] 佈局取值，不會檢查
-//     byte[0]==0x51（那個檢查只適用於額溫槍/血氧計的原始封包）。
+//   血壓計 kind（3 筆：收縮壓/舒張壓/脈搏，**或** 1 筆血糖）：這裡的
+//     value/len 不是原始 GATT 封包，是呼叫端已經組好的 8 bytes「記錄」（見
+//     上面 FORA_BP_CMD_* 那段說明），不會檢查 byte[0]==0x51（那個檢查只適用
+//     於額溫槍/血氧計的原始封包）。先看 byte[2] bit7 分辨這筆是血壓還是血糖
+//     （見上面的說明），血壓照 byte[4]/byte[6]/byte[7] 佈局取值，血糖照
+//     byte[4..7] 的血糖格式取值（回傳 VITAL_TYPE_GLUCOSE，1 筆）；血糖值是
+//     65535 或 255 這兩個特殊值時視為無效讀值，回傳 0。
 size_t fora_protocol_parse_reading(
     fora_device_kind_t kind, const uint8_t *value, uint16_t len,
     vital_record_t out[FORA_MAX_READINGS_PER_NOTIFICATION]);

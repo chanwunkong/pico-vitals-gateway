@@ -65,6 +65,7 @@ target_link_libraries(pico_gateway
     hardware_flash
     hardware_spi
     pico_flash
+    pico_unique_id
 )
 
 pico_add_extra_outputs(pico_gateway)

@@ -130,6 +130,29 @@ size_t fora_protocol_parse_reading(
             return 0;
         }
         uint32_t measured_key = fora_protocol_decode_measured_key(value);
+
+        // 這台裝置是血壓血糖二合一，「問目前這一筆記錄」的回應可能是血壓、
+        // 也可能是血糖，靠 byte[2] 的 bit7 分辨（0=血糖、1=血壓，反編譯官方
+        // 程式 GenBgmAndBpmMeter.GetRecord() 得到的分流邏輯，見 fora_protocol.h
+        // 開頭註解跟 PROJECT_PLAN.md 第 6.3/6.4 節）。之前這裡沒檢查這個 bit，
+        // 會把血糖資料誤當血壓數值解析，是已修好的正確性 bug。
+        if ((value[2] & 0x80) == 0) {
+            // 血糖格式：byte[4..5] 是 16-bit 小端血糖值，byte[6] 是環境溫度
+            // （目前不用），byte[7] 低 6 bit 是 codeNo（不用）、高 2 bit 是
+            // 測試時機（不用，畫面/上傳目前只需要數值本身）。
+            int glucose = (int)value[5] * 256 + (int)value[4];
+            if (glucose == 65535 || glucose == 255) {
+                // 官方程式對這兩個特殊值的判斷：不是真正的血糖數字（感測器
+                // 誤差/品管測試等情況），視為無效讀值，不當成一筆資料回傳。
+                return 0;
+            }
+            out[0].type = VITAL_TYPE_GLUCOSE;
+            out[0].value = (float)glucose;
+            out[0].device_measured_key = measured_key;
+            out[0].source_kind = (uint8_t)kind;
+            return 1;
+        }
+
         out[0].type = VITAL_TYPE_SYSTOLIC;
         out[0].value = (float)value[4];
         out[0].device_measured_key = measured_key;

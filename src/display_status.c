@@ -138,6 +138,15 @@ static bool s_ble_screen_is_current = false;
 // 回傳值目前恆為 true（沒有任何情況會跳過刷新），保留 bool 是因為
 // display_status_poll() 的「沒刷新成功就不更新快照」邏輯還在，之後如果又要
 // 加別的跳過條件（例如偵測到面板故障）不用改呼叫端。
+//
+// 2026-08-06：曾經加過局部刷新（`EPD_2IN9_V2_Display_Partial`，~0.6 秒不閃）
+// 又拿掉了——沒有任何實測觀察到的具體場景真的需要它（BLE_RECEIVE 本來就靠
+// 內容比對，刷新頻率不高；理論上「全刷卡住 2-3 秒可能錯過血壓計/血氧計短暫
+// 廣播窗口」這個顧慮從沒被實際觀察到發生過），純全刷交換的 0.6 秒 vs 3 秒、
+// 不閃黑這些好處，換來的是沒有實機驗證過的呼叫順序風險、疊代殘影需要額外
+// 清理邏輯——為一個從未真正發生過問題的場景背負未測試的複雜度不值得，見
+// PROJECT_PLAN.md 第 12.5 節。只用全刷（`EPD_2IN9_V2_Display_Base`），簡單
+// 可靠。
 static bool end_frame_and_refresh(void) {
     // EPD_2IN9_V2_Init() 內部一開始就會做硬體 Reset，同時也是从深度睡眠喚醒的
     // 標準程序，所以不需要另外維護一個「現在是睡是醒」的狀態——每次要刷新
@@ -193,8 +202,9 @@ void display_status_show_boot_test(void) {
 // 提示，這是業界慣例（源自 ZXing），不是 QR code 本身有什麼特殊格式/模式——
 // 產生方式跟其他 QR code 完全一樣，差別只在編碼進去的文字內容。SSID/密碼裡
 // 如果剛好出現 `\`、`;`、`,`、`:`、`"` 這幾個字元，依慣例要加反斜線跳脫，
-// 不然會被手機誤判成欄位分隔符號——目前 AP_SSID/AP_PASSWORD 是寫死的字串、
-// 沒有這些字元，但這裡還是做完整，避免以後密碼改成可設定/隨機產生時踩到。
+// 不然會被手機誤判成欄位分隔符號——`mode_ap_config.c` 的 `generate_ap_ssid()`／
+// `generate_ap_password()` 衍生出來的字串目前不會出現這些字元，但這裡還是
+// 做完整，避免兩邊之後改了衍生規則卻忘記回來檢查這裡。
 static void append_escaped_wifi_field(char *out, size_t out_size, size_t *len, const char *field) {
     for (const char *p = field; *p != '\0' && *len + 1 < out_size; p++) {
         if (*p == '\\' || *p == ';' || *p == ',' || *p == ':' || *p == '"') {
@@ -471,9 +481,10 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     draw_reading_row(36, VITAL_TYPE_TEMPERATURE, snap);
     draw_reading_row(49, VITAL_TYPE_SPO2, snap);
     draw_reading_row(62, VITAL_TYPE_PULSE_RATE, snap);
-    // 血糖協定還沒接（FORA D40 是血壓血糖二合一，血糖部分還沒逆向出來，見
-    // PROJECT_PLAN.md 第 7 節第 2 點），這裡先保留欄位，永遠顯示 "-- (never)"，
-    // 之後接上血糖協定不用再改這幾層。
+    // 血糖走跟血壓相同的資料管道，靠回應裡的旗標 bit 分辨（見
+    // fora_protocol.h、PROJECT_PLAN.md 第 6.3/6.4 節），量到血糖時
+    // storage_get_last_reading(VITAL_TYPE_GLUCOSE) 就會有值，這裡不用額外
+    // 判斷——沒量過的話 draw_reading_row() 本身就會顯示 "-- (never)"。
     draw_reading_row(75, VITAL_TYPE_GLUCOSE, snap);
 
     // 血壓收縮/舒張合成一行顯示；兩者通常同一次量測一起寫入，時間戳取收縮壓的。

@@ -51,9 +51,11 @@ Pico W 沒有使用者按鍵，只有 BOOTSEL。這個檔案用一個取自官�
 ## 三個運作模式
 
 ### `src/mode_ap_config.c` / `mode_ap_config.h`
-「熱點設定模式」。開一個獨立的 WiFi 熱點（`AP_SSID "PicoGateway-Setup"` / `AP_PASSWORD "gateway123"`，目前寫死在程式碼裡，PROJECT_PLAN.md 有註記正式版要改成每台裝置唯一密碼），搭配 `dhcpserver.c`／`dnsserver.c` 讓手機連上後自動配到 IP，並且不管查什麼網域都導回 Pico 自己觸發作業系統的 captive portal 自動彈出登入頁（模仿公用 WiFi 的行為，使用者不用自己開瀏覽器打網址）。進入這個模式時會先 `scan_nearby_wifi()` 掃描附近 WiFi，設定頁的 SSID 欄位是下拉選單（掃到的網路，含訊號強度）+ 一個手動輸入欄位（給掃不到的隱藏網路用）。用 lwIP 的 raw TCP API 手刻一個極簡單的單連線 HTTP server（不是官方的 lwIP httpd），GET 回傳表單、POST 收表單資料後用 `storage_save_config()` 寫進 flash，然後結束（回到 BLE 接收模式）。
+「熱點設定模式」。開一個獨立的 WiFi 熱點（`AP_SSID "PicoGateway-Setup"` + `generate_ap_password()` 衍生出的每台裝置專屬密碼，見下方說明），搭配 `dhcpserver.c`／`dnsserver.c` 讓手機連上後自動配到 IP，並且不管查什麼網域都導回 Pico 自己觸發作業系統的 captive portal 自動彈出登入頁（模仿公用 WiFi 的行為，使用者不用自己開瀏覽器打網址）。進入這個模式時會先 `scan_nearby_wifi()` 掃描附近 WiFi，設定頁的 SSID 欄位是下拉選單（掃到的網路，含訊號強度）+ 一個手動輸入欄位（給掃不到的隱藏網路用）。用 lwIP 的 raw TCP API 手刻一個極簡單的單連線 HTTP server（不是官方的 lwIP httpd），GET 回傳表單、POST 收表單資料後用 `storage_save_config()` 寫進 flash，然後結束（回到 BLE 接收模式）。
 
-表單會先讀目前已存的設定（`storage_load_config()`）帶入頁面：SSID 下拉選單自動選中目前的網路、個案姓名/編號/個管師資訊會帶入現有值，**密碼欄位留空 = 不變更目前密碼**（不會被清空覆蓋），方便使用者只改其中一項而不用重填全部欄位。
+表單會先讀目前已存的設定（`storage_load_config()`）帶入頁面：SSID 下拉選單自動選中目前的網路、個案姓名/編號/個管師資訊/上傳伺服器網址會帶入現有值，**WiFi 密碼、上傳認證金鑰欄位留空 = 不變更目前值**（不會被清空覆蓋），方便使用者只改其中一項而不用重填全部欄位。
+
+**（2026-08-06 加做，尚未實機測試）** `generate_ap_password()`：熱點密碼不再寫死，改成從 RP2040 flash 晶片出廠燒錄的 64-bit 全球唯一序號（`pico_get_unique_board_id()`）衍生出 8 位十六進位字元，同一台裝置每次都相同，且會顯示在電子紙的 AP_CONFIG 畫面上，不需要另外印貼紙。`CMakeLists.txt` 新增連結 `pico_unique_id`。表單也新增 `api_host`／`api_key` 兩個欄位，對應 `device_config_t` 新增的 `upload_server_host`／`upload_api_key`，留空的行為跟密碼欄位一致（見下方 `common.h`／`upload_api.c` 說明）。
 
 **這個模式跟「Pico 實際運作時要連的 WiFi」是兩個獨立網路**：這個熱點只是拿來讓你在設定介面上「填入」目標 WiFi 的帳密，Pico 存好設定後就會關掉這個熱點、改用你填的帳密去連目標 WiFi。
 
@@ -67,7 +69,9 @@ BLE 接收模式，24/7 常駐狀態。用 BTstack 當 GAP central：主動掃�
 `DEVICE_RECONNECT_COOLDOWN_MS[]`：依裝置種類分開設定的冷卻時間，拿到讀值後這段時間內完全不理會該種裝置的廣播，避免裝置被無限重連導致無法休眠（跨 BLE_RECEIVE/UPLOAD 模式切換持續有效）。額溫槍/血壓計目前是 60 秒/4 分鐘，血氧計 5 秒——血壓計原本也是 5 秒，實測發現這台裝置在「傳送舊記錄」模式下設計是 3 分鐘無活動就自動關機，短冷卻會一直重置這個計時器讓裝置永遠關不了機，拉長到 4 分鐘（見 PROJECT_PLAN.md 8.4 節）。`s_got_any_reading_this_session`：修過的另一個 bug——原本「距離上次讀值 N 秒沒新資料就觸發上傳」的計時器是從「進入 BLE_RECEIVE 模式」就開始倒數，不是從「收到第一筆資料」開始，導致血壓計那種要 30-45 秒才會推播一次的裝置，量測還沒做完就被切去上傳模式、逼著斷線。現在改成收到第一筆資料之前完全不倒數；**且觸發上傳前會先確認 `storage_pending_count() > 0`**（判重邏輯上線後，收到讀值不代表待傳佇列真的有新東西，見 `storage.c` 說明），沒有東西要傳就不切去 UPLOAD 白跑一趟 WiFi。
 
 ### `src/mode_upload.c` / `mode_upload.h`
-上傳模式。先讀 flash 裡的裝置設定（`storage_load_config()`），沒設定過就直接放棄（點三連閃錯誤燈號）。有設定的話，用 `cyw43_arch_wifi_connect_async()` 開 WiFi station 模式連線，依序嘗試多種認證模式（`WIFI_AUTH_MODES_TO_TRY[]`，因為分享器種類很多，不寫死單一種）。連線成功的判斷**不是**單純信任 `cyw43_wifi_link_status()`（實測發現這個狀態有時候不會準時回報成功，即使 lwIP 的 DHCP 早就真的拿到 IP 了），而是直接檢查 `netif_is_up()` 且 netif 的 IP 不是 `0.0.0.0`——這是修過的一個關鍵 bug，詳見 PROJECT_PLAN.md 第 8 節第 1 點。連上後呼叫 `wall_clock_sync()` 嘗試 NTP 校時（見 `wall_clock.c`），再把 `storage_pending_records()` 取出的待傳紀錄丟給 `upload_api_post_batch()` 前逐筆換算時間戳：**有裝置自己認證過的量測時間戳（`device_measured_key != 0`，目前只有血壓計）就優先用 `fora_protocol_measured_key_to_epoch_ms()` 換算**（不依賴 NTP，實測過就算這次 NTP 校時失敗，血壓數值的時間戳依然正確），其餘裝置才用 `wall_clock_to_epoch_ms()`（校時失敗就維持 boot-relative）。依上傳結果用 `storage_mark_uploaded()` 標記成功或失敗（失敗的下次會重試），最後關掉 WiFi、回到 BLE 接收模式。
+上傳模式。先讀 flash 裡的裝置設定（`storage_load_config()`），沒設定過就直接放棄（點三連閃錯誤燈號）。有設定的話，用 `cyw43_arch_wifi_connect_async()` 開 WiFi station 模式連線，依序嘗試多種認證模式（`WIFI_AUTH_MODES_TO_TRY[]`，因為分享器種類很多，不寫死單一種）。連線成功的判斷**不是**單純信任 `cyw43_wifi_link_status()`（實測發現這個狀態有時候不會準時回報成功，即使 lwIP 的 DHCP 早就真的拿到 IP 了），而是直接檢查 `netif_is_up()` 且 netif 的 IP 不是 `0.0.0.0`——這是修過的一個關鍵 bug，詳見 PROJECT_PLAN.md 第 8 節第 1 點。連上後呼叫 `wall_clock_sync()` 嘗試 NTP 校時（見 `wall_clock.c`），再把 `storage_pending_records()` 取出的待傳紀錄丟給 `upload_api_post_batch()`（傳入 `config.upload_server_host`／`config.upload_api_key`）前逐筆換算時間戳：**有裝置自己認證過的量測時間戳（`device_measured_key != 0`，目前只有血壓計）就優先用 `fora_protocol_measured_key_to_epoch_ms()` 換算**（不依賴 NTP，實測過就算這次 NTP 校時失敗，血壓數值的時間戳依然正確），其餘裝置才用 `wall_clock_to_epoch_ms()`（校時失敗就維持 boot-relative）。依上傳結果用 `storage_mark_uploaded()` 標記成功或失敗（失敗的下次會重試），最後關掉 WiFi、回到 BLE 接收模式。
+
+**（2026-08-06 加做，尚未實機測試）** `DEVICE_CLOCK_SANITY_WINDOW_MS`（7 天）：裝置自己的時間戳換算成 epoch ms 之後，如果 Pico 已經 NTP 校時過，會跟現在時間比對，差距超過這個範圍就判定裝置時鐘不可信（電池換過、從沒設定過等情況），退回用 Pico 收到 BLE 通知的時間換算；Pico 自己都還沒校時過的話沒有基準可以比對，照樣採用裝置時間戳。
 
 ---
 
@@ -78,7 +82,7 @@ BLE 接收模式，24/7 常駐狀態。用 BTstack 當 GAP central：主動掃�
 
 - `fora_protocol_matches_advertisement()`：判斷掃到的廣播封包是不是 FORA 裝置（比對名稱含 "FORA"），並依名稱裡有沒有 "O2"／"D40" 進一步分辨是哪一種型號，透過 `fora_device_kind_t *out_kind` 回傳。
 - `fora_protocol_build_command()`：組出三種裝置共用的 8-byte 指令格式 `{0x51, cmd, p1..p4, 0xA3, checksum}`，checksum 是前 7 bytes 總和的低位元組。血壓計用這個組「問記錄」的兩段式指令（`FORA_BP_CMD_GET_RECORD_PART_A`/`_B`）。
-- `fora_protocol_parse_reading()`：依 `fora_device_kind_t` 決定用哪一種格式解析。額溫槍/血氧計是自訂的 `0x51` 開頭封包（借用 Nordic SDK 範例板的自訂 characteristic）；血壓計**不是**標準 Bluetooth SIG Blood Pressure Measurement 格式，是同一套自訂 pipe 的私有格式（呼叫端已經把兩次指令的回應接成 8 bytes 才傳進來，見 `mode_ble_receive.c` 的兩段式合併邏輯）。一次呼叫最多可能解出 3 筆數值（血壓計：收縮壓+舒張壓+脈搏），回傳實際筆數。每筆填入的 `vital_record_t` 都會設定 `source_kind`（記錄是哪種裝置回報的，給 `storage.c` 判重時區分共用型別如 `VITAL_TYPE_PULSE_RATE` 用）；血壓計還會額外填 `device_measured_key`（其餘裝置固定填 0）。
+- `fora_protocol_parse_reading()`：依 `fora_device_kind_t` 決定用哪一種格式解析。額溫槍/血氧計是自訂的 `0x51` 開頭封包（借用 Nordic SDK 範例板的自訂 characteristic）；血壓計**不是**標準 Bluetooth SIG Blood Pressure Measurement 格式，是同一套自訂 pipe 的私有格式（呼叫端已經把兩次指令的回應接成 8 bytes 才傳進來，見 `mode_ble_receive.c` 的兩段式合併邏輯）。一次呼叫最多可能解出 3 筆數值（血壓計：收縮壓+舒張壓+脈搏），回傳實際筆數。每筆填入的 `vital_record_t` 都會設定 `source_kind`（記錄是哪種裝置回報的，給 `storage.c` 判重時區分共用型別如 `VITAL_TYPE_PULSE_RATE` 用）；血壓計還會額外填 `device_measured_key`（其餘裝置固定填 0）。**⚠️ 已知缺口**：FORA D40 是血壓血糖二合一裝置，「問目前這一筆記錄」的回應可能是血壓、也可能是血糖（回應 `byte[2]` 的 bit7 分辨，見 PROJECT_PLAN.md 第 6.3/6.4 節），目前這個函式完全沒有檢查這個 bit，無條件當成血壓解析——使用者量過一次血糖之後，下次血壓計連線讀到的「最新記錄」就會是那筆血糖資料被誤當成血壓數值上傳。血糖協定本身已經反推確認（PROJECT_PLAN.md 6.4 節），但解析函式裡還沒接上這個分流判斷，是目前優先權最高的待辦（PROJECT_PLAN.md 第 7.1 節第 1、2 點）。
 - `fora_protocol_decode_measured_key()`：血壓記錄的 `byte[0..3]` 藏著裝置內部時鐘認證過的量測日期/時分（day/month/year/hour/minute，分鐘解析度），這裡解碼成一個可以直接比較是否相等的鍵值，給 `storage.c` 判重用（同一個鍵值保證是同一筆記錄）。
 - `fora_protocol_measured_key_to_datetime()` / `fora_protocol_measured_key_to_epoch_ms()`：把上面的鍵值還原成年/月/日/時/分，或換算成 epoch ms（假設裝置內部時鐘存的是本地時間 UTC+8，`common.h` 的 `LOCAL_UTC_OFFSET_SEC`），分別給 `display_status.c` 畫面顯示、`mode_upload.c` 上傳用——這個時間戳代表「裝置實際量測的時間」，不是「Pico 收到 BLE 通知的時間」，兩者可能有延遲，而且完全不依賴 NTP 校時（實測驗證過 NTP 失敗時血壓的時間戳依然正確）。`days_from_civil()` 是 Howard Hinnant 的年/月/日換算天數演算法（CC0 授權），跟 `display_status.c` 的 `civil_month_day_from_days()` 是同一套演算法的另一半。
 
@@ -87,21 +91,26 @@ BLE 接收模式，24/7 常駐狀態。用 BTstack 當 GAP central：主動掃�
 ## 網路上傳實作
 
 ### `src/upload_api.c` / `upload_api.h`
-把 `vital_record_t` 陣列組成 JSON、透過 HTTPS POST 送到伺服器。流程：`dns_gethostbyname()` 解析目標主機名 → 用 lwIP 的 `altcp_tls` 包一層 TLS 建立連線 → 用 `mbedtls_ssl_set_hostname()` 設定 SNI（Cloudflare 這類多租戶邊緣節點靠這個決定轉給哪個 tunnel）→ `altcp_write()` 送出組好的 HTTP request → 收回應判斷有沒有 `200`。伺服器位址（`UPLOAD_SERVER_HOST`）目前寫死在檔案開頭常數，因為 `device_config_t` 還沒有存這個欄位的地方，是刻意的測試階段簡化（見檔案裡的 TODO 註解）。這個檔案裡也提供了 `mbedtls_ms_time()` 的實作，因為 mbedtls 官方版本只支援 POSIX/Windows，在 Pico 這種 bare-metal 環境要自己接一個版本進去（用 pico SDK 的單調時鐘）。
+把 `vital_record_t` 陣列組成 JSON、透過 HTTPS POST 送到伺服器。流程：`dns_gethostbyname()` 解析目標主機名 → 用 lwIP 的 `altcp_tls` 包一層 TLS 建立連線 → 用 `mbedtls_ssl_set_hostname()` 設定 SNI（Cloudflare 這類多租戶邊緣節點靠這個決定轉給哪個 tunnel）→ `altcp_write()` 送出組好的 HTTP request → 收回應判斷有沒有 `200`。這個檔案裡也提供了 `mbedtls_ms_time()` 的實作，因為 mbedtls 官方版本只支援 POSIX/Windows，在 Pico 這種 bare-metal 環境要自己接一個版本進去（用 pico SDK 的單調時鐘）。
+
+**（2026-08-06 加做，尚未實機測試）** `upload_api_post_batch()` 簽名新增 `server_host`／`api_key` 兩個參數（來自 `device_config_t`，`mode_upload.c` 呼叫時傳入）：`server_host` 留空就退回檔案開頭的 `UPLOAD_SERVER_HOST_DEFAULT`（原本寫死的測試網址，現在只是預設值）；`api_key` 有值的話 `build_request()` 會加一個 `X-API-Key` 標頭（先過濾非可印出 ASCII 字元）。TLS 憑證驗證改成看 `upload_tls_ca_cert.h` 的 `UPLOAD_CA_CERT_PEM` 陣列有沒有內容：有內容就連同長度一起交給 `altcp_tls_create_config_client()`（lwIP 會自動改成要求驗證），沒有內容維持原本的不驗證模式，但現在每次都會在 log 印出明顯警告，不再是靜默的不安全狀態。
+
+### `src/upload_tls_ca_cert.h`（2026-08-06 新增，尚未實機測試）
+只有一個常數 `UPLOAD_CA_CERT_PEM`，目前是空字串——正式後端網址確定之後，把該伺服器的憑證/CA PEM 貼進這裡，`upload_api.c` 就會自動改成真正驗證憑證鏈，不用改其他程式碼。檔案裡有詳細的取得憑證方式說明（`openssl s_client`／`openssl x509` 指令）。
 
 ---
 
 ### `src/wall_clock.c` / `wall_clock.h`
 Pico 開機時沒有網路，不知道真實時間，量測當下只能記錄開機以來的毫秒數（boot-relative）。這個檔案在 `mode_upload.c` 每次 WiFi 連上時嘗試跟公開的 NTP 伺服器（`pool.ntp.org`）校時一次，記住「校時那一刻的 boot ms 對應到哪個真實世界 epoch ms」，之後任何 boot-relative 時間點都能線性換算成真實時間。校時透過 lwIP 內建的 `pico_lwip_sntp` 函式庫，`lwipopts.h` 把 `SNTP_SET_SYSTEM_TIME_US` 巨集接到這個檔案裡的 `wall_clock_sntp_set_system_time_us()`。校時失敗（例如逾時）不影響上傳本身，只是那批資料的時間戳會維持 boot-relative 值。
 
-**（2026-08-05 修 bug）** 原本 `s_synced` 成功過一次就永遠是 `true`，導致實際上只有開機後第一次呼叫 `wall_clock_sync()` 才會真的打 NTP，之後每次上傳都被誤判成「已經校過時」直接跳過，長時間運作下 RP2040 震盪器的漂移完全沒有機會被修正。改成每天最多真的重新校時一次（`NTP_RESYNC_INTERVAL_MS`），並且伺服器改成清單（`pool.ntp.org`／`time.cloudflare.com`）輪流試，其中一個失敗換下一個；如果已經有過基準點、這次重新校時又失敗，會保留舊基準點而不是整個放棄，見 PROJECT_PLAN.md 第 7 節第 3 點。
+**（2026-08-05 修 bug）** 原本 `s_synced` 成功過一次就永遠是 `true`，導致實際上只有開機後第一次呼叫 `wall_clock_sync()` 才會真的打 NTP，之後每次上傳都被誤判成「已經校過時」直接跳過，長時間運作下 RP2040 震盪器的漂移完全沒有機會被修正。改成每 `NTP_RESYNC_INTERVAL_MS`（目前 6 小時，2026-08-05 從 24 小時調整，頻率負擔仍很小，多留一點餘裕應付長時間運作的漂移累積）最多真的重新校時一次，並且伺服器改成清單（`pool.ntp.org`／`time.cloudflare.com`）輪流試，其中一個失敗換下一個；如果已經有過基準點、這次重新校時又失敗，會保留舊基準點而不是整個放棄，見 PROJECT_PLAN.md 第 7.2 節第 4 點。
 
 ---
 
 ## 共用資料型別
 
 ### `src/common.h`
-純資料定義，沒有任何函式實作。`device_config_t`（熱點設定模式收集的 WiFi 帳密＋個案資訊）、`vital_type_t`（體溫/血氧/脈搏/收縮壓/舒張壓/**血糖**，血糖欄位是保留給以後用的，協定還沒接）、`vital_record_t`（一筆量測紀錄：接收時間、數值、上傳時間、上傳狀態、`device_measured_key`、`source_kind`）。這三個型別貫穿 `storage.c`、`mode_ble_receive.c`、`mode_upload.c`、`upload_api.c`、`fora_protocol.c`，是串起整條資料流的共同語言。
+純資料定義，沒有任何函式實作。`device_config_t`（熱點設定模式收集的 WiFi 帳密＋個案資訊，**2026-08-06 新增** `upload_server_host`／`upload_api_key` 兩個欄位，見 `mode_ap_config.c`／`upload_api.c` 說明）、`vital_type_t`（體溫/血氧/脈搏/收縮壓/舒張壓/**血糖**，血糖協定已於 2026-08-06 反推確認並實作，見 PROJECT_PLAN.md 第 6.4 節）、`vital_record_t`（一筆量測紀錄：接收時間、數值、上傳時間、上傳狀態、`device_measured_key`、`source_kind`）。這三個型別貫穿 `storage.c`、`mode_ble_receive.c`、`mode_upload.c`、`upload_api.c`、`fora_protocol.c`，是串起整條資料流的共同語言。
 
 `LOCAL_UTC_OFFSET_SEC`：這個專案目前只在台灣用，統一假設本地時間是 UTC+8，`display_status.c`（校時後換算真人看得懂的時鐘）跟 `fora_protocol.c`（血壓計自己時鐘的量測時間換算成 epoch ms）共用同一份常數，避免兩邊各自寫一份之後改一邊忘記改另一邊。
 
@@ -114,7 +123,9 @@ Pico 開機時沒有網路，不知道真實時間，量測當下只能記錄開
 ## 持久化與暫存
 
 ### `src/storage.c` / `storage.h`
-兩種資料都會寫進 flash，用兩個不同的保留 sector 區塊分開存，互不影響：**裝置設定**（`device_config_t`）存在最後一個 sector，`mode_ap_config.c` 存、`mode_upload.c` 讀。**待傳生理資料**（`vital_record_t` 陣列，`MAX_PENDING_RECORDS 128`）存在再往前保留的幾個 sector（`persist_pending_records()`，`storage_append_record()`／`storage_mark_uploaded()` 呼叫時都會整份覆寫一次），開機時 `storage_init()` 會讀回，所以斷電或上傳失敗都不會遺失尚未成功上傳的資料。兩者都用 `flash_safe_execute()` 安全地抹寫，讀取直接用 XIP 位址存取。**注意：這個做法沒有 wear-leveling**，正式量產前如果讀值頻率提高，需評估升級成 littlefs（見 PROJECT_PLAN.md 第 8 節第 7 點）。
+三種資料都會寫進 flash，用三個不同的保留 sector 區塊分開存，互不影響：**裝置設定**（`device_config_t`）存在最後一個 sector，`mode_ap_config.c` 存、`mode_upload.c` 讀。**待傳生理資料**（`vital_record_t` 陣列，`MAX_PENDING_RECORDS 128`）存在再往前保留的幾個 sector（`persist_pending_records()`，`storage_append_record()`／`storage_mark_uploaded()` 呼叫時都會整份覆寫一次），開機時 `storage_init()` 會讀回，所以斷電或上傳失敗都不會遺失尚未成功上傳的資料。**已上傳歷史**（見下方說明）存在再更前面的 sector。三者都用 `flash_safe_execute()` 安全地抹寫，讀取直接用 XIP 位址存取。**注意：這個做法沒有 wear-leveling**，正式量產前如果讀值頻率提高，需評估升級成 littlefs（見 PROJECT_PLAN.md 第 8 節第 7 點）。
+
+**（2026-08-06 加做，尚未實機測試，主持人明確提出的需求）** `storage_mark_uploaded()` 原本上傳成功的紀錄會直接從待傳佇列移除、不再保留在任何地方。**主持人不希望上傳完後本機資料被直接清除**，新增 `s_upload_history[]`（`MAX_UPLOAD_HISTORY 200`，環狀緩衝，滿了覆蓋最舊一筆）跟對應的 `persist_upload_history()`／`storage_get_upload_history()`：上傳成功的紀錄除了從待傳佇列移除，也會複製一份進這個緩衝並持久化。**200 這個數字是概略估計**（假設單一個案一天約 20 筆讀值、涵蓋 1~2 週），不是精確計算或使用者指定的值，見 PROJECT_PLAN.md 第 7.3 節「待與相關人員確認事項」。目前沒有任何介面能讀出這份歷史，只是先把資料保留下來。
 
 `storage_pending_records()` 會撈出 `PENDING` 跟 `FAILED` 狀態的紀錄（不是只有 `PENDING`——之前這裡篩選條件寫錯，導致上傳失敗過一次的紀錄永遠不會再被重傳，是修過的一個 bug）。上傳失敗+斷電都不會遺失資料：失敗的紀錄留在佇列裡（標記 `FAILED`，不會被丟棄），只要佇列非空、BLE_RECEIVE 閒置就會被 `mode_ble_receive_run()` 觸發重新嘗試上傳，不需要額外的定時器；待傳佇列本身持久化在 flash，斷電重開機後 `storage_init()` 會讀回繼續重試。
 
@@ -144,7 +155,9 @@ Waveshare Pico-ePaper-2.9 電子紙顯示器封裝，跟 `led_status.c` 平行�
 
 **「Scanning」狀態文字的心跳**：故意不用靜態文字，會帶時間戳（`mode_ble_receive.c` 的 `update_scanning_status()`），且在沒有裝置連線活動時每 180 秒定期重新呼叫一次，讓使用者能從畫面判斷「裝置還活著、只是沒掃到裝置」跟「裝置已經當機、畫面凍結」的差別。
 
-**（硬體規格書要求，見 PROJECT_PLAN.md 12.5.1 節）** `end_frame_and_refresh()` 是四種畫面共用的唯一刷新入口：電子紙不能長時間維持通電/高電壓是硬性規定，每次刷新都是「喚醒 → 畫 → `EPD_2IN9_V2_Sleep()`」，兩次刷新之間面板永遠在睡眠狀態。資料手冊建議的「刷新間隔至少 180 秒」**這條建議值本身刻意沒有嚴格遵守，以使用方便性為原則**（真的有新資料/狀態要顯示時不delay），但保留了「距離上次刷新超過 24 小時就算內容沒變也強制刷一次」；上面提到的「Scanning」心跳是唯一一個「定期、沒有實際新事件也會觸發」的刷新來源，這個改成比照資料手冊建議的 180 秒，跟「180 秒不嚴格遵守」的決定不衝突（那個決定針對的是有新事件時不要延遲，心跳沒有這個顧慮）。
+**（硬體規格書要求，見 PROJECT_PLAN.md 12.5.1 節）** `end_frame_and_refresh(void)` 是四種畫面共用的唯一刷新入口：電子紙不能長時間維持通電/高電壓是硬性規定，每次刷新都是「喚醒 → 畫 → `EPD_2IN9_V2_Sleep()`」，兩次刷新之間面板永遠在睡眠狀態。資料手冊建議的「刷新間隔至少 180 秒」**這條建議值本身刻意沒有嚴格遵守，以使用方便性為原則**（真的有新資料/狀態要顯示時不delay），但保留了「距離上次刷新超過 24 小時就算內容沒變也強制刷一次」；上面提到的「Scanning」心跳是唯一一個「定期、沒有實際新事件也會觸發」的刷新來源，這個改成比照資料手冊建議的 180 秒，跟「180 秒不嚴格遵守」的決定不衝突（那個決定針對的是有新事件時不要延遲，心跳沒有這個顧慮）。
+
+**（2026-08-06 曾經加過 Phase 3 局部刷新又拿掉了）** 一度加了 `prefer_partial` 參數讓 BLE_RECEIVE 畫面優先用 `EPD_2IN9_V2_Display_Partial()`。重新檢視後發現沒有任何實測觀察到的具體場景真的需要它（原本設想「全刷卡住 2-3 秒可能讓 BLE 主迴圈錯過裝置短暫廣播窗口」只是理論推測，從沒真的觀察到發生過），局部刷新換來的速度/不閃黑好處要用「沒有實機驗證過的呼叫順序」跟「疊代殘影需要額外清理邏輯」這些真實風險去換，不值得，決定拿掉、只保留全刷（`EPD_2IN9_V2_Display_Base()`），見 PROJECT_PLAN.md 第 12.5 節。
 
 `display_status.c` 內部有一個 `sanitize_ascii()`：使用者在 AP_CONFIG 表單填的 `patient_id` 沒有限制輸入內容，理論上可能填中文，但目前只有 ASCII 字型（見下方 `epd/` 說明），直接把非 ASCII byte 丟給 `Paint_DrawChar()` 可能亂碼甚至讀到無效 flash 位址——所有使用者自由輸入的欄位在畫到螢幕前都會先過濾成只剩可印出 ASCII 字元。**呼叫端自己組的狀態文字/錯誤訊息不會被這個函式過濾，必須自己確保是純英文**（`display_status.h` 檔頭有這個限制的說明）。
 
