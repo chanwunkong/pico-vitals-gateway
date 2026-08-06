@@ -14,9 +14,7 @@
 
 #include <stdio.h>
 
-// 曾經卡在「DHCP 明明成功拿到 IP，卻被誤判逾時、整個連線被砍掉重建」的 bug
-// （見下面用 netif 直接檢查 IP 而非只信任 cyw43_wifi_link_status() 的邏輯），
-// 30 秒是留給 DHCP 重試（實測最壞情況約 15-16 秒）+ 認證本身的餘裕。
+// 30 秒是留給 DHCP 重試＋認證本身的餘裕。
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 #define MAX_BATCH_SIZE 32
 
@@ -24,9 +22,7 @@
 // 過——電池換過、從沒設定過、韌體預設值都可能讓這個時鐘跟真實時間差很多年。
 // 跟 Pico 自己 NTP 校時過的現在時間比對，差距超過這個範圍就不信任裝置時鐘，
 // 退回用 Pico 收到 BLE 通知的時間（見 fora_protocol_measured_key_to_epoch_ms()
-// 呼叫端的判斷）。7 天遠大於正常情況下「量測到上傳」的延遲（整個系統設計下
-// 最慢也只有幾分鐘等級，見 DEVICE_RECONNECT_COOLDOWN_MS），足以只在裝置時鐘
-// 明顯錯誤（差好幾個月/年）時才觸發，不會誤傷正常情況。
+// 呼叫端的判斷）。這個值待與主持人確認，見 PROJECT_PLAN.md 第 7.3 節。
 #define DEVICE_CLOCK_SANITY_WINDOW_MS (7ULL * 24 * 60 * 60 * 1000)
 
 // 認證模式不寫死——分享器種類很多，依常見程度排序嘗試，直到成功或全部試完。
@@ -58,10 +54,8 @@ void mode_upload_run(void) {
     for (size_t i = 0; i < num_modes; i++) {
         printf("[UPLOAD] trying auth mode 0x%08x...\n", WIFI_AUTH_MODES_TO_TRY[i]);
 
-        // 除錯用：cyw43_arch_wifi_connect_timeout_ms() 只回傳最終成功/失敗，
-        // 看不到中間過程。改用 async 版本自己輪詢 cyw43_wifi_link_status()，
-        // 才能知道到底是卡在認證（一直停在 JOIN 之前）還是認證過了卡在等
-        // DHCP 配 IP（停在 NOIP），這兩種問題完全不同、修法也不一樣。
+        // 用 async 版本自己輪詢 cyw43_wifi_link_status()，可以區分是卡在認證
+        // （停在 JOIN 之前）還是認證過了卡在等 DHCP 配 IP（停在 NOIP）。
         int async_err = cyw43_arch_wifi_connect_async(
             config.wifi_ssid, config.wifi_password, WIFI_AUTH_MODES_TO_TRY[i]);
         if (async_err != 0) {
@@ -82,10 +76,9 @@ void mode_upload_run(void) {
                 last_status = status;
             }
 
-            // 除錯發現 cyw43_wifi_link_status() 有時候不會準時回報 CYW43_LINK_UP，
-            // 即使 lwIP 的 DHCP 早就 dhcp_bind() 拿到合法 IP 了——只信任這個狀態
-            // 會白白等到逾時，然後 disable/enable_sta_mode() 反而把已經成功的
-            // 連線砍掉重來。改成直接檢查 netif 本身是否已經有真實 IP。
+            // cyw43_wifi_link_status() 有時候不會準時回報 CYW43_LINK_UP，即使
+            // lwIP 的 DHCP 早就拿到合法 IP，所以另外直接檢查 netif 是否已經有
+            // 真實 IP，兩個條件任一成立就視為已連線。
             struct netif *sta_netif = &cyw43_state.netif[CYW43_ITF_STA];
             if (netif_is_up(sta_netif) && !ip4_addr_isany_val(*netif_ip4_addr(sta_netif))) {
                 printf("[UPLOAD]   netif has IP %s, treating as connected.\n",
@@ -124,16 +117,17 @@ void mode_upload_run(void) {
     size_t count = storage_pending_records(batch, MAX_BATCH_SIZE);
     printf("[UPLOAD] WiFi connected, %u pending record(s) to upload.\n", (unsigned)count);
 
+    // 不管這次有沒有資料要傳，只要 WiFi 已經連上就順便嘗試一次 NTP 校時——
+    // KEY1 手動觸發（見 mode_ble_receive.c）就算佇列是空的也會走到這裡，
+    // 讓使用者能確認網路時間校得準不準，不是只有「有資料要傳」才做。
+    wall_clock_sync(8000);
+
     if (count == 0) {
         display_status_show_upload(config.wifi_ssid, "Connected, nothing to send");
-    }
-
-    if (count > 0) {
+    } else {
         // 量測時 Pico 還沒連網路，received_at_ms 存的是 boot-relative 的 ms，
-        // 沒有意義給人看。趁現在 WiFi 已經連上，跟 NTP 校時一次，把這批要上傳
-        // 的紀錄換算成真實世界時間再送出去（校時失敗就照舊傳 boot-relative
-        // 值，不影響上傳本身，只是這批資料的時間看起來還是不準）。
-        wall_clock_sync(8000);
+        // 沒有意義給人看，換算成真實世界時間再送出去（校時失敗就照舊傳
+        // boot-relative 值，不影響上傳本身，只是這批資料的時間看起來還是不準）。
         for (size_t i = 0; i < count; i++) {
             bool used_device_clock = false;
             if (batch[i].device_measured_key != 0) {

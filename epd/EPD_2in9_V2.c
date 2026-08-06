@@ -147,11 +147,17 @@ parameter:
 void EPD_2IN9_V2_ReadBusy(void)
 {
     Debug("e-Paper busy\r\n");
-	while(1)
-	{	 //=1 BUSY
-		if(DEV_Digital_Read(EPD_BUSY_PIN)==0) 
+	// 逾時上限 5 秒，逾時就放棄等待繼續往下執行。
+	const int timeout_ms = 5000;
+	int waited_ms = 0;
+	while(DEV_Digital_Read(EPD_BUSY_PIN) != 0)
+	{
+		if (waited_ms >= timeout_ms) {
+			printf("[EPD] ReadBusy() timed out after %dms, giving up wait.\r\n", timeout_ms);
 			break;
+		}
 		DEV_Delay_ms(50);
+		waited_ms += 50;
 	}
 	DEV_Delay_ms(50);
     Debug("e-Paper busy release\r\n");

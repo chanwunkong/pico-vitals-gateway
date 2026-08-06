@@ -5,11 +5,7 @@
 
 #include <stdio.h>
 
-// 2026-08-05 從 24 小時改成 6 小時：RP2040 內建震盪器的漂移量級是一天幾秒，
-// 不需要每次上傳都重打一次 NTP（那樣每次上傳都多一次網路來回，卻幾乎沒有
-// 實質收穫），但 6 小時一次的頻率負擔還是很小——只是趁 WiFi 已經連線時順便
-// 打一個很小的 UDP 封包，不會額外開一次 WiFi 連線，比 24 小時多留一點餘裕
-// 應付長時間連續運作的漂移累積。開機後第一次呼叫（從沒成功校時過）一定會
+// 不需要每次上傳都重打一次 NTP：開機後第一次呼叫（從沒成功校時過）一定會
 // 真的去打，之後只有距離上次成功校時超過這個間隔才會真的重新查詢，其餘時間
 // 直接沿用已經校過的基準點。
 #define NTP_RESYNC_INTERVAL_MS (6ULL * 60 * 60 * 1000)
@@ -31,6 +27,7 @@ static volatile bool s_callback_fired = false;
 static bool s_have_basis = false;
 static uint64_t s_sync_epoch_ms = 0;
 static uint64_t s_sync_boot_ms = 0;
+static bool s_force_resync = false;
 
 // lwipopts.h 把這個函式接到 SNTP_SET_SYSTEM_TIME_US 巨集，lwIP 的 sntp.c 收到
 // NTP 伺服器回應時會直接呼叫。sec/us 是 NTP 回應換算出來的 UTC epoch 時間。
@@ -56,20 +53,29 @@ static bool try_one_server(const char *server, uint32_t timeout_ms) {
     return s_callback_fired;
 }
 
+void wall_clock_request_resync(void) {
+    s_force_resync = true;
+}
+
 bool wall_clock_sync(uint32_t timeout_ms) {
-    if (s_have_basis) {
+    bool force = s_force_resync;
+    s_force_resync = false;
+
+    if (s_have_basis && !force) {
         uint64_t now_ms = to_ms_since_boot(get_absolute_time());
         if (now_ms - s_sync_boot_ms < NTP_RESYNC_INTERVAL_MS) {
-            // 距離上次成功校時還不到 24 小時，沿用現有基準點，不用再打網路。
-            // 這裡故意還是印一行 log——這個分支完全不打網路，如果不印任何
-            // 東西，從 log 完全看不出「時間到底有沒有校過」，之前排查上傳
-            // 問題時就因為這樣誤以為時間校時本身失敗了，其實只是校過之後
-            // 每次都安靜地跳過而已。
+            // 距離上次成功校時還沒超過 NTP_RESYNC_INTERVAL_MS，沿用現有基準點，
+            // 不用再打網路。這個分支完全不打網路，仍印一行 log 讓人從 log 就能
+            // 看出時間有沒有校過，而不是誤以為校時失敗了。
             printf("[TIME] using existing sync from %llums ago (epoch_ms=%llu)\n",
                    (unsigned long long)(now_ms - s_sync_boot_ms), (unsigned long long)s_sync_epoch_ms);
             return true;
         }
-        printf("[TIME] last NTP sync was >=24h ago, refreshing...\n");
+    }
+    if (force) {
+        printf("[TIME] forced resync requested, refreshing...\n");
+    } else if (s_have_basis) {
+        printf("[TIME] last NTP sync exceeded resync interval, refreshing...\n");
     }
 
     uint32_t per_server_timeout_ms = (uint32_t)(timeout_ms / NTP_SERVER_COUNT);

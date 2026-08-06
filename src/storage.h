@@ -4,20 +4,17 @@
 #include "common.h"
 #include <stddef.h>
 
-// 設定資料存在 flash 最後一個保留 sector，寫入透過 flash_safe_execute() 執行，
-// 讀取直接用 XIP 位址存取（讀取不需要暫停中斷）。
+// 設定值、待傳生理資料清單、已上傳歷史都持久化在 littlefs 掛載的一個 flash
+// 分區裡（各自是分區裡的一個檔案：config.bin／pending.bin／history.bin，見
+// lfs_pico_hal.c/.h），抹寫會在分區內的多個 block 之間輪替。
 //
-// 生理資料（vital_record_t）待傳清單同樣會整份寫回 flash（config 前面再保留
-// 幾個 sector），每次新增/標記上傳結果都整份覆寫一次，所以斷電或上傳失敗
-// 都不會遺失尚未成功上傳的資料，重開機會自動讀回繼續重試。
-// 這個做法沒有 wear leveling，寫入頻率高的話會較快耗損那幾個 sector；
-// 正式量產前如果讀值頻率提高，需評估升級成 littlefs，見 PROJECT_PLAN.md 第7節。
+// 生理資料（vital_record_t）待傳清單會整份寫回 flash，每次新增/標記上傳
+// 結果都整份覆寫一次，所以斷電或上傳失敗都不會遺失尚未成功上傳的資料，
+// 重開機會自動讀回繼續重試。
 //
 // 上傳成功的紀錄不會立刻從本機消失：另外用一個環狀緩衝（最近
 // MAX_UPLOAD_HISTORY 筆，見 storage.c）保留一份已上傳歷史，一樣持久化在
-// flash（待傳佇列前面再保留幾個 sector），供之後查驗/除錯用，見
-// storage_get_upload_history()。這是主持人明確提出的需求，見 PROJECT_PLAN.md
-// 第 5 節。
+// 同一個分區裡，供之後查驗/除錯用，見 storage_get_upload_history()。
 
 void storage_init(void);
 
@@ -58,5 +55,14 @@ bool storage_get_last_upload_time(uint64_t *out_ms);
 // 立刻從本機消失」的說明——這份資料獨立於待傳佇列之外，紀錄一旦上傳成功
 // 就會同時進到這裡，滿了（MAX_UPLOAD_HISTORY 筆）會覆蓋最舊的一筆。
 size_t storage_get_upload_history(vital_record_t *out, size_t max_count);
+
+// 已上傳歷史目前總共有幾筆（跟 storage_pending_count() 是兩份獨立的計數，
+// 這個只計已上傳成功、進到 storage_get_upload_history() 那份環狀緩衝的）。
+size_t storage_get_upload_history_count(void);
+
+// 取出最近上傳成功的「最新」max_count 筆（跟 storage_get_upload_history()
+// 從最舊開始取不同，這個是從最新往回取），一樣最舊的排前面、最新的排最後，
+// 回傳實際取出筆數。畫面顯示「最近幾筆上傳紀錄」用。
+size_t storage_get_recent_upload_history(vital_record_t *out, size_t max_count);
 
 #endif // STORAGE_H

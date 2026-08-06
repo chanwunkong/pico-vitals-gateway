@@ -24,8 +24,10 @@ add_executable(pico_gateway
     src/mode_upload.c
     src/upload_api.c
     src/led_status.c
+    src/button_input.c
     src/display_status.c
     src/storage.c
+    src/lfs_pico_hal.c
     src/wall_clock.c
     dhcpserver.c
     dnsserver.c
@@ -41,6 +43,10 @@ add_executable(pico_gateway
     # QR code 編碼器（Nayuki QR-Code-generator），AP_CONFIG 畫面的 WiFi QR code 用，
     # 見 PROJECT_PLAN.md 第 12.7 節。
     qrcode/qrcodegen.c
+    # littlefs（設定值/待傳資料/已上傳歷史的 flash 持久化，取代舊版手刻的固定
+    # sector 讀寫，有 wear-leveling），見 PROJECT_PLAN.md 第 9 節、src/storage.c。
+    littlefs/lfs.c
+    littlefs/lfs_util.c
 )
 
 target_include_directories(pico_gateway PRIVATE
@@ -49,6 +55,7 @@ target_include_directories(pico_gateway PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/epd
     ${CMAKE_CURRENT_LIST_DIR}/epd/Fonts
     ${CMAKE_CURRENT_LIST_DIR}/qrcode
+    ${CMAKE_CURRENT_LIST_DIR}/littlefs
 )
 
 pico_enable_stdio_usb(pico_gateway 1)
@@ -65,7 +72,6 @@ target_link_libraries(pico_gateway
     hardware_flash
     hardware_spi
     pico_flash
-    pico_unique_id
 )
 
 pico_add_extra_outputs(pico_gateway)

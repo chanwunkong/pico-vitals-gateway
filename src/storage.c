@@ -1,68 +1,28 @@
 #include "storage.h"
 
-#include "hardware/flash.h"
-#include "hardware/regs/addressmap.h"
-#include "pico/flash.h"
+#include "lfs.h"
+#include "lfs_pico_hal.h"
 
+#include <stdio.h>
 #include <string.h>
 
-#define CONFIG_MAGIC 0x50494B31u // "PIK1"
-#define CONFIG_FLASH_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
-
-typedef struct {
-    uint32_t magic;
-    device_config_t config;
-} config_flash_block_t;
-
-#define CONFIG_PAGE_BYTES (FLASH_PAGE_SIZE * \
-    ((sizeof(config_flash_block_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE))
+// 設定值/待傳佇列/已上傳歷史各自是 littlefs 分區裡的一個檔案，見 storage.h
+// 開頭的說明。
+#define CONFIG_FILENAME "config.bin"
+#define PENDING_FILENAME "pending.bin"
+#define HISTORY_FILENAME "history.bin"
 
 #define MAX_PENDING_RECORDS 128
 
-#define PENDING_MAGIC 0x50494B32u // "PIK2"
+// 上傳成功後紀錄不會立刻消失，保留最近 MAX_UPLOAD_HISTORY 筆已上傳的紀錄
+// （環狀緩衝，滿了覆蓋最舊的一筆），見 storage_get_upload_history()。
+#define MAX_UPLOAD_HISTORY 200
 
-typedef struct {
-    uint32_t magic;
-    uint32_t count;
-    vital_record_t records[MAX_PENDING_RECORDS];
-} pending_flash_block_t;
-
-#define PENDING_PAGE_BYTES (FLASH_PAGE_SIZE * \
-    ((sizeof(pending_flash_block_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE))
-#define PENDING_FLASH_SECTORS \
-    ((PENDING_PAGE_BYTES + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE)
-#define PENDING_FLASH_SIZE (PENDING_FLASH_SECTORS * FLASH_SECTOR_SIZE)
-// 保留在 config 那個 sector 前面，跟 config 分開各自一塊，互不影響。
-#define PENDING_FLASH_OFFSET (CONFIG_FLASH_OFFSET - PENDING_FLASH_SIZE)
+static lfs_t s_lfs;
+static bool s_lfs_mounted = false;
 
 static vital_record_t s_records[MAX_PENDING_RECORDS];
 static size_t s_record_count = 0;
-
-// 2026-08-06 加做：上傳成功後紀錄不會立刻消失，保留最近 MAX_UPLOAD_HISTORY
-// 筆已上傳的紀錄，供之後查驗/除錯用（見 PROJECT_PLAN.md 第 5 節「已上傳紀錄
-// 保留機制」的說明；這是主持人明確提出的需求：不希望上傳完後本機資料被直接
-// 清除，至少要保留紀錄）。用環狀緩衝，滿了就覆蓋最舊的一筆，不會無限成長。
-// 200 筆的選擇是概略估計：單一個案就算四種生理值都密集量測（一天合計約
-// 20 筆），200 筆大約涵蓋 1~2 週的份量，在「保留多少歷史」跟「flash 空間/
-// 磨損」之間取一個折衷值，不是精確計算出來的，如果之後發現份量不夠或太多，
-// 這裡是唯一要調整的地方。
-#define MAX_UPLOAD_HISTORY 200
-#define UPLOAD_HISTORY_MAGIC 0x50494B33u // "PIK3"
-
-typedef struct {
-    uint32_t magic;
-    uint32_t count;      // 目前有效筆數（環狀緩衝還沒繞滿一圈之前 < MAX_UPLOAD_HISTORY）
-    uint32_t next_index; // 下一筆要寫入的位置
-    vital_record_t records[MAX_UPLOAD_HISTORY];
-} upload_history_flash_block_t;
-
-#define UPLOAD_HISTORY_PAGE_BYTES (FLASH_PAGE_SIZE * \
-    ((sizeof(upload_history_flash_block_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE))
-#define UPLOAD_HISTORY_FLASH_SECTORS \
-    ((UPLOAD_HISTORY_PAGE_BYTES + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE)
-#define UPLOAD_HISTORY_FLASH_SIZE (UPLOAD_HISTORY_FLASH_SECTORS * FLASH_SECTOR_SIZE)
-// 保留在待傳佇列那個區塊前面，三塊（history/pending/config）各自獨立、互不影響。
-#define UPLOAD_HISTORY_FLASH_OFFSET (PENDING_FLASH_OFFSET - UPLOAD_HISTORY_FLASH_SIZE)
 
 static vital_record_t s_upload_history[MAX_UPLOAD_HISTORY];
 static uint32_t s_upload_history_count = 0;
@@ -81,140 +41,150 @@ static bool s_last_reading_valid[VITAL_TYPE_COUNT];
 static uint64_t s_last_upload_at_ms;
 static bool s_last_upload_valid = false;
 
-// 血壓計（理論上額溫槍/血氧計也可能）量測完會持續廣播一段時間，裝置本身不會
-// 標記「這筆記錄已經被讀走」——冷卻時間（見 mode_ble_receive.c 的
-// DEVICE_RECONNECT_COOLDOWN_MS）一到就會重新連線，每次都拿到一模一樣的「目前
-// 最新一筆」記錄。2026-08-05 實測證實：同一次量測在 35 秒左右的重連週期下，
-// 被當成 3 筆不同紀錄重複上傳到伺服器（見 PROJECT_PLAN.md 第 6.3 節）。
-//
-// 血壓計的記錄本身帶有裝置自己認證過的量測時間戳（見
-// vital_record_t.device_measured_key），這種情況下直接比對時間戳是否相等，
-// 不需要猜時間窗口——同一個時間戳保證是同一筆記錄，不同時間戳保證是不同筆
-// （裝置量測本身要 30-45 秒，同一分鐘不可能量出兩筆）。只有在協定沒有提供
-// 時間戳的裝置（額溫槍/血氧計，device_measured_key 恆為 0）才退回用這個
-// 經驗法則：數值完全相同、且時間間隔在這個視窗內就當作重複。設 10 分鐘：
-// 遠大於觀察到的重連週期，足以蓋過裝置整段廣播期間；如果同一種類型真的在
-// 10 分鐘內量出完全相同的數值，會被誤判成重複而漏傳一筆，但比起現況（同一筆
-// 量測值無限重複灌進伺服器）是更好的取捨。
+// 沒有裝置量測時間戳可用時（device_measured_key 恆為 0 的裝置）的判重備案：
+// 數值完全相同、且時間間隔在這個視窗內就當作重複。
 #define DUPLICATE_SUPPRESS_WINDOW_MS (10ull * 60 * 1000)
 
 static void persist_pending_records(void);
 static void persist_upload_history(void);
 
-typedef struct {
-    uint32_t flash_offset;
-    uint32_t erase_size;
-    const void *data;
-    size_t data_size;
-} flash_write_params_t;
-
-static void flash_erase_and_program(void *param) {
-    flash_write_params_t *p = (flash_write_params_t *)param;
-    flash_range_erase(p->flash_offset, p->erase_size);
-    flash_range_program(p->flash_offset, (const uint8_t *)p->data, p->data_size);
+// 掛載 littlefs；第一次使用或資料損毀時 lfs_mount() 會失敗，這時候格式化後
+// 重新掛載一次。
+static bool lfs_mount_or_format(void) {
+    int err = lfs_mount(&s_lfs, &lfs_pico_cfg);
+    if (err != 0) {
+        printf("[STORAGE] lfs_mount() failed (err=%d), formatting flash partition...\n", err);
+        int fmt_err = lfs_format(&s_lfs, &lfs_pico_cfg);
+        if (fmt_err != 0) {
+            printf("[STORAGE] lfs_format() failed (err=%d), storage will be RAM-only this boot.\n", fmt_err);
+            return false;
+        }
+        err = lfs_mount(&s_lfs, &lfs_pico_cfg);
+        if (err != 0) {
+            printf("[STORAGE] lfs_mount() after format still failed (err=%d), storage will be "
+                   "RAM-only this boot.\n", err);
+            return false;
+        }
+    }
+    return true;
 }
 
 void storage_init(void) {
     s_record_count = 0;
+    s_upload_history_count = 0;
+    s_upload_history_next = 0;
     memset(s_last_reading_valid, 0, sizeof(s_last_reading_valid));
     s_last_upload_valid = false;
 
-    const pending_flash_block_t *stored =
-        (const pending_flash_block_t *)(XIP_BASE + PENDING_FLASH_OFFSET);
-    if (stored->magic == PENDING_MAGIC && stored->count <= MAX_PENDING_RECORDS) {
-        // 上次可能是上傳失敗或直接斷電，flash 裡還留著沒傳完的紀錄，讀回來繼續重試。
-        memcpy(s_records, stored->records, stored->count * sizeof(vital_record_t));
-        s_record_count = stored->count;
+    s_lfs_mounted = lfs_mount_or_format();
+    if (!s_lfs_mounted) {
+        // 掛載/格式化都失敗（理論上不會發生，除非 flash 硬體真的壞了）——
+        // 讓其餘程式碼繼續跑，只是這次開機的資料不會持久化，見上面各個
+        // storage_xxx() 函式裡對 s_lfs_mounted 的檢查。
+        return;
     }
 
-    const upload_history_flash_block_t *history =
-        (const upload_history_flash_block_t *)(XIP_BASE + UPLOAD_HISTORY_FLASH_OFFSET);
-    if (history->magic == UPLOAD_HISTORY_MAGIC && history->count <= MAX_UPLOAD_HISTORY &&
-        history->next_index < MAX_UPLOAD_HISTORY) {
-        memcpy(s_upload_history, history->records, sizeof(s_upload_history));
-        s_upload_history_count = history->count;
-        s_upload_history_next = history->next_index;
+    // 上次可能是上傳失敗或直接斷電，flash 裡還留著沒傳完的紀錄，讀回來繼續
+    // 重試。檔案格式：開頭 4 bytes 是筆數，後面接著實際的 vital_record_t
+    // 陣列——不需要像舊版那樣另外存 magic number 判斷「有沒有存過」，
+    // lfs_file_open() 開不到檔案本身就代表沒存過。
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, PENDING_FILENAME, LFS_O_RDONLY) == 0) {
+        uint32_t count = 0;
+        lfs_ssize_t header_read = lfs_file_read(&s_lfs, &file, &count, sizeof(count));
+        if (header_read == (lfs_ssize_t)sizeof(count) && count <= MAX_PENDING_RECORDS) {
+            lfs_ssize_t data_read = lfs_file_read(&s_lfs, &file, s_records, count * sizeof(vital_record_t));
+            if (data_read == (lfs_ssize_t)(count * sizeof(vital_record_t))) {
+                s_record_count = count;
+            } else {
+                printf("[STORAGE] pending.bin truncated/corrupt (expected %u record(s), "
+                       "read %ld bytes), discarding.\n", (unsigned)count, (long)data_read);
+            }
+        }
+        lfs_file_close(&s_lfs, &file);
+    }
+
+    if (lfs_file_open(&s_lfs, &file, HISTORY_FILENAME, LFS_O_RDONLY) == 0) {
+        uint32_t count = 0, next_index = 0;
+        lfs_ssize_t count_read = lfs_file_read(&s_lfs, &file, &count, sizeof(count));
+        lfs_ssize_t next_read = lfs_file_read(&s_lfs, &file, &next_index, sizeof(next_index));
+        if (count_read == (lfs_ssize_t)sizeof(count) && next_read == (lfs_ssize_t)sizeof(next_index) &&
+            count <= MAX_UPLOAD_HISTORY && next_index < MAX_UPLOAD_HISTORY) {
+            lfs_ssize_t data_read = lfs_file_read(&s_lfs, &file, s_upload_history, sizeof(s_upload_history));
+            if (data_read == (lfs_ssize_t)sizeof(s_upload_history)) {
+                s_upload_history_count = count;
+                s_upload_history_next = next_index;
+            } else {
+                printf("[STORAGE] history.bin truncated/corrupt (read %ld bytes), discarding.\n",
+                       (long)data_read);
+            }
+        }
+        lfs_file_close(&s_lfs, &file);
     }
 }
 
 bool storage_load_config(device_config_t *out) {
-    const config_flash_block_t *stored =
-        (const config_flash_block_t *)(XIP_BASE + CONFIG_FLASH_OFFSET);
-
-    if (stored->magic != CONFIG_MAGIC) {
-        return false; // flash 是空的 (0xFFFFFFFF)，代表還沒設定過
+    if (!s_lfs_mounted) {
+        return false;
     }
-
-    memcpy(out, &stored->config, sizeof(device_config_t));
-    return true;
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, CONFIG_FILENAME, LFS_O_RDONLY) != 0) {
+        return false; // 檔案不存在，代表還沒設定過
+    }
+    lfs_ssize_t n = lfs_file_read(&s_lfs, &file, out, sizeof(*out));
+    lfs_file_close(&s_lfs, &file);
+    return n == (lfs_ssize_t)sizeof(*out);
 }
 
 bool storage_save_config(const device_config_t *config) {
-    static uint8_t page_buf[CONFIG_PAGE_BYTES];
-    memset(page_buf, 0xFF, sizeof(page_buf));
-
-    config_flash_block_t block;
-    block.magic = CONFIG_MAGIC;
-    memcpy(&block.config, config, sizeof(device_config_t));
-    memcpy(page_buf, &block, sizeof(block));
-
-    flash_write_params_t params = {
-        .flash_offset = CONFIG_FLASH_OFFSET,
-        .erase_size = FLASH_SECTOR_SIZE,
-        .data = page_buf,
-        .data_size = sizeof(page_buf),
-    };
-    int rc = flash_safe_execute(flash_erase_and_program, &params, 1000);
-    return rc == PICO_OK;
+    if (!s_lfs_mounted) {
+        return false;
+    }
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, CONFIG_FILENAME,
+                       LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) != 0) {
+        return false;
+    }
+    lfs_ssize_t n = lfs_file_write(&s_lfs, &file, config, sizeof(*config));
+    int close_err = lfs_file_close(&s_lfs, &file); // close 會 flush 寫入快取
+    return n == (lfs_ssize_t)sizeof(*config) && close_err == 0;
 }
 
 // 把目前 RAM 裡的待傳清單整份寫回 flash，讓斷電或上傳失敗都不會遺失資料。
-// 沒有 wear leveling，每次呼叫都會整份覆寫——見 storage.h 開頭的取捨說明。
 static void persist_pending_records(void) {
-    static uint8_t page_buf[PENDING_PAGE_BYTES];
-    memset(page_buf, 0xFF, sizeof(page_buf));
-
-    // page_buf 直接當成 pending_flash_block_t 寫，省掉再多開一份跟它一樣大的
-    // 區域變數（這個 struct 含 128 筆 vital_record_t，放堆疊上太浪費）。
-    pending_flash_block_t *block = (pending_flash_block_t *)page_buf;
-    block->magic = PENDING_MAGIC;
-    block->count = (uint32_t)s_record_count;
-    memcpy(block->records, s_records, s_record_count * sizeof(vital_record_t));
-
-    flash_write_params_t params = {
-        .flash_offset = PENDING_FLASH_OFFSET,
-        .erase_size = PENDING_FLASH_SIZE,
-        .data = page_buf,
-        .data_size = sizeof(page_buf),
-    };
-    flash_safe_execute(flash_erase_and_program, &params, 1000);
+    if (!s_lfs_mounted) {
+        return;
+    }
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, PENDING_FILENAME,
+                       LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) != 0) {
+        printf("[STORAGE] persist_pending_records: lfs_file_open failed\n");
+        return;
+    }
+    uint32_t count = (uint32_t)s_record_count;
+    lfs_file_write(&s_lfs, &file, &count, sizeof(count));
+    lfs_file_write(&s_lfs, &file, s_records, s_record_count * sizeof(vital_record_t));
+    lfs_file_close(&s_lfs, &file);
 }
 
-// 把目前 RAM 裡的已上傳歷史紀錄整份寫回 flash。沒有 wear leveling，每次有
-// 新紀錄加進來都會整份覆寫——跟 persist_pending_records() 同樣的取捨，見
-// storage.h 開頭的說明。
+// 把目前 RAM 裡的已上傳歷史紀錄整份寫回 flash。
 static void persist_upload_history(void) {
-    static uint8_t page_buf[UPLOAD_HISTORY_PAGE_BYTES];
-    memset(page_buf, 0xFF, sizeof(page_buf));
-
-    upload_history_flash_block_t *block = (upload_history_flash_block_t *)page_buf;
-    block->magic = UPLOAD_HISTORY_MAGIC;
-    block->count = s_upload_history_count;
-    block->next_index = s_upload_history_next;
-    memcpy(block->records, s_upload_history, sizeof(s_upload_history));
-
-    flash_write_params_t params = {
-        .flash_offset = UPLOAD_HISTORY_FLASH_OFFSET,
-        .erase_size = UPLOAD_HISTORY_FLASH_SIZE,
-        .data = page_buf,
-        .data_size = sizeof(page_buf),
-    };
-    flash_safe_execute(flash_erase_and_program, &params, 1000);
+    if (!s_lfs_mounted) {
+        return;
+    }
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, HISTORY_FILENAME,
+                       LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) != 0) {
+        printf("[STORAGE] persist_upload_history: lfs_file_open failed\n");
+        return;
+    }
+    lfs_file_write(&s_lfs, &file, &s_upload_history_count, sizeof(s_upload_history_count));
+    lfs_file_write(&s_lfs, &file, &s_upload_history_next, sizeof(s_upload_history_next));
+    lfs_file_write(&s_lfs, &file, s_upload_history, sizeof(s_upload_history));
+    lfs_file_close(&s_lfs, &file);
 }
 
-// 上傳成功的紀錄加進環狀歷史緩衝——見上面 MAX_UPLOAD_HISTORY 的說明，這是
-// 主持人要求的「上傳完不要立刻清掉本機資料」，跟待傳佇列（只保留還沒傳完的）
-// 是分開的兩份資料，這份會在紀錄離開待傳佇列之後繼續留著一段時間。
+// 上傳成功的紀錄加進環狀歷史緩衝，跟待傳佇列（只保留還沒傳完的）是分開的兩份資料。
 static void append_to_upload_history(const vital_record_t *record) {
     s_upload_history[s_upload_history_next] = *record;
     s_upload_history_next = (s_upload_history_next + 1) % MAX_UPLOAD_HISTORY;
@@ -224,18 +194,11 @@ static void append_to_upload_history(const vital_record_t *record) {
 }
 
 bool storage_append_record(const vital_record_t *record) {
-    // 重複量測判斷：跟上一筆同類型的「最後讀值」比對數值是否完全相同、時間間隔
-    // 是否在 DUPLICATE_SUPPRESS_WINDOW_MS 之內，是的話視為同一次量測被重複
-    // 廣播/重新連線收到，不重複塞進待傳佇列（見上面常數的說明）。要在覆寫
-    // s_last_reading 之前比對，不然會拿新紀錄跟自己比。
-    // 2026-08-05 加上 source_kind 比對：VITAL_TYPE_PULSE_RATE 同時被血氧計跟
-    // 血壓計共用（見 common.h vital_record_t.source_kind 的說明），如果只比對
-    // vital_type_t、不管是哪種裝置量的，會把「血氧計這次的脈搏」誤判成要跟
-    // 「血壓計上次回報的脈搏」比較——兩種裝置的數值只要剛好相同，血氧計真正
-    // 的新讀值就會被誤判成重複而漏傳（比多傳一筆更嚴重的方向：這是真的會遺失
-    // 資料的方向，2026-08-05 實測抓到過一次症狀，見 PROJECT_PLAN.md 第 6.3
-    // 節）。不同裝置種類回報同一種 vital_type_t 一律當作不同來源，不比對、
-    // 直接視為新資料。
+    // 重複量測判斷：跟上一筆「同類型、同來源裝置」的最後讀值比對（source_kind
+    // 也要相同，見 common.h 的說明，避免不同裝置共用同一個 vital_type_t 時
+    // 互相誤判），數值是否完全相同、時間間隔是否在 DUPLICATE_SUPPRESS_WINDOW_MS
+    // 之內，是的話視為同一次量測被重複廣播/重新連線收到，不重複塞進待傳佇列。
+    // 要在覆寫 s_last_reading 之前比對，不然會拿新紀錄跟自己比。
     bool is_duplicate = false;
     if (record->type < VITAL_TYPE_COUNT && s_last_reading_valid[record->type] &&
         record->source_kind == s_last_reading[record->type].source_kind) {
@@ -340,6 +303,20 @@ size_t storage_get_upload_history(vital_record_t *out, size_t max_count) {
     size_t n = 0;
     for (size_t i = 0; i < s_upload_history_count && n < max_count; i++) {
         out[n++] = s_upload_history[(oldest_index + i) % MAX_UPLOAD_HISTORY];
+    }
+    return n;
+}
+
+size_t storage_get_upload_history_count(void) {
+    return s_upload_history_count;
+}
+
+size_t storage_get_recent_upload_history(vital_record_t *out, size_t max_count) {
+    size_t oldest_index = (s_upload_history_count < MAX_UPLOAD_HISTORY) ? 0 : s_upload_history_next;
+    size_t n = s_upload_history_count < max_count ? s_upload_history_count : max_count;
+    size_t skip = s_upload_history_count - n;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = s_upload_history[(oldest_index + skip + i) % MAX_UPLOAD_HISTORY];
     }
     return n;
 }

@@ -17,8 +17,8 @@
 // （沿用同一個序列埠，不會重複初始化）。
 void display_status_init(void);
 
-// 開機驗證用畫面：固定文字＋整片全刷，用來確認接線/方向/字型顯示正確
-// （2026-08-05 已實機驗證過，見 PROJECT_PLAN.md 12 節）。main.c 開機時呼叫一次。
+// 開機驗證用畫面：固定文字＋整片全刷，用來確認接線/方向/字型顯示正確。
+// main.c 開機時呼叫一次。
 void display_status_show_boot_test(void);
 
 // 熱點設定模式（AP_CONFIG）畫面：熱點 SSID/密碼 + 目前已存的個案編號（沒有
@@ -59,5 +59,11 @@ void display_status_format_clock(uint64_t boot_ms, char *out, size_t out_size);
 // 不要呼叫這個函式（會被這裡覆蓋掉）——那幾個模式改呼叫對應的
 // display_status_show_xxx()，內容在該模式執行期間變動不頻繁，不需要輪詢。
 void display_status_poll(void);
+
+// 已上傳歷史摘要畫面：KEY2 觸發的陽春文字列表，最多顯示 7 筆（見 display_status.c
+// 的 HISTORY_DISPLAY_MAX_ROWS），records 應該是最舊排前面、最新排最後（見
+// storage_get_recent_upload_history()）。跟 show_upload()/show_error() 一樣是
+// 直接畫、直接刷新，呼叫端負責決定顯示多久之後要換回 BLE_RECEIVE 畫面。
+void display_status_show_upload_history(const vital_record_t *records, size_t count, size_t total_count);
 
 #endif // DISPLAY_STATUS_H

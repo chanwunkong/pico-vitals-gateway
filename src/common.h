@@ -43,10 +43,6 @@ typedef enum {
     VITAL_TYPE_PULSE_RATE,
     VITAL_TYPE_SYSTOLIC,
     VITAL_TYPE_DIASTOLIC,
-    // FORA D40 是血壓血糖二合一裝置，血糖跟血壓走同一套指令/資料管道，靠
-    // 回應裡的一個旗標 bit 分辨，見 fora_protocol.h 開頭註解跟
-    // PROJECT_PLAN.md 第 6.3/6.4 節。協定已反推確認，但只比對過官方反編譯
-    // 原始碼，還沒有實機量測比對過。
     VITAL_TYPE_GLUCOSE,
     VITAL_TYPE_COUNT, // 型別數量，不是實際的量測類型，只用來宣告陣列大小
 } vital_type_t;
@@ -67,24 +63,15 @@ typedef struct {
     // 裝置自己回報的量測時間（分鐘解析度，編碼方式見 fora_protocol.h 的
     // fora_protocol_parse_reading() 說明），0 代表這種裝置的協定沒有這個資訊
     // （目前額溫槍/血氧計是 0，血壓計有值）。storage.c 判斷是不是同一次量測
-    // 被重複廣播/重連收到時，這個欄位有值就以它為準（同一個時間戳＝裝置認證
-    // 過的同一筆記錄，不是靠猜的），只有在雙方都是 0（沒有這個資訊可比對）
-    // 才退回用「數值相同+短時間內」的經驗法則，見 storage_append_record()。
-    // 只在 RAM 裡比對用，不會被序列化進上傳的 JSON（build_request() 沒有用到
-    // 這個欄位）、也不需要 flash 持久化格式相容性考量。
+    // 被重複廣播/重連收到時，這個欄位有值就以它為準，只有在雙方都是 0 才
+    // 退回用「數值相同+短時間內」的經驗法則，見 storage_append_record()。
+    // 只在 RAM 裡比對用，不會序列化進上傳的 JSON。
     uint32_t device_measured_key;
     // 是哪一種裝置回報的這筆讀值（實際數值範圍/意義由對應的協定模組定義，
-    // 目前是 fora_protocol.h 的 fora_device_kind_t，這裡故意用不透明的
-    // uint8_t 而不是直接引用那個型別，避免 common.h 反過來依賴
-    // fora_protocol.h 造成循環 include）。
-    //
-    // 2026-08-05 加這個欄位的原因：VITAL_TYPE_PULSE_RATE 這個 vital_type_t
-    // 同時被血氧計跟血壓計共用（兩種裝置都會回報脈搏），storage.c
-    // 判斷「是不是同一次量測被重複收到」時，如果只比對 vital_type_t 不看是
-    // 哪種裝置量的，會把「血氧計這次的脈搏」誤判成「跟血壓計上次回報的脈搏
-    // 比較」，兩種裝置剛好量到同一個數字時會把血氧計真正的新讀值誤判成重複
-    // 而漏傳（比多傳一筆更嚴重的方向）。storage_append_record() 判重時要求
-    // source_kind 也要相同才能算重複，見該函式的說明。
+    // 目前是 fora_protocol.h 的 fora_device_kind_t，這裡用不透明的 uint8_t
+    // 存，避免 common.h 反過來依賴 fora_protocol.h 造成循環 include）。
+    // storage_append_record() 判重時要求 source_kind 也要相同才算重複，見
+    // 該函式的說明。
     uint8_t source_kind;
 } vital_record_t;
 

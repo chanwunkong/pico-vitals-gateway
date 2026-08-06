@@ -1,16 +1,30 @@
 #include "mode_ble_receive.h"
 
+#include "button_input.h"
 #include "common.h"
 #include "display_status.h"
 #include "fora_protocol.h"
 #include "led_status.h"
 #include "storage.h"
+#include "wall_clock.h"
 
 #include "btstack.h"
 #include "pico/time.h"
 
 #include <stdio.h>
 #include <string.h>
+
+// KEY0 需要連續按住這麼久才會觸發進入熱點設定模式（見 button_input.h），
+// 避免不小心碰到就誤觸發；跟開機時「按住 BOOTSEL」的窗口時間量級一致。
+#define KEY0_ENTER_CONFIG_HOLD_MS 3000
+
+// KEY2 觸發已上傳歷史畫面，顯示這麼久之後自動換回 BLE_RECEIVE 即時畫面。
+#define KEY2_HISTORY_VIEW_MS 8000
+#define KEY2_HISTORY_DISPLAY_ROWS 7
+
+// 還沒校時成功時，每隔這麼久主動連一次 WiFi 重試 NTP，不等待收到裝置讀值
+// 才觸發（見主迴圈裡的說明）。校時成功後這個計時器就不會再觸發。
+#define NTP_UNSYNCED_RETRY_MS (5 * 60 * 1000)
 
 // 狀態機結構參考 BTstack 範例 lib/btstack/example/gatt_heart_rate_client.c：
 // 掃描 -> 連線 -> 探索服務 -> 探索特徵值 -> 訂閱通知 -> 持續接收。
@@ -43,51 +57,15 @@ static uint32_t s_idle_timeout_ms;
 // （血氧計前面多了好幾個標準服務），handle 編號並不通用，混用會查詢失敗。
 static fora_device_kind_t s_current_kind = FORA_DEVICE_UNKNOWN;
 
-// 每種裝置拿到讀值之後，多久內不要再重新連線同一種裝置——裝置量測完常常會
-// 持續廣播好一陣子，如果一拿到資料就馬上又進到 UPLOAD、上傳完馬上又回到
-// BLE_RECEIVE 重新掃描，這時候裝置多半都還醒著/還在廣播，會立刻被重新連線
-// 再讀一次幾乎一樣的數值，變成裝置被反覆喚醒、storage 裡累積一堆重複紀錄。
-// 這個冷卻時間**不是**每次進 BLE_RECEIVE 模式就重置，是跨越 BLE_RECEIVE/
-// UPLOAD 模式切換持續有效的，才能真正讓裝置閒置下來、有機會走到它自己的
-// 休眠邏輯。依裝置種類分開追蹤，額溫槍的冷卻不影響血氧計、反之亦然。
-//
-// 2026-08-05 從單一共用的 60 秒改成依裝置種類分開設定：實測發現 FORA IR42
-// 額溫槍看起來是「只要通電就持續廣播」，不是量測完才廣播一段時間就停——60
-// 秒冷卻一到，裝置多半都還在原地廣播，馬上又被連線讀一次，讀到的值有時候
-// 還在緩慢漂移（例如同一顆額溫槍隔幾輪讀到 36.5 -> 36.8 -> 37.0 -> 37.1，不是
-// 同一個量測值不變），看起來比較像是連續感應中，不是「使用者又量了一次」，
-// 造成裝置被反覆喚醒、待傳資料被反覆覆蓋成幾乎沒有意義的新值，所以額溫槍
-// 拉長到 1 分鐘。
-//
-// 2026-08-05 稍後：血壓計（FORA D40）原本維持 5 秒冷卻，但實測發現它量完一次
-// 之後會持續廣播非常久（觀察到的重連週期是 5 秒冷卻+連線+上傳耗時，約
-// 30-40 秒一次循環，遠遠超過額溫槍的問題），導致裝置一直被 Pico 重新喚醒、
-// 沒有機會真正休眠。現在有 fora_protocol_decode_measured_key() 帶來的裝置端
-// 量測時間戳可以正確判斷「是不是同一次量測」（見 storage.c 的
-// storage_append_record()），已經不需要靠「短冷卻、盡快抓到新量測」這個手段
-// 來確保正確性了，所以比照額溫槍拉長到 1 分鐘，減少不必要的重連。
-//
-// 2026-08-05 再調整：拉到 1 分鐘後實測發現裝置還是完全不會自己關機（量測完
-// 超過 30 分鐘依然持續廣播、回應連線）。使用者提供關鍵線索：這台裝置在「傳送
-// 舊記錄」模式下設計是 3 分鐘無活動就會自動關機——但 Pico 每 60 秒就重新連線
-// 一次，很可能每次連線都把裝置自己的關機倒數計時器重置掉了，導致它永遠撐不到
-// 3 分鐘這個門檻。拉長到 4 分鐘（240 秒），比裝置的 3 分鐘門檻多留 1 分鐘餘裕，
-// 讓 Pico 真的有機會空出一段夠長的時間不去碰它，才有機會讓裝置自己觸發關機。
-// 判重邏輯不依賴冷卻時間長短（見上面的說明），拉長不會犧牲正確性，只是「偵測
-// 到真正新的一次量測」最慢會慢 4 分鐘。
-//
-// 2026-08-06 使用者確認每種裝置的自動休眠設計值，整理成下表——**這幾個冷卻
-// 時間存在的唯一理由就是要讓裝置真正撐到自己的休眠門檻**，跟判重的正確性
-// 無關（判重靠時間戳/數值比對，見上面說明），所以冷卻時間只要「夠長、能讓
-// 裝置真的睡著」就好，設太長只是讓真正的新量測晚一點被抓到，不影響正確性，
-// 這是目前取捨的原則（在「裝置能不能真的休眠」跟「多久能確認/擋掉重複資料」
-// 之間找平衡，優先滿足前者，因為後者本來就有時間戳/數值比對兜底）：
-//   額溫槍：官方休眠門檻 1 分鐘 → 冷卻設 60 秒（等於門檻，沒有額外餘裕）。
-//   血壓計：官方休眠門檻 3 分鐘 → 冷卻設 4 分鐘（240 秒，多留 1 分鐘餘裕，
-//     見上面 2026-08-05 的說明）。
-//   血氧計：目前沒有已知的官方休眠門檻資訊，5 秒是暫定值，等之後確認實際
-//     門檻後應該要比照額溫槍/血壓計的做法重新設定（見 PROJECT_PLAN.md 第 7
-//     節的待確認事項）。
+// 每種裝置拿到讀值之後，多久內不要再重新連線同一種裝置，讓裝置有機會走到
+// 它自己的休眠邏輯。這個冷卻時間**不是**每次進 BLE_RECEIVE 模式就重置，是
+// 跨越 BLE_RECEIVE/UPLOAD 模式切換持續有效的。依裝置種類分開追蹤，額溫槍的
+// 冷卻不影響血氧計、反之亦然。判重邏輯不依賴冷卻時間長短（靠裝置端時間戳/
+// 數值比對，見 storage.c 的 storage_append_record()），冷卻時間只要「夠長、
+// 能讓裝置真的睡著」就好：
+//   額溫槍：官方休眠門檻 1 分鐘 → 冷卻設 60 秒。
+//   血壓計：官方休眠門檻 3 分鐘 → 冷卻設 4 分鐘（240 秒，多留 1 分鐘餘裕）。
+//   血氧計：官方休眠門檻未知，5 秒是暫定值，見 PROJECT_PLAN.md 第 7 節。
 static const uint32_t DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_KIND_COUNT] = {
     [FORA_DEVICE_UNKNOWN] = 0,
     [FORA_DEVICE_THERMOMETER] = 60 * 1000,
@@ -132,6 +110,18 @@ static bool s_have_display_config = false;
 // update_scanning_status() 的說明。
 static absolute_time_t s_last_scanning_status_update_at;
 
+// 上一次嘗試「還沒校時成功就主動重試 NTP」的時間戳，見主迴圈裡 NTP_UNSYNCED_RETRY_MS
+// 的檢查。**故意不在 mode_ble_receive_run() 開頭重置**（跟 s_kind_cooldown_until[]
+// 的道理一樣）：零值（開機時的預設值）代表「無窮久以前」，讓開機後第一次檢查
+// 就會成立、立刻嘗試一次校時，不用空等滿一整個 NTP_UNSYNCED_RETRY_MS 週期；
+// 之後每次真的觸發重試時才會更新這個時間戳，重新開始計算下一次的間隔。
+static absolute_time_t s_last_ntp_retry_at;
+
+// KEY2 觸發歷史畫面期間暫停呼叫 display_status_poll()，不然畫面會馬上被
+// BLE_RECEIVE 即時內容蓋掉，見主迴圈裡的說明。
+static bool s_showing_history = false;
+static absolute_time_t s_history_view_until;
+
 // 組出「Scanning (last: HH:MM)」這種帶時間戳的狀態文字並更新畫面
 // （display_status_set_ble_receive() 本身不會馬上刷新面板，實際刷新由
 // display_status_poll() 內容比對後決定，見 display_status.h 的說明）。
@@ -158,23 +148,29 @@ static void start_scan(void) {
     gap_start_scan();
 }
 
+// 這一輪服務/特徵值探索有沒有真的找到符合的 UUID——GATT_EVENT_QUERY_COMPLETE
+// 只代表查詢本身正常跑完，不代表有找到結果（陌生裝置沒有這個 service/
+// characteristic 時，查詢一樣會「成功」完成，但完全沒有結果）。每次開始探索
+// 前重置，收到對應的 QUERY_RESULT 事件才設成 true。
+static bool s_discovery_found = false;
+
 static void discover_service(void) {
     s_ble_state = BLE_STATE_DISCOVER_SERVICE;
-    // 2026-08-05 更正：血壓計也是走跟額溫槍/血氧計相同的 Nordic LED/Button
-    // Service 自訂 128-bit UUID pipe，不是標準 Blood Pressure Service（見
-    // fora_protocol.h 開頭的說明），三種裝置現在都用同一套探索方式。
+    s_discovery_found = false;
+    // 三種裝置都走同一個 Nordic LED/Button Service 自訂 128-bit UUID pipe
+    // （見 fora_protocol.h 開頭的說明），用同一套探索方式。
     gatt_client_discover_primary_services_by_uuid128(
         handle_gatt_client_event, s_connection_handle, FORA_SERVICE_UUID128);
 }
 
 static void discover_characteristic(void) {
     s_ble_state = BLE_STATE_DISCOVER_CHARACTERISTIC;
+    s_discovery_found = false;
     gatt_client_discover_characteristics_for_service_by_uuid128(
         handle_gatt_client_event, s_connection_handle, &s_fora_service, FORA_CHARACTERISTIC_UUID128);
 }
 
-// 三種裝置現在都走同一套自訂 pipe 的 Notify 機制（血壓計 2026-08-05 之前
-// 誤以為要用標準 Indicate，見 fora_protocol.h 的更正說明）。
+// 三種裝置都走同一套自訂 pipe 的 Notify 機制。
 static void enable_value_updates(void) {
     s_ble_state = BLE_STATE_ENABLE_NOTIFY;
     gatt_client_listen_for_characteristic_value_updates(
@@ -204,8 +200,7 @@ static void send_bp_get_record_part(uint8_t cmd) {
         s_connection_handle, s_fora_characteristic.value_handle, sizeof(command), command);
 }
 
-// 額溫槍/血氧計用 Notify、血壓計用標準 Indicate 推播，兩種來源的 payload
-// 都送進這裡解析、存起來、斷線——共用同一份邏輯。
+// 三種裝置的 Notify payload 都送進這裡解析、存起來、斷線——共用同一份邏輯。
 static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
     vital_record_t records[FORA_MAX_READINGS_PER_NOTIFICATION];
     size_t record_count = fora_protocol_parse_reading(s_current_kind, value, value_len, records);
@@ -220,9 +215,7 @@ static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
         records[i].status = UPLOAD_STATUS_PENDING;
         storage_append_record(&records[i]);
         // 手動格式化浮點數，避免依賴 newlib-nano 預設未啟用的 printf float 支援；
-        // 用四捨五入到小數點後 1 位，不是無條件捨去——之前這裡跟 upload_api.c
-        // 修過的那個 bug 是同一種截斷誤差（36.8 印成 36.79），只是這裡是 debug
-        // log 專用的另一份格式化邏輯，之前沒有一起修到。
+        // 用四捨五入到小數點後 1 位，不是無條件捨去。
         int tenths = (int)(records[i].value * 10.0f + (records[i].value >= 0.0f ? 0.5f : -0.5f));
         int whole = tenths / 10;
         int frac = tenths % 10;
@@ -239,13 +232,11 @@ static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
     gap_disconnect(s_connection_handle);
 }
 
-// 已知的 FORA IR42 位址（前面幾次連線測試確認過），debug log 直接鎖定這顆裝置，
-// 不再只靠裝置名稱判斷──manufacturer data 可能出現在沒有帶名稱的廣播封包裡。
+// 已知的 FORA IR42 位址，debug log 用來直接鎖定這顆裝置，不只靠裝置名稱
+// 判斷──manufacturer data 可能出現在沒有帶名稱的廣播封包裡。
 static const bd_addr_t FORA_KNOWN_ADDR = { 0xC0, 0x26, 0xDA, 0x28, 0xB6, 0xE6 };
 
-// 除錯用：把掃描到的每個裝置名稱/位址/manufacturer data 印出來，方便直接比對
-// 「量測前」跟「量測後」廣播內容有沒有變化——用來驗證體溫數值是不是直接透過
-// 廣播封包（不需要建立連線）發出來的，而不是只能靠 GATT indication。
+// 除錯用：把掃描到的每個裝置名稱/位址/manufacturer data 印出來。
 static void debug_print_advertisement(uint8_t *packet, const uint8_t *adv_data, uint8_t adv_len) {
     bd_addr_t addr;
     gap_event_advertising_report_get_address(packet, addr);
@@ -331,16 +322,24 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
     switch (hci_event_packet_get_type(packet)) {
         case GATT_EVENT_SERVICE_QUERY_RESULT:
             gatt_event_service_query_result_get_service(packet, &s_fora_service);
+            s_discovery_found = true;
             break;
 
         case GATT_EVENT_CHARACTERISTIC_QUERY_RESULT:
             gatt_event_characteristic_query_result_get_characteristic(packet, &s_fora_characteristic);
+            s_discovery_found = true;
             break;
 
         case GATT_EVENT_QUERY_COMPLETE: {
             uint8_t att_status = gatt_event_query_complete_get_att_status(packet);
-            if (att_status != ATT_ERROR_SUCCESS) {
-                printf("[BLE] query failed at state=%d, att_status=0x%02x, disconnecting.\n", s_ble_state, att_status);
+            bool is_discovery_state = s_ble_state == BLE_STATE_DISCOVER_SERVICE ||
+                                       s_ble_state == BLE_STATE_DISCOVER_CHARACTERISTIC;
+            if (att_status != ATT_ERROR_SUCCESS || (is_discovery_state && !s_discovery_found)) {
+                // 查詢本身可能「成功」完成卻完全沒有結果（陌生裝置沒有這個
+                // service/characteristic），這種情況不能當成正常繼續往下走，
+                // 不然會拿沒填過的 s_fora_service/s_fora_characteristic 去用。
+                printf("[BLE] query failed or empty at state=%d, att_status=0x%02x, disconnecting.\n",
+                       s_ble_state, att_status);
                 gap_disconnect(s_connection_handle);
                 break;
             }
@@ -417,10 +416,9 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
         }
 
         case GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT: {
-            // 目前沒有任何裝置會主動觸發 Read（血壓計那個「等不到推播就補讀」的
-            // 備案已經拿掉，見上面 GATT_EVENT_QUERY_COMPLETE／BLE_STATE_ENABLE_NOTIFY
-            // 分支的說明），這個 case 保留著是給以後可能需要用 Read 的裝置
-            // （例如血糖）共用同一套解析流程。
+            // 目前沒有任何裝置會主動觸發 Read，三種裝置都是靠 Notify 推播
+            // 取值。這個 case 保留著給以後可能需要用 Read 的裝置共用同一套
+            // 解析流程。
             const uint8_t *value = gatt_event_characteristic_value_query_result_get_value(packet);
             uint16_t value_len = gatt_event_characteristic_value_query_result_get_value_length(packet);
             printf("[BLE] read value (%u bytes):", value_len);
@@ -438,7 +436,7 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
 }
 
 // 血壓計連線後先配對，配對完成後才根據有沒有快取 handle，決定直接訂閱
-// Indicate 還是先做服務/特徵值探索。
+// Notify 還是先做服務/特徵值探索。
 static void proceed_after_pairing(void) {
     if (s_handle_cache[s_current_kind].cached) {
         s_fora_service = s_handle_cache[s_current_kind].service;
@@ -503,6 +501,16 @@ static void handle_hci_event(uint8_t packet_type, uint16_t channel, uint8_t *pac
 
     if (event_type == HCI_EVENT_META_GAP &&
         hci_event_gap_meta_get_subevent_code(packet) == GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
+        uint8_t status = gap_subevent_le_connection_complete_get_status(packet);
+        if (status != ERROR_CODE_SUCCESS) {
+            // 連線嘗試失敗（逾時、裝置已離開範圍等），不會再有 HCI_EVENT_
+            // DISCONNECTION_COMPLETE 補上——沒有這個檢查的話狀態機會卡在
+            // BLE_STATE_CONNECTING，永遠不會回去掃描。
+            printf("[BLE] connection failed (status=0x%02x), resuming scan.\n", status);
+            s_connection_handle = HCI_CON_HANDLE_INVALID;
+            start_scan();
+            return;
+        }
         s_connection_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
         printf("[BLE] connected, handle=0x%04x\n", s_connection_handle);
         if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE) {
@@ -532,7 +540,7 @@ static void handle_hci_event(uint8_t packet_type, uint16_t channel, uint8_t *pac
     }
 }
 
-bool mode_ble_receive_run(uint32_t idle_timeout_ms) {
+mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
     // 只是給畫面顯示用（個案編號），讀一次 flash 就好；如果從沒設定過
     // （storage_load_config() 回傳 false），display_status 那邊會顯示 "(unset)"。
     s_have_display_config = storage_load_config(&s_display_config);
@@ -571,25 +579,67 @@ bool mode_ble_receive_run(uint32_t idle_timeout_ms) {
     s_last_reading_at = get_absolute_time();
     while (true) {
         led_status_poll();
-        display_status_poll();
+
+        // KEY2 顯示歷史畫面期間暫停呼叫 display_status_poll()，不然畫面會
+        // 馬上被 BLE_RECEIVE 即時內容蓋掉；逾時後恢復正常輪詢，poll() 會因為
+        // s_ble_screen_is_current 已經被 show_upload_history() 清成 false
+        // 而強制刷新一次，換回即時畫面。
+        if (s_showing_history) {
+            if (time_reached(s_history_view_until)) {
+                s_showing_history = false;
+            }
+        } else {
+            display_status_poll();
+        }
 
         // 只有在 Scanning 狀態（沒有裝置連線中）才需要定期把時間戳往前推進——
         // 一旦開始連線/配對/探索，畫面內容本來就會因為狀態切換而變動，不需要
         // 額外靠這個計時器刷新。跟其他讀值時間戳一樣走 display_status_poll()
         // 的內容比對機制，只有時間戳字串真的變了才會觸發一次全刷，不會每輪
-        // 迴圈都刷新面板。
-        //
-        // 2026-08-05：從 60 秒改成 180 秒——這是唯一一個「定期、沒有實際新
-        // 事件也會觸發」的刷新來源（其他畫面更新都是因為真的有新讀值/狀態
-        // 改變/待傳筆數變化才觸發），比照 Waveshare 資料手冊建議的刷新間隔
-        // 下限（見 PROJECT_PLAN.md 12.5.1 節），沒有理由讓這個心跳計時器成為
-        // 唯一違反建議值的刷新來源。跟 12.5.1 節「180 秒建議值不嚴格遵守」的
-        // 決定不衝突：那個決定是說「真的有新資料/狀態要顯示時不要因為還沒滿
-        // 180 秒就延遲顯示」，這裡剛好相反——沒有新事件，純粹是為了讓使用者
-        // 能分辨「裝置還活著」而定期刷新的心跳，本來就沒有「越快越好」的理由。
+        // 迴圈都刷新面板。每 180 秒觸發一次。
         if (s_ble_state == BLE_STATE_SCANNING &&
             absolute_time_diff_us(s_last_scanning_status_update_at, get_absolute_time()) / 1000 >= 180 * 1000) {
             update_scanning_status();
+        }
+
+        // KEY0 長按：使用者手動要求進入熱點設定模式，不用重新插拔電源找
+        // BOOTSEL。跟 BOOTSEL 那條路徑並存，沒有接這片電子紙的機器讀到的
+        // 一律是「沒按下」，見 button_input.h 的說明。
+        if (button_input_key0_long_press(KEY0_ENTER_CONFIG_HOLD_MS)) {
+            printf("[BLE] KEY0 long-press detected, entering AP_CONFIG.\n");
+            return MODE_BLE_RECEIVE_EXIT_ENTER_CONFIG;
+        }
+
+        // KEY1：手動要求做一次完整的 WiFi 動作（連線→強制重新 NTP 校時→
+        // 上傳，見 mode_upload.c），跳過 idle timeout 的等待。不像 idle
+        // timeout 那條路徑要求待傳佇列非空——就算沒有資料要傳，也要能連線
+        // 確認一次網路時間校得準不準。
+        if (button_input_key1_pressed()) {
+            printf("[BLE] KEY1 pressed, manually triggering WiFi action + NTP resync.\n");
+            wall_clock_request_resync();
+            return MODE_BLE_RECEIVE_EXIT_UPLOAD;
+        }
+
+        // KEY2：顯示已上傳歷史摘要畫面，看幾秒後自動換回即時畫面。
+        if (button_input_key2_pressed()) {
+            vital_record_t history[KEY2_HISTORY_DISPLAY_ROWS];
+            size_t shown = storage_get_recent_upload_history(history, KEY2_HISTORY_DISPLAY_ROWS);
+            size_t total = storage_get_upload_history_count();
+            printf("[BLE] KEY2 pressed, showing upload history (%u/%u).\n", (unsigned)shown, (unsigned)total);
+            display_status_show_upload_history(history, shown, total);
+            s_showing_history = true;
+            s_history_view_until = make_timeout_time_ms(KEY2_HISTORY_VIEW_MS);
+        }
+
+        // 還沒校時成功的話，不用等收到裝置讀值才有機會嘗試 NTP——每隔
+        // NTP_UNSYNCED_RETRY_MS 就主動連一次 WiFi 重試，避免裝置一直收不到
+        // 任何生理訊號時永遠沒有機會校時。校時成功後 wall_clock_is_synced()
+        // 變 true，這個分支就不會再觸發。
+        if (!wall_clock_is_synced() &&
+            absolute_time_diff_us(s_last_ntp_retry_at, get_absolute_time()) / 1000 >= NTP_UNSYNCED_RETRY_MS) {
+            printf("[BLE] wall clock still unsynced, triggering WiFi to retry NTP.\n");
+            s_last_ntp_retry_at = get_absolute_time();
+            return MODE_BLE_RECEIVE_EXIT_UPLOAD;
         }
 
         // 每次量測都是「連線->拿一筆資料->斷線」的短暫過程，不是持續連線接收，
@@ -601,7 +651,7 @@ bool mode_ble_receive_run(uint32_t idle_timeout_ms) {
             int64_t idle_ms = absolute_time_diff_us(s_last_reading_at, get_absolute_time()) / 1000;
             if (idle_ms >= (int64_t)s_idle_timeout_ms) {
                 if (storage_pending_count() > 0) {
-                    return true;
+                    return MODE_BLE_RECEIVE_EXIT_UPLOAD;
                 }
                 // 收到的都是重複量測、被 storage_append_record() 判重擋掉，待傳
                 // 佇列其實是空的——沒有東西要傳，不需要為了「切去 UPLOAD 確認看

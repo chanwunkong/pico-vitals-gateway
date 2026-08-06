@@ -106,6 +106,8 @@ void DEV_GPIO_Init(void)
 	DEV_GPIO_Mode(EPD_DC_PIN, 1);
 	DEV_GPIO_Mode(EPD_CS_PIN, 1);
 	DEV_GPIO_Mode(EPD_BUSY_PIN, 0);
+	// BUSY 腳位內建下拉，浮接時預設讀到「不忙」（0）。
+	gpio_pull_down(EPD_BUSY_PIN);
 
 	DEV_Digital_Write(EPD_CS_PIN, 1);
 }

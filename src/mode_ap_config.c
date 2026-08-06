@@ -1,5 +1,6 @@
 #include "mode_ap_config.h"
 
+#include "button_input.h"
 #include "common.h"
 #include "display_status.h"
 #include "led_status.h"
@@ -7,7 +8,6 @@
 
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
-#include "pico/unique_id.h"
 
 #include "lwip/ip4_addr.h"
 #include "lwip/pbuf.h"
@@ -33,41 +33,43 @@
 #define MAX_SCANNED_NETWORKS   15
 #define CONFIG_FORM_BUF_SIZE   4096
 
+// KEY0 需要按住這麼久才會取消 AP_CONFIG，比進入這個模式用的 3 秒短，但比
+// 瞬間單擊要求更多，降低誤觸發風險。
+#define AP_CONFIG_CANCEL_HOLD_MS 1000
+
 typedef struct {
     char ssid[33];
     int16_t rssi;
 } scanned_network_t;
 
-// 每台裝置專屬的熱點密碼，不寫死在原始碼裡（正式量產前的已知限制之一，見
-// PROJECT_PLAN.md 第 9 節）。用 RP2040 flash 晶片燒錄時就固定的 64-bit 全球
-// 唯一序號（pico_get_unique_board_id()，同一顆晶片每次讀出來都一樣，不需要
-// 額外存進我們自己的 flash sector）衍生出來，同一台裝置每次進這個模式密碼都
-// 相同（方便印在裝置貼紙上，或直接讓使用者從下面 display_status_show_ap_config()
-// 顯示在電子紙螢幕上的密碼讀出來，兩種管道都拿得到同一組密碼）。8 位十六進位
-// 字元滿足 WPA2 最短 8 字元的要求。
+// 熱點密碼所有裝置固定同一組（2026-08-06 從每台裝置唯一衍生改回固定值）：
+// 無螢幕版本沒有任何管道能讓使用者知道衍生出來的密碼是什麼，固定值可以事先
+// 印在文件/貼紙上，任何一台裝置都適用。SSID 仍然每台裝置唯一（見下方
+// generate_ap_ssid()），用來分辨機台；密碼固定不影響這一點。
+#define AP_PASSWORD_FIXED "02750963"
+
 static void generate_ap_password(char *out, size_t out_size) {
-    pico_unique_board_id_t id;
-    pico_get_unique_board_id(&id);
-    snprintf(out, out_size, "pico-%02x%02x%02x%02x",
-             id.id[4], id.id[5], id.id[6], id.id[7]);
+    snprintf(out, out_size, "%s", AP_PASSWORD_FIXED);
 }
 
 // 熱點名稱也不寫死，同樣的理由：多台裝置部署在同一個場所（例如同一層病房）
-// 時，如果每台都叫一模一樣的 "PicoGateway-Setup"，使用者手機的 WiFi 列表會
-// 看到好幾個同名網路，分不出要連哪一台。改用 CYW43 晶片的出廠 MAC 位址
-// （`cyw43_wifi_get_mac()`，`main.c` 開機時 `cyw43_arch_init()` 就會準備好，
-// 這裡呼叫不需要額外前置條件）取後 2 bytes 組成 4 位十六進位字尾，同一台
-// 裝置每次開熱點名稱都相同，且會顯示在電子紙螢幕上，使用者不需要另外知道
-// MAC 位址是多少，看螢幕上完整的 SSID 字串去手機的 WiFi 列表比對就好。
+// 時，如果每台都叫一模一樣的名稱，使用者手機的 WiFi 列表會看到好幾個同名
+// 網路，分不出要連哪一台。改用 CYW43 晶片的出廠 MAC 位址（`cyw43_wifi_get_mac()`，
+// `main.c` 開機時 `cyw43_arch_init()` 就會準備好，這裡呼叫不需要額外前置條件）
+// 取後 2 bytes 組成 4 位十六進位字尾，同一台裝置每次開熱點名稱都相同，且會
+// 顯示在電子紙螢幕上，使用者不需要另外知道 MAC 位址是多少，看螢幕上完整的
+// SSID 字串去手機的 WiFi 列表比對就好。**2026-08-06 從 "PicoGateway-Setup-"
+// 縮短成 "GATEWAY-"**：字尾一樣是 4 位十六進位，前綴縮短單純是配合電子紙
+// 螢幕上顯示空間有限（見 display_status.c 的 SSID 顯示說明）。
 static void generate_ap_ssid(char *out, size_t out_size) {
     uint8_t mac[6];
     int err = cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_AP, mac);
     if (err != 0) {
         // 理論上不會發生（見上面的說明），保底退回固定名稱，至少熱點還是能用。
-        snprintf(out, out_size, "PicoGateway-Setup");
+        snprintf(out, out_size, "GATEWAY");
         return;
     }
-    snprintf(out, out_size, "PicoGateway-Setup-%02X%02X", mac[4], mac[5]);
+    snprintf(out, out_size, "GATEWAY-%02X%02X", mac[4], mac[5]);
 }
 
 static scanned_network_t s_scanned[MAX_SCANNED_NETWORKS];
@@ -145,9 +147,9 @@ static void scan_nearby_wifi(void) {
     s_scanned_count = 0;
 
     // 掃描要在 station 介面真的啟用之後才會有結果，cyw43_arch_enable_sta_mode()
-    // 是 void，呼叫端拿不到成功/失敗訊號；實測發現剛從藍牙模式切過來的那一刻，
-    // 底層 cyw43_wifi_on() 偶爾還沒真的把介面帶起來（itf_state 還是 0），
-    // 導致 cyw43_wifi_scan() 回傳 -CYW43_EPERM(-4)。用重試代替假設它一定成功。
+    // 是 void，呼叫端拿不到成功/失敗訊號，介面可能還沒真的帶起來就回傳
+    // （itf_state 還是 0，cyw43_wifi_scan() 會回傳 -CYW43_EPERM）。用重試
+    // 代替假設它一定成功。
     for (int attempt = 0; attempt < 10; attempt++) {
         cyw43_arch_enable_sta_mode();
         if (cyw43_state.itf_state & (1 << CYW43_ITF_STA)) {
@@ -218,8 +220,7 @@ static void render_config_form_response(void) {
         "<form method='POST' action='/save'>"
         // 不依賴 JavaScript：下拉選單本身就是 ssid 欄位，手動輸入是另一個獨立的
         // 覆寫欄位。手機連上熱點後自動彈出的「登入頁」瀏覽器有些不支援/限制
-        // JavaScript，之前用 onchange 把下拉選單值複製到文字框的做法在那種
-        // 環境會整個失效，送出的 ssid 永遠是空字串。
+        // JavaScript。
         "WiFi 名稱（選附近掃到的）: <select name='ssid'>"
         "<option value=''>-- 請選擇，或改用下面手動輸入 --</option>");
 
@@ -229,7 +230,7 @@ static void render_config_form_response(void) {
         html_append(body, sizeof(body), &body_len, "'%s>",
             (has_cfg && strcmp(s_scanned[i].ssid, cur_ssid) == 0) ? " selected" : "");
         html_append_escaped(body, sizeof(body), &body_len, s_scanned[i].ssid);
-        html_append(body, sizeof(body), &body_len, " (%d dBm)</option>", s_scanned[i].rssi);
+        html_append(body, sizeof(body), &body_len, "</option>");
     }
 
     html_append(body, sizeof(body), &body_len, "</select><br>"
@@ -433,8 +434,7 @@ static bool starts_with_ci(const char *s, const char *prefix) {
 
 // headers 收完（看到 \r\n\r\n）不代表 body 也收完了——TCP 常常把 headers 跟
 // body 拆成不同封包送達，各自觸發一次 http_recv_cb。沒有這個檢查會在 body
-// 還沒送到、甚至完全是空的那一刻就急著解析，永遠拿到空欄位（這是之前 ssid
-// 一直是空字串的真正原因，不是使用者填錯或快取問題）。
+// 還沒送到、甚至完全是空的那一刻就急著解析，永遠拿到空欄位。
 static long parse_content_length(const char *req) {
     const char *p = req;
     const char key[] = "content-length:";
@@ -536,12 +536,25 @@ void mode_ap_config_run(void) {
     listen_pcb = tcp_listen(listen_pcb);
     tcp_accept(listen_pcb, http_accept_cb);
 
-    while (!s_config_submitted) {
+    // KEY0 短按住取消：不想改設定的話不用真的把表單送出來才能離開，按住
+    // KEY0 一下（AP_CONFIG_CANCEL_HOLD_MS，比進入這個模式用的長按短，但還是
+    // 要求短暫按住而不是碰一下就觸發——連著的手機可能正在填表單，誤觸發會
+    // 讓熱點斷線、表單內容全部消失）就退回 BLE_RECEIVE，不會呼叫
+    // storage_save_config()。
+    bool cancelled = false;
+    while (!s_config_submitted && !cancelled) {
         led_status_poll();
+        if (button_input_key0_long_press(AP_CONFIG_CANCEL_HOLD_MS)) {
+            printf("[AP_CONFIG] KEY0 held, cancelling without saving.\n");
+            cancelled = true;
+            break;
+        }
         sleep_ms(20);
     }
 
-    storage_save_config(&s_pending_config);
+    if (!cancelled) {
+        storage_save_config(&s_pending_config);
+    }
 
     tcp_close(listen_pcb);
     dns_server_deinit(&dns_server);

@@ -132,10 +132,8 @@ size_t fora_protocol_parse_reading(
         uint32_t measured_key = fora_protocol_decode_measured_key(value);
 
         // 這台裝置是血壓血糖二合一，「問目前這一筆記錄」的回應可能是血壓、
-        // 也可能是血糖，靠 byte[2] 的 bit7 分辨（0=血糖、1=血壓，反編譯官方
-        // 程式 GenBgmAndBpmMeter.GetRecord() 得到的分流邏輯，見 fora_protocol.h
-        // 開頭註解跟 PROJECT_PLAN.md 第 6.3/6.4 節）。之前這裡沒檢查這個 bit，
-        // 會把血糖資料誤當血壓數值解析，是已修好的正確性 bug。
+        // 也可能是血糖，靠 byte[2] 的 bit7 分辨（0=血糖、1=血壓），見
+        // fora_protocol.h 開頭的協定說明。
         if ((value[2] & 0x80) == 0) {
             // 血糖格式：byte[4..5] 是 16-bit 小端血糖值，byte[6] 是環境溫度
             // （目前不用），byte[7] 低 6 bit 是 codeNo（不用）、高 2 bit 是
@@ -173,11 +171,9 @@ size_t fora_protocol_parse_reading(
     }
 
     if (kind == FORA_DEVICE_OXIMETER) {
-        // 2026-08-03 實測回推（手指夾著、螢幕顯示 SpO2 97% / BPM 71-80 時
-        // 收到 51 26 61 00 3c 4c a5 05）：byte[4]/byte[6]/byte[7] 目前不知道
-        // 用途，先忽略。這個回應封包沒有像血壓計那樣附帶量測時間戳，
-        // device_measured_key 只能填 0（見 common.h 該欄位的說明，storage.c
-        // 會退回用數值+時間窗口的經驗法則判重）。
+        // byte[4]/byte[6]/byte[7] 用途未知，忽略。這個回應封包沒有像血壓計
+        // 那樣附帶量測時間戳，device_measured_key 只能填 0（見 common.h 該
+        // 欄位的說明，storage.c 會退回用數值+時間窗口的經驗法則判重）。
         if (len < 6) {
             return 0;
         }

@@ -50,8 +50,8 @@ void state_machine_run(void) {
             case STATE_BLE_RECEIVE: {
                 printf("[FSM] -> BLE_RECEIVE\n");
                 radio_switch_to_bluetooth();
-                bool idle_timeout = mode_ble_receive_run(BLE_IDLE_UPLOAD_TRIGGER_MS);
-                state = idle_timeout ? STATE_UPLOAD : STATE_BLE_RECEIVE;
+                mode_ble_receive_exit_t exit_reason = mode_ble_receive_run(BLE_IDLE_UPLOAD_TRIGGER_MS);
+                state = (exit_reason == MODE_BLE_RECEIVE_EXIT_ENTER_CONFIG) ? STATE_AP_CONFIG : STATE_UPLOAD;
                 break;
             }
 

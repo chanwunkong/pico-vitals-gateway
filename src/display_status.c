@@ -110,13 +110,8 @@ static void begin_frame(void) {
 }
 
 // ---------------------------------------------------------------------------
-// 面板保護：Waveshare 資料手冊要求電子紙不能長時間維持通電/高電壓狀態（不
-// 刷新的時候要進睡眠或斷電，不然膜片會不可逆損壞）——這條是硬性的，每次刷新
-// 都會遵守。資料手冊另外建議刷新間隔至少 180 秒，但**2026-08-05 決定不嚴格
-// 遵守這條建議值，以使用方便性為原則**——BLE_RECEIVE 收到新讀值、UPLOAD
-// 顯示結果這些都是使用者/個管師會想立刻看到的即時狀態，硬性延遲 3 分鐘顯示
-// 反而更不好用。目前只保留「至少每 24 小時要刷新一次」（避免長時間靜態顯示
-// 造成殘影/老化），不再擋下真正想顯示的內容。
+// 面板保護：不刷新的時候要進睡眠或斷電，每次刷新都會遵守。刷新頻率不設下限，
+// 只保留「至少每 24 小時要刷新一次」避免長時間靜態顯示造成殘影/老化。
 // ---------------------------------------------------------------------------
 #define MAX_REFRESH_INTERVAL_MS (24ULL * 60 * 60 * 1000) // 24 小時至少刷新一次
 
@@ -125,36 +120,22 @@ static absolute_time_t s_last_actual_refresh;
 
 // 目前面板上顯示的是不是 BLE_RECEIVE 畫面。AP_CONFIG／UPLOAD／錯誤／開機驗證
 // 畫面都是「直接畫、直接刷新」，不會去更新 BLE_RECEIVE 那邊「上次真的畫了
-// 什麼」的快照（`s_last_rendered`，見下面 BLE_RECEIVE 那一段）。這造成一個
-// 實際發生過的 bug：從 BLE_RECEIVE 切去 UPLOAD、上傳完又切回 BLE_RECEIVE
-// 時，如果這次 BLE_RECEIVE 的內容（狀態文字/讀值/待傳筆數）剛好跟切走前
-// 最後一次畫的一樣，`display_status_poll()` 的內容比對會覺得「沒有變化」
-// 而不刷新——但面板上現在其實還停在 UPLOAD 畫面，使用者會以為裝置卡在
-// 上傳中，不知道其實已經回到 BLE_RECEIVE 掃描了。用這個旗標強制：只要
-// 中間顯示過別的畫面，回到 BLE_RECEIVE 時第一次 poll() 一定要刷新一次，
-// 不管內容比對結果如何。
+// 什麼」的快照（`s_last_rendered`，見下面 BLE_RECEIVE 那一段）。這個旗標
+// 強制：只要中間顯示過別的畫面，回到 BLE_RECEIVE 時第一次 poll() 一定要
+// 刷新一次，不管內容比對結果如何。
 static bool s_ble_screen_is_current = false;
 
 // 回傳值目前恆為 true（沒有任何情況會跳過刷新），保留 bool 是因為
 // display_status_poll() 的「沒刷新成功就不更新快照」邏輯還在，之後如果又要
-// 加別的跳過條件（例如偵測到面板故障）不用改呼叫端。
-//
-// 2026-08-06：曾經加過局部刷新（`EPD_2IN9_V2_Display_Partial`，~0.6 秒不閃）
-// 又拿掉了——沒有任何實測觀察到的具體場景真的需要它（BLE_RECEIVE 本來就靠
-// 內容比對，刷新頻率不高；理論上「全刷卡住 2-3 秒可能錯過血壓計/血氧計短暫
-// 廣播窗口」這個顧慮從沒被實際觀察到發生過），純全刷交換的 0.6 秒 vs 3 秒、
-// 不閃黑這些好處，換來的是沒有實機驗證過的呼叫順序風險、疊代殘影需要額外
-// 清理邏輯——為一個從未真正發生過問題的場景背負未測試的複雜度不值得，見
-// PROJECT_PLAN.md 第 12.5 節。只用全刷（`EPD_2IN9_V2_Display_Base`），簡單
-// 可靠。
+// 加別的跳過條件（例如偵測到面板故障）不用改呼叫端。只用全刷
+// （`EPD_2IN9_V2_Display_Base`），不做局部刷新。
 static bool end_frame_and_refresh(void) {
     // EPD_2IN9_V2_Init() 內部一開始就會做硬體 Reset，同時也是从深度睡眠喚醒的
     // 標準程序，所以不需要另外維護一個「現在是睡是醒」的狀態——每次要刷新
     // 畫面前都直接呼叫一次就對了。
     EPD_2IN9_V2_Init();
     EPD_2IN9_V2_Display_Base(s_framebuffer);
-    // 刷完立刻進深度睡眠，面板不能一直維持高電壓，見上面的說明——這條是硬性
-    // 規定，不受「180 秒建議值不嚴格遵守」的決定影響。
+    // 刷完立刻進深度睡眠，面板不能一直維持高電壓，見上面的說明。
     EPD_2IN9_V2_Sleep();
 
     s_last_actual_refresh = get_absolute_time();
@@ -174,9 +155,8 @@ void display_status_init(void) {
 
     // 注意：這裡故意不呼叫 EPD_2IN9_V2_Init()/Clear()——那本身就是一次面板
     // 刷新，而開機後幾乎立刻就會呼叫某個 display_status_show_xxx() 畫出真正
-    // 的第一個畫面，兩次刷新背靠背做沒有意義，還會浪費 180 秒的刷新額度
-    // （面板保護限制，見 end_frame_and_refresh()）。面板真正的硬體初始化延後
-    // 到第一次呼叫 display_status_show_xxx()／poll() 觸發刷新時才做。
+    // 的第一個畫面，兩次刷新背靠背做沒有意義。面板真正的硬體初始化延後到
+    // 第一次呼叫 display_status_show_xxx()／poll() 觸發刷新時才做。
     Paint_NewImage(s_framebuffer, EPD_2IN9_V2_WIDTH, EPD_2IN9_V2_HEIGHT, ROTATE_90, WHITE);
     begin_frame();
 }
@@ -266,11 +246,15 @@ void display_status_show_ap_config(const char *ap_ssid, const char *ap_password,
 
     Paint_DrawString_EN(5, 2, "WiFi Setup", &Font16, BLACK, WHITE);
 
+    // SSID/密碼用 Font8（比 Font12 窄）畫，QR code 從 x=180 開始（見下方
+    // draw_qr_code() 呼叫），左側文字只有 175px 寬可用——SSID 帶了 MAC 衍生
+    // 的字尾（例如 "PicoGateway-Setup-DC15"）長度會超過 Font12 在這個寬度
+    // 塞得下的字元數，換成 Font8 才不會被 QR code 蓋到/裁切掉。
     char line[48];
     snprintf(line, sizeof(line), "SSID: %s", ap_ssid);
-    Paint_DrawString_EN(5, 26, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(5, 26, line, &Font8, BLACK, WHITE);
     snprintf(line, sizeof(line), "Pass: %s", ap_password);
-    Paint_DrawString_EN(5, 40, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(5, 38, line, &Font8, BLACK, WHITE);
 
     char patient_id_ascii[PATIENT_ID_MAX_LEN];
     if (existing_config != NULL && existing_config->valid) {
@@ -423,6 +407,8 @@ static const char *vital_label(vital_type_t type) {
         case VITAL_TYPE_SPO2:        return "SpO2 ";
         case VITAL_TYPE_PULSE_RATE:  return "Pulse";
         case VITAL_TYPE_GLUCOSE:     return "Gluc ";
+        case VITAL_TYPE_SYSTOLIC:    return "Sys  ";
+        case VITAL_TYPE_DIASTOLIC:   return "Dia  ";
         default:                     return "?    ";
     }
 }
@@ -433,6 +419,8 @@ static const char *vital_unit(vital_type_t type) {
         case VITAL_TYPE_SPO2:        return "%";
         case VITAL_TYPE_PULSE_RATE:  return "bpm";
         case VITAL_TYPE_GLUCOSE:     return "mg/dL";
+        case VITAL_TYPE_SYSTOLIC:    return "mmHg";
+        case VITAL_TYPE_DIASTOLIC:   return "mmHg";
         default:                     return "";
     }
 }
@@ -476,15 +464,9 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     Paint_DrawString_EN(5, 2, line, &Font12, BLACK, WHITE);
     Paint_DrawString_EN(5, 16, snap->status_text[0] != '\0' ? snap->status_text : "Idle", &Font12, BLACK, WHITE);
 
-    // 2026-08-05：加了血糖列，畫面 9 行擠在 128px 高度裡，行距從 14px 縮到
-    // 13px 才放得下（Font12 實測約 12px 高，13px 步進還有 1px 餘裕，不會疊字）。
     draw_reading_row(36, VITAL_TYPE_TEMPERATURE, snap);
     draw_reading_row(49, VITAL_TYPE_SPO2, snap);
     draw_reading_row(62, VITAL_TYPE_PULSE_RATE, snap);
-    // 血糖走跟血壓相同的資料管道，靠回應裡的旗標 bit 分辨（見
-    // fora_protocol.h、PROJECT_PLAN.md 第 6.3/6.4 節），量到血糖時
-    // storage_get_last_reading(VITAL_TYPE_GLUCOSE) 就會有值，這裡不用額外
-    // 判斷——沒量過的話 draw_reading_row() 本身就會顯示 "-- (never)"。
     draw_reading_row(75, VITAL_TYPE_GLUCOSE, snap);
 
     // 血壓收縮/舒張合成一行顯示；兩者通常同一次量測一起寫入，時間戳取收縮壓的。
@@ -540,17 +522,47 @@ void display_status_poll(void) {
     // 中間顯示過別的畫面（AP_CONFIG/UPLOAD/錯誤）的話，就算這次 BLE_RECEIVE
     // 的內容跟切走前最後一次畫的一模一樣，也一定要強制刷新一次——不然面板會
     // 一直停在舊畫面（例如「Uploading...Failed」），使用者以為裝置卡住，
-    // 見 s_ble_screen_is_current 宣告處的說明（2026-08-05 實測發現的問題）。
+    // 見 s_ble_screen_is_current 宣告處的說明。
     if (!content_changed && !refresh_overdue && s_ble_screen_is_current) {
         return; // 內容沒變、也還沒到強制刷新的時間、畫面本來就是這個，不刷新
     }
 
-    // render_ble_receive() 可能因為 180 秒面板保護而跳過實際刷新（回傳
-    // false）——這種情況下 s_last_rendered 故意不更新，讓下一輪 poll() 繼續
-    // 認定內容「還沒真的畫上去」，過幾輪之後保護時間一到就會自然補畫一次，
-    // 不會遺失這次要顯示的內容。
+    // render_ble_receive() 目前恆回傳 true；若之後改成有條件跳過刷新，
+    // s_last_rendered 應該只在真的刷新成功時才更新，讓下一輪 poll() 繼續
+    // 認定內容「還沒真的畫上去」，不會遺失這次要顯示的內容。
     if (render_ble_receive(&current)) {
         s_last_rendered = current;
         s_ble_screen_is_current = true;
     }
+}
+
+#define HISTORY_DISPLAY_MAX_ROWS 7
+
+void display_status_show_upload_history(const vital_record_t *records, size_t count, size_t total_count) {
+    s_ble_screen_is_current = false;
+    begin_frame();
+
+    char line[48];
+    snprintf(line, sizeof(line), "Upload History (%u total)", (unsigned)total_count);
+    Paint_DrawString_EN(5, 2, line, &Font12, BLACK, WHITE);
+
+    if (count == 0) {
+        Paint_DrawString_EN(5, 20, "(none yet)", &Font12, BLACK, WHITE);
+    } else {
+        int y = 18;
+        size_t rows = count < HISTORY_DISPLAY_MAX_ROWS ? count : HISTORY_DISPLAY_MAX_ROWS;
+        for (size_t i = 0; i < rows; i++) {
+            char value_str[16];
+            format_vital_value(value_str, sizeof(value_str), records[i].type, records[i].value);
+            char clock_str[24];
+            format_reading_clock(records[i].received_at_ms, records[i].device_measured_key,
+                                  clock_str, sizeof(clock_str));
+            snprintf(line, sizeof(line), "%s %s%s (%s)", vital_label(records[i].type), value_str,
+                     vital_unit(records[i].type), clock_str);
+            Paint_DrawString_EN(5, y, line, &Font12, BLACK, WHITE);
+            y += 13;
+        }
+    }
+
+    end_frame_and_refresh();
 }

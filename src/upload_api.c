@@ -56,11 +56,8 @@ typedef struct {
     volatile bool done;
     volatile bool success;
     // 累積收到的回應開頭幾個 byte，跨越多次 on_recv() 呼叫——回應可能被
-    // TLS record／pbuf 邊界切成好幾段送達，如果只看「這一次」收到的那一小段
-    // 找 "200"，狀態列 "HTTP/1.1 200 OK" 剛好被切在中間（例如這次只收到
-    // "HTTP/1.1 2"，下次才收到 "00 OK..."）就會兩次都比對不到，明明伺服器
-    // 真的回了 200 也會被誤判成失敗（2026-08-05 實測抓到：伺服器端 log 顯示
-    // 資料確實收到、回應也是 200，但裝置這邊一直印 result: failed）。
+    // TLS record／pbuf 邊界切成好幾段送達，狀態列 "HTTP/1.1 200 OK" 可能被
+    // 切在中間，只看單次收到的內容會找不到完整的 "200"。
     char header_buf[128];
     size_t header_len;
 } upload_ctx_t;
@@ -84,14 +81,8 @@ static void append(char *buf, size_t buf_size, size_t *len, const char *fmt, ...
 }
 
 // 把字串當成 JSON 字串內容附加進 buf（外層的引號不包含在內，呼叫端自己包）。
-// patient_id 是 AP_CONFIG 表單的自由輸入欄位，內容完全不受控制——2026-08-05
-// 實測抓到一次真實案例：flash 裡存的 patient_id 混進了幾個控制字元（`\x01`、
-// `\x06`、`\x14`，很可能是很久以前某次測試殘留的資料，原因不明），沒有跳脫
-// 就直接塞進 JSON，導致伺服器端 `json.loads()` 解析失敗、每次上傳都回
-// 400 Bad Request，卻只回報「failed」看不出原因，直到加了這行請求內容的
-// debug log 才抓到。跟 `display_status.c` 的 WiFi QR code 那邊處理 SSID/
-// 密碼是同一個道理：使用者自由輸入的欄位，在塞進任何有格式規則的地方
-// （JSON、QR code）之前都要先跳脫/過濾，不能假設內容一定乾淨。
+// patient_id 是 AP_CONFIG 表單的自由輸入欄位，內容完全不受控制，可能包含
+// 控制字元，必須跳脫過後才能塞進 JSON。
 static void append_json_escaped(char *buf, size_t buf_size, size_t *len, const char *text) {
     if (text == NULL) {
         return;
@@ -109,9 +100,8 @@ static void append_json_escaped(char *buf, size_t buf_size, size_t *len, const c
 
 // 手動格式化數值，避免依賴 newlib-nano 預設未啟用的 printf float 支援
 // （沿用 mode_ble_receive.c 同樣的作法）。體溫只需要小數點後 1 位（裝置本身
-// 解析度就是 0.1°C），其他類型（SpO2、脈搏、血壓）都是整數。用四捨五入而不是
-// 無條件捨去——之前用 (int)((value-whole)*100) 這種截斷法，浮點數誤差會讓
-// 36.8 被印成 36.79 這種看起來莫名其妙的錯誤數字。
+// 解析度就是 0.1°C），其他類型（SpO2、脈搏、血壓）都是整數。用四捨五入到
+// 目標精度再格式化，避免浮點數截斷誤差。
 static void format_value(char *out, size_t out_size, vital_type_t type, float value) {
     if (type == VITAL_TYPE_TEMPERATURE) {
         int tenths = (int)(value * 10.0f + (value >= 0.0f ? 0.5f : -0.5f));
@@ -188,6 +178,22 @@ static void dns_found_cb(const char *name, const ip_addr_t *ipaddr, void *arg) {
     ctx->done = true;
 }
 
+// 檢查累積的回應開頭是不是 HTTP 狀態列回報 200（例如 "HTTP/1.1 200 OK"），
+// 只比對狀態碼欄位本身，不是在整段回應內容裡找 "200" 子字串（標頭/內文其他
+// 地方，例如 Content-Length 剛好是 200，不該被誤判成成功）。
+static bool header_indicates_200(const char *buf) {
+    const char *sp = strchr(buf, ' ');
+    if (sp == NULL) {
+        return false;
+    }
+    const char *code = sp + 1;
+    if (strncmp(code, "200", 3) != 0) {
+        return false;
+    }
+    char after = code[3];
+    return after == ' ' || after == '\r' || after == '\0';
+}
+
 static err_t on_recv(void *arg, struct altcp_pcb *conn, struct pbuf *p, err_t err) {
     (void)err;
     upload_ctx_t *ctx = (upload_ctx_t *)arg;
@@ -199,7 +205,7 @@ static err_t on_recv(void *arg, struct altcp_pcb *conn, struct pbuf *p, err_t er
         return ERR_OK;
     }
 
-    // 累積進 header_buf（不是每次只看這次收到的片段），這樣「200」剛好被
+    // 累積進 header_buf（不是每次只看這次收到的片段），這樣狀態列剛好被
     // TCP/TLS 切成兩段送達也不會漏判，見 upload_ctx_t 裡的說明。
     if (!ctx->success && ctx->header_len + 1 < sizeof(ctx->header_buf)) {
         size_t space = sizeof(ctx->header_buf) - 1 - ctx->header_len;
@@ -208,7 +214,7 @@ static err_t on_recv(void *arg, struct altcp_pcb *conn, struct pbuf *p, err_t er
         ctx->header_len += copy_len;
         ctx->header_buf[ctx->header_len] = '\0';
 
-        if (strstr(ctx->header_buf, "200") != NULL) {
+        if (header_indicates_200(ctx->header_buf)) {
             ctx->success = true;
         }
     }
@@ -362,9 +368,8 @@ bool upload_api_post_batch(const char *patient_id, const char *server_host, cons
     altcp_tls_free_config(tls_config);
     printf("[UPLOAD_API] result: %s\n", ctx.success ? "success" : "failed");
     if (!ctx.success) {
-        // 印出實際收到的回應開頭，方便排查——伺服器端可能其實有收到資料、
-        // 也回了 200，但這裡沒能正確判斷出來（曾經真的是這個原因，見
-        // on_recv() 的說明），或者伺服器真的回了別的狀態碼/完全沒回應。
+        // 印出實際收到的回應開頭，方便排查是判斷邏輯沒抓到 200，還是伺服器
+        // 真的回了別的狀態碼/完全沒回應。
         printf("[UPLOAD_API]   response so far (%u bytes): %s\n",
                (unsigned)ctx.header_len, ctx.header_len > 0 ? ctx.header_buf : "(none)");
     }

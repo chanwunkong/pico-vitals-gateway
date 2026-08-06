@@ -1,6 +1,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 
+#include "button_input.h"
 #include "display_status.h"
 #include "led_status.h"
 #include "state_machine.h"
@@ -24,6 +25,7 @@ int main(void) {
     }
 
     led_status_init();
+    button_input_init();
     storage_init();
 
     // Phase 1 硬體驗證畫面（display_status_show_boot_test()）不在正常開機流程
