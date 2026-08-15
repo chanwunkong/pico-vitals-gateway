@@ -22,6 +22,11 @@
 - Flash 持久化改用 littlefs，解決 wear-leveling 問題（一次性、不相容的格式改動，見第 5.1/8.5 節第 28 點）——這次燒錄測試期間看起來運作正常（設定/待傳/歷史都有正確存取），但還沒驗證重開機後資料是否正確持久化。
 - 修復無螢幕版本（不接電子紙板）開機後極可能卡死的問題（見第 12.9/8 節第 33 點）——這次測試機器有接面板，還沒拿無螢幕機器驗證過。
 - NTP 一直沒校時成功時每 5 分鐘自動重試（見第 2.4 節）——這次測試很快就校時成功，沒機會驗證這個計時器本身。
+- 2026-08-13：電子紙 BLE_RECEIVE 畫面版面優化（ID/狀態文字合併一行、Last upload/Pending 合併一行，省下來的空間留給以後 MD6 用，見第 12.6 節）——已 build 成功，還沒燒錄/肉眼驗證實際排版。
+
+**協定研究完成，但完全還沒寫程式碼（下次接續開發先看這裡）：**
+
+- FORA MD6 六合一測試儀藍牙協定：已反編譯官方程式確認大致格式，但機型辨識方式（ProjectNo/廣播名稱）、六個新項目的數值單位/scale 都還不確定，**故意還沒動 `fora_device_kind_t`／解析邏輯**，避免拿不確定的假設寫出連線階段就分類錯誤的程式碼。完整發現記錄在第 6.5 節，下次要接續前**先看完第 6.5 節最後的「下次接續開發」清單**。
 
 **曾經做過又移除的：** 電子紙 Phase 3 局部刷新——重新檢視後發現沒有實測觀察到的具體場景真的需要它，換不到的好處不值得承擔未測試的風險，決定拿掉、維持只用全刷（見第 12.5 節）。
 
@@ -239,6 +244,44 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
   官方程式的合理性檢查：`glucose == 65535` 或 `glucose == 255` 時視為無效讀值（`Invalid`），不是真正的血糖數字。
 - **已實作、已實機驗證（2026-08-06）**：`fora_protocol_parse_reading(FORA_DEVICE_BLOOD_PRESSURE, ...)` 收到組好的 8 bytes 後會先檢查 `byte[2] & 0x80`，0 就照上表解析血糖、回傳 `VITAL_TYPE_GLUCOSE`，非 0 才照原本的血壓邏輯解析；`mode_ble_receive.c` 原本「送 part A/B、組 8 bytes」的流程不用改，分流是在解析階段做的。實機測試量到一筆血糖 107 mg/dL，`byte[2]` bit7 正確判斷成血糖、數值換算跟手動核算封包位元組吻合，完整走過解析→判重→存 flash→上傳全部成功。畫面（`display_status.c` 的血糖列）、上傳（`upload_api.c`／`test_server/app.py` 的 `VITAL_TYPE_NAMES`）也都正確顯示/傳送。**已跟裝置螢幕實際顯示的數字比對一致**，見第 7.2 節第 11 點。
 
+### 6.5 FORA MD6 六合一測試儀（2026-08-13 協定已反推，完全還沒實作，下次接續開發先看這裡）
+
+**現況一句話**：確認了 MD6 走跟 D40 完全同一套指令管道，只是把血糖泛化成六個項目；但機型辨識方式、六個新項目的數值 scale/單位都還不確定，**故意沒有動任何程式碼**（沒加新的 `fora_device_kind_t`、沒改 `fora_protocol_parse_reading()`），避免拿不確定的假設寫出連線階段就分類錯誤、或數值單位錯誤的程式碼——這比完全不支援還糟，見下面「不確定、需要實機驗證」。
+
+**反推來源跟怎麼重現**：這台機器（`WunKong` 帳號）上裝了官方 Windows 程式「FORA Health Care Management System_BLE」（`%APPDATA%\FORA Health Care Management System_BLE\`，`image\` 資料夾裡有一張「福爾旗艦6合1測試儀 FORA MD6.jpg」確認這支程式認得 MD6），反編譯目標是同一支 `DLL\BLE_PCLink_Library.dll`，工具鏈跟第 8 節記錄的血壓計反推方法完全相同（`ilspycmd` 8.2.0.7535）。**這台機器上 `dotnet`／`ilspycmd` 都已經裝好，但不在這個 session 的 PATH 裡**——跟 pico-sdk 工具鏈一樣的問題（見第 0 節），要重新反編譯的話：
+
+```powershell
+$env:Path = "C:\Program Files\dotnet;$env:USERPROFILE\.dotnet\tools;" + $env:Path
+ilspycmd -p -o <輸出資料夾> "$env:APPDATA\FORA Health Care Management System_BLE\DLL\BLE_PCLink_Library.dll"
+```
+
+反編譯出來的原始碼裡完全沒有出現過 "MD6" 這個字面字串（連 exe 的字串資源也搜不到），下面的內容是從命名空間裡看到的 class 結構類推出來的，不是直接看到寫死的 "MD6"。
+
+**已確認的部分（有反編譯原始碼逐行對照）**：
+
+- 對應 `TaiDoc.BLE_PcLink.Meter` 命名空間的 `GenBgmMeter` class（`MeterType.BG`）+ `TaiDoc.BLE_PcLink.Meter.Record` 命名空間的 `BloodGlucose` class——這個 class 其實是「多合一血糖機」的通用實作，D40 的血糖功能（第 6.4 節）已經在用同一套邏輯了，MD6 只是同一個 class 支援的其中一種型號。
+- 指令框架、`FORA_BP_CMD_GET_RECORD_PART_A/B/COUNT`（`0x25`/`0x26`/`0x2B`）、8-byte checksum 全部沿用第 6.3/6.4 節已經實作的邏輯，不用新增指令。
+- `byte[0..3]` 日期/時間解碼方式跟血壓/血糖完全一樣（見第 6.4 節表格），不用改。
+- `byte[4..5]`：16-bit 小端數值，`65535` 視為無效讀值（跟血糖一樣）。
+- `byte[6]`：ambient（環境溫度），不用。
+- `byte[7]` 是 MD6 新增的關鍵欄位，跟血糖共用同一個 byte 但語意更豐富：
+  - bits 6-7（`&0xC0`，右移 6）＝量測情境：0=一般（`byte[3]` bits5-7==4 時視為「運動」）、1=飯前(AC)、2=飯後(PC)、**3=QC（品管/對照液測試，不是真的病人數值，理論上不該當成待傳資料上傳，但這個位元的實際行為還沒實機驗證過）**。
+  - bits 2-5（`&0x3C`，右移 2）＝這筆記錄是六合一裡的哪一項：`0`=血糖 Glucose、`6`=HCT（血球比容）、`7`=酮體 Ketone、`8`=尿酸 UA、`9`=總膽固醇 CHOL、`11`=血紅素 HB、`12`=乳酸 Lactate、`13`=三酸甘油脂 TG（`1/2/3/4/5/10` 官方程式碼裡沒有對應項目）。
+  - bits 0-1：跟項目欄位共用「code number」概念（不同項目用不同試片），這個專案目前不需要額外解析。
+
+**不確定、需要實機驗證，不要照抄就實作**：
+
+1. **血糖以外六項的數值 scale／單位**：官方程式碼裡 `GlucoseUnitEnum`/`CHOLUnitEnum`/`TGUnitEnum` 都有 mg/dL 跟 mmol/L 兩種模式（裝置端可切換）、`UAUnitEnum` 是 mg/dL 跟 umol/L、`HbCUnitEnum` 只有 g/dL、`HCTUnitEnum` 只有 %——`readMeasureRange()` 裡對 Glucose/CHOL/TG 的量測範圍門檻值有額外 `*10` 的縮放邏輯，但看不出這個縮放是不是也適用在 `byte[4..5]` 的實際量測值上。實際連線時應該先確認裝置目前的單位設定，不能假設一定是 mg/dL、也不能假設一定不用縮放。
+2. **廣播階段沒辦法用裝置名稱分辨是不是 MD6**：官方程式是連線後送 `cmd 0x24`（`GetMeterInfo`）問到 ProjectNo 才決定機型，不是像 O2/D40 那樣看廣播封包名稱關鍵字（見 `fora_protocol_matches_advertisement()`）。要支援 MD6 得先決定「怎麼在廣播階段先篩選要不要連線」——最簡單的做法是沿用「名稱含 FORA 就先連線」的既有邏輯、連上後再送 `cmd 0x24` 問 ProjectNo 判斷，但這樣會讓額溫槍/血氧計/血壓計的連線流程多一道查詢，需要評估要不要接受這個改動。
+3. **MD6 實際對應哪個 ProjectNo**：程式碼裡看到 `"4230"`/`"4232"`/`"4240"`/`"4255"`/`"4261"` 幾個代碼共用同一個 `GenBgmMeter` class，但沒有任何地方明確標示哪一個是 MD6，要連線後送 `cmd 0x24` 才能實測確認。
+
+**下次接續開發，建議順序**：
+
+1. 有 MD6 實機的話，先接一次官方 Windows 程式配對，找出它回報的 ProjectNo（或直接寫一小段測試韌體送 `cmd 0x24` 問）。
+2. 確認裝置目前的單位設定（mg/dL vs mmol/L 等），量幾筆不同項目的樣本，跟裝置螢幕顯示的數字比對 `byte[4..5]` 的 raw value 到底要不要縮放。
+3. 決定廣播階段的篩選策略（上面第 2 點），再動 `fora_protocol.h`（新增 `FORA_DEVICE_MD6`）、`fora_protocol.c`（`fora_protocol_matches_advertisement()`／`fora_protocol_parse_reading()`）、`common.h`（新增六個 `VITAL_TYPE_*`）、`storage.c`（既有邏輯是泛型的，理論上不用改，但要跑一遍確認）、`display_status.c`（畫面空間有限，六項不太可能一項一行，可能要比照 BP 那樣做「顯示最後一次量到的是哪一項」的合併列）、`upload_api.c`（新增 JSON 欄位名稱）。
+4. 全部接完之後才更新這裡的狀態，並把這一節標記從「協定已反推，完全還沒實作」改成「已實作，還沒/已實機驗證」。
+
 ## 7. 待辦事項
 
 分成兩類：**7.1 軟體層面**是需要寫新程式碼/改邏輯的（功能還沒做完或有已知的正確性風險），**7.2 測試/驗證層面**是程式碼已經寫好、需要實際跑一遍確認正確的。兩者優先順序不互相排斥，可以平行進行。
@@ -249,7 +292,8 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
 
 1. **TLS 憑證驗證框架已接好，但還沒有真正的憑證可以放**：見 `upload_tls_ca_cert.h`，`UPLOAD_CA_CERT_PEM` 目前是空字串，upload_api.c 會照舊用不驗證模式（並在 log 印警告）。等正式後端網址確定之後，把該伺服器的憑證/CA PEM 貼進這個檔案就會自動改成真正驗證，不用改任何其他程式碼——**這個檔案本身沒有東西要寫了，純粹是在等一個「正式後端網址」的決定**。
 2. **上傳伺服器網址/認證金鑰目前用 AP_CONFIG 表單設定，但伺服器端還沒有實作認證檢查**：`upload_api.c` 已經會在有填認證金鑰時送出 `X-API-Key` 標頭，但這是單邊的——目前唯一的測試伺服器 `test_server/app.py` 完全沒有檢查這個標頭（也不應該檢查，它就是設計給沒有認證的本機測試用）。正式後端要自己實作驗證這個標頭的邏輯。
-3. 見第 9 節「已知限制」剩下還沒有處理的項目。
+3. **【新增】FORA MD6 六合一測試儀支援：協定已反推，完全還沒寫程式碼**，見第 6.5 節完整發現記錄跟「下次接續開發」的建議順序。卡點是機型辨識方式（廣播階段分辨不出來，要連線後查 ProjectNo）跟六個新項目的數值 scale/單位都需要實機才能確認，故意沒有先動 `fora_device_kind_t`/解析邏輯。
+4. 見第 9 節「已知限制」剩下還沒有處理的項目。
 
 ### 7.2 測試/驗證層面待辦（功能已經寫好，需要實機測試確認正確）
 
@@ -488,6 +532,8 @@ Waveshare 資料手冊列了幾點面板保護要求，**其中「不能長時�
 |---|---|---|
 | AP_CONFIG 熱點設定 | 熱點 SSID/密碼文字、目前已存的個案編號（ASCII 過濾過，沒設定過就顯示 `(unset)`）、操作提示、WiFi QR code（見 12.7 節） | `display_status_show_ap_config()` |
 | BLE_RECEIVE | 個案編號（方案 A）、目前狀態（`Scanning (MM/DD HH:MM)`，見下方心跳說明）、體溫/血氧/脈搏/**血糖（協定已實作，見 6.4 節，沒量過的話顯示 `-- (never)`）**/血壓各自最後一筆數值＋時間戳（已校時顯示 `MM/DD HH:MM` 絕對時間，血壓計顯示的是**裝置自己的量測時間**而非 Pico 收到時間，見第 6.3 節；未校時且無裝置時間戳顯示 `unsynced,+Nm`）、**最後一次成功上傳時間**、待上傳筆數 | `display_status_set_ble_receive()` + `display_status_poll()` |
+
+（2026-08-13 版面優化，**已 build 成功，還沒燒錄/肉眼驗證實際排版**：ID 跟狀態文字合併成一行、Last upload 跟 Pending 合併成一行，各省一行螢幕空間；體溫/血氧/脈搏/血糖/血壓五行往上移到 y=22~74，省下來的空間（y≈87 附近）留給以後 FORA MD6 六合一新增的項目用，見第 6.5 節。）
 | UPLOAD | WiFi SSID + 目前階段/結果文字（`Connecting...`/`Success (N records)`/`Failed, will retry`） | `display_status_show_upload()` |
 | 錯誤 | 一句英文錯誤訊息，取代難記的三連閃燈號 | `display_status_show_error()` |
 

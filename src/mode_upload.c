@@ -18,12 +18,8 @@
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 #define MAX_BATCH_SIZE 32
 
-// 血壓計自己回報的量測時間戳（device_measured_key）不保證裝置內部時鐘校時
-// 過——電池換過、從沒設定過、韌體預設值都可能讓這個時鐘跟真實時間差很多年。
-// 跟 Pico 自己 NTP 校時過的現在時間比對，差距超過這個範圍就不信任裝置時鐘，
-// 退回用 Pico 收到 BLE 通知的時間（見 fora_protocol_measured_key_to_epoch_ms()
-// 呼叫端的判斷）。這個值待與主持人確認，見 PROJECT_PLAN.md 第 7.3 節。
-#define DEVICE_CLOCK_SANITY_WINDOW_MS (7ULL * 24 * 60 * 60 * 1000)
+// DEVICE_CLOCK_SANITY_WINDOW_MS 定義在 wall_clock.h，跟 display_status.c 共用
+// 同一個門檻，見該處說明。
 
 // 認證模式不寫死——分享器種類很多，依常見程度排序嘗試，直到成功或全部試完。
 static const uint32_t WIFI_AUTH_MODES_TO_TRY[] = {
@@ -140,16 +136,12 @@ void mode_upload_run(void) {
                 // 合理性，差距太大就不信任，退回用 Pico 收到時間。
                 uint64_t device_epoch_ms = fora_protocol_measured_key_to_epoch_ms(batch[i].device_measured_key);
                 if (wall_clock_is_synced()) {
-                    uint64_t now_epoch_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
-                    uint64_t diff_ms = device_epoch_ms > now_epoch_ms
-                        ? device_epoch_ms - now_epoch_ms : now_epoch_ms - device_epoch_ms;
-                    if (diff_ms <= DEVICE_CLOCK_SANITY_WINDOW_MS) {
+                    if (wall_clock_epoch_is_plausible(device_epoch_ms, DEVICE_CLOCK_SANITY_WINDOW_MS)) {
                         batch[i].received_at_ms = device_epoch_ms;
                         used_device_clock = true;
                     } else {
-                        printf("[UPLOAD] device clock for record %u looks wrong (off by %llu ms), "
-                               "falling back to Pico's receive time.\n", (unsigned)i,
-                               (unsigned long long)diff_ms);
+                        printf("[UPLOAD] device clock for record %u looks wrong, "
+                               "falling back to Pico's receive time.\n", (unsigned)i);
                     }
                 } else {
                     // Pico 自己都還沒校時過，沒有基準可以比對合理性，這種

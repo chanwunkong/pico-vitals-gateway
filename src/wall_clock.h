@@ -30,4 +30,22 @@ bool wall_clock_is_synced(void);
 // boot-relative 值（呼叫端可以用 wall_clock_is_synced() 分辨兩種情況）。
 uint64_t wall_clock_to_epoch_ms(uint64_t boot_ms);
 
+// 血壓計自己回報的量測時間戳（device_measured_key）不保證裝置內部時鐘校時
+// 過——電池換過、從沒設定過、韌體預設值都可能讓這個時鐘跟真實時間差很多年。
+// 跟 Pico 自己 NTP 校時過的現在時間比對，差距超過這個範圍就不信任裝置時鐘。
+// 這個值待與主持人確認，見 PROJECT_PLAN.md 第 7.3 節。上傳（mode_upload.c）
+// 跟畫面顯示（display_status.c）共用同一個門檻，見下面 wall_clock_epoch_is_plausible()。
+#define DEVICE_CLOCK_SANITY_WINDOW_MS (7ULL * 24 * 60 * 60 * 1000)
+
+// 判斷某個「宣稱是真實世界 epoch ms」的時間點，跟 Pico 自己已校時過的現在時間
+// 比對起來合不合理（差距是否在 window_ms 之內，通常傳 DEVICE_CLOCK_SANITY_WINDOW_MS）。
+// 給有自己內部時鐘、但校時狀態不受 Pico 控制的裝置用（目前是血壓計的
+// device_measured_key，見 fora_protocol_measured_key_to_epoch_ms()）——裝置的
+// 時鐘可能從沒設定過、電池換過，回報出離譜的日期時間，這種情況不該被當真。
+// 呼叫端必須先確認 wall_clock_is_synced() 為 true 才呼叫這個函式，否則 Pico
+// 自己都沒有可信的現在時間可以比對；上傳（mode_upload.c）跟畫面顯示
+// （display_status.c）共用同一份判斷邏輯，避免兩邊各自實作、之後改一邊忘記
+// 改另一邊。
+bool wall_clock_epoch_is_plausible(uint64_t epoch_ms, uint64_t window_ms);
+
 #endif // WALL_CLOCK_H

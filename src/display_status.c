@@ -339,6 +339,12 @@ typedef struct {
     // 的說明），0 代表這種裝置的協定沒有這個資訊，畫面上要退回顯示
     // reading_received_at_ms。目前只有血壓計有值。
     uint32_t reading_device_measured_key[VITAL_TYPE_COUNT];
+    // 是哪一種裝置回報的這筆讀值（fora_device_kind_t，見 common.h
+    // vital_record_t.source_kind 的說明）。目前只有 VITAL_TYPE_PULSE_RATE
+    // 會同時由血壓計跟血氧計兩種裝置回報，畫面上用這個欄位加來源標籤分辨
+    // （見 draw_reading_row()），也要納入內容比對，不然來源換了但數值/時間戳
+    // 剛好相同時畫面不會刷新。
+    uint8_t reading_source_kind[VITAL_TYPE_COUNT];
     bool last_upload_valid;
     uint64_t last_upload_at_ms;
 } ble_snapshot_t;
@@ -363,6 +369,7 @@ static void capture_current_snapshot(ble_snapshot_t *out) {
             out->reading_value[type] = record.value;
             out->reading_received_at_ms[type] = record.received_at_ms;
             out->reading_device_measured_key[type] = record.device_measured_key;
+            out->reading_source_kind[type] = record.source_kind;
         }
     }
 
@@ -388,7 +395,8 @@ static bool snapshots_equal(const ble_snapshot_t *a, const ble_snapshot_t *b) {
         }
         if (a->reading_valid[i] && (a->reading_value[i] != b->reading_value[i] ||
                                      a->reading_received_at_ms[i] != b->reading_received_at_ms[i] ||
-                                     a->reading_device_measured_key[i] != b->reading_device_measured_key[i])) {
+                                     a->reading_device_measured_key[i] != b->reading_device_measured_key[i] ||
+                                     a->reading_source_kind[i] != b->reading_source_kind[i])) {
             return false;
         }
     }
@@ -430,15 +438,42 @@ static const char *vital_unit(vital_type_t type) {
 // 「裝置量測當下」的時間，不是「Pico 收到 BLE 通知」的時間——裝置可能在量測
 // 完之後過一段時間才被 Pico 連上、讀到資料，兩個時間點不一定相同。沒有這個
 // 資訊的裝置（額溫槍/血氧計，key==0）才退回顯示 received_at_ms。
+//
+// 裝置自己的時鐘不保證校時過（電池換過、從沒設定過、韌體預設值都可能差好幾
+// 年）——跟 mode_upload.c 上傳前做的判斷一樣，先跟 Pico 已校時過的現在時間
+// 比對合理性（wall_clock_epoch_is_plausible()），不合理就退回顯示
+// received_at_ms，不要讓畫面直接顯示裝置回報的離譜日期時間。這裡故意跟
+// mode_upload.c 共用同一份 wall_clock_epoch_is_plausible()／
+// DEVICE_CLOCK_SANITY_WINDOW_MS，避免兩邊各自實作、之後改一邊忘記改另一邊。
 static void format_reading_clock(uint64_t received_at_ms, uint32_t device_measured_key,
                                   char *out, size_t out_size) {
     if (device_measured_key != 0) {
-        unsigned year, month, day, hour, minute;
-        fora_protocol_measured_key_to_datetime(device_measured_key, &year, &month, &day, &hour, &minute);
-        snprintf(out, out_size, "%02u/%02u %02u:%02u", month, day, hour, minute);
-        return;
+        uint64_t device_epoch_ms = fora_protocol_measured_key_to_epoch_ms(device_measured_key);
+        if (!wall_clock_is_synced() ||
+            wall_clock_epoch_is_plausible(device_epoch_ms, DEVICE_CLOCK_SANITY_WINDOW_MS)) {
+            unsigned year, month, day, hour, minute;
+            fora_protocol_measured_key_to_datetime(device_measured_key, &year, &month, &day, &hour, &minute);
+            snprintf(out, out_size, "%02u/%02u %02u:%02u", month, day, hour, minute);
+            return;
+        }
     }
     display_status_format_clock(received_at_ms, out, out_size);
+}
+
+// VITAL_TYPE_PULSE_RATE 是目前唯一會同時由兩種裝置回報的類型（血壓計/血氧計，
+// 見 fora_protocol.c 的 fora_protocol_parse_reading()），畫面上只有一行
+// 「Pulse」、只顯示最新一筆（見 storage_get_last_reading() 的說明），所以加
+// 這個來源標籤讓使用者能分辨這筆數值是哪台裝置量到的，不需要為此多佔一整行
+// 螢幕空間。其他類型只有單一來源，不需要標籤。
+static const char *pulse_source_tag(vital_type_t type, uint8_t source_kind) {
+    if (type != VITAL_TYPE_PULSE_RATE) {
+        return "";
+    }
+    switch ((fora_device_kind_t)source_kind) {
+        case FORA_DEVICE_BLOOD_PRESSURE: return "BP ";
+        case FORA_DEVICE_OXIMETER:       return "O2 ";
+        default:                         return "";
+    }
 }
 
 static void draw_reading_row(int y, vital_type_t type, const ble_snapshot_t *snap) {
@@ -449,7 +484,8 @@ static void draw_reading_row(int y, vital_type_t type, const ble_snapshot_t *sna
         char clock_str[24];
         format_reading_clock(snap->reading_received_at_ms[type], snap->reading_device_measured_key[type],
                               clock_str, sizeof(clock_str));
-        snprintf(line, sizeof(line), "%s %s%s (%s)", vital_label(type), value_str, vital_unit(type), clock_str);
+        snprintf(line, sizeof(line), "%s %s%s (%s%s)", vital_label(type), value_str, vital_unit(type),
+                 pulse_source_tag(type, snap->reading_source_kind[type]), clock_str);
     } else {
         snprintf(line, sizeof(line), "%s -- (never)", vital_label(type));
     }
@@ -460,14 +496,18 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     begin_frame();
 
     char line[48];
-    snprintf(line, sizeof(line), "ID: %s", snap->patient_id_ascii[0] != '\0' ? snap->patient_id_ascii : "(unset)");
+    snprintf(line, sizeof(line), "ID: %s  %s",
+             snap->patient_id_ascii[0] != '\0' ? snap->patient_id_ascii : "(unset)",
+             snap->status_text[0] != '\0' ? snap->status_text : "Idle");
     Paint_DrawString_EN(5, 2, line, &Font12, BLACK, WHITE);
-    Paint_DrawString_EN(5, 16, snap->status_text[0] != '\0' ? snap->status_text : "Idle", &Font12, BLACK, WHITE);
 
-    draw_reading_row(36, VITAL_TYPE_TEMPERATURE, snap);
-    draw_reading_row(49, VITAL_TYPE_SPO2, snap);
-    draw_reading_row(62, VITAL_TYPE_PULSE_RATE, snap);
-    draw_reading_row(75, VITAL_TYPE_GLUCOSE, snap);
+    // ID/狀態合併一行、Last upload/Pending 合併一行（各省一行），vitals 區塊
+    // 從 y=22 開始、13px 一行；騰出來的畫面下方空間（y=99 之後到面板底部
+    // y=128）保留給之後 FORA MD6 六合一新增的項目用。
+    draw_reading_row(22, VITAL_TYPE_TEMPERATURE, snap);
+    draw_reading_row(35, VITAL_TYPE_SPO2, snap);
+    draw_reading_row(48, VITAL_TYPE_PULSE_RATE, snap);
+    draw_reading_row(61, VITAL_TYPE_GLUCOSE, snap);
 
     // 血壓收縮/舒張合成一行顯示；兩者通常同一次量測一起寫入，時間戳取收縮壓的。
     if (snap->reading_valid[VITAL_TYPE_SYSTOLIC] && snap->reading_valid[VITAL_TYPE_DIASTOLIC]) {
@@ -480,19 +520,16 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     } else {
         snprintf(line, sizeof(line), "BP    -- (never)");
     }
-    Paint_DrawString_EN(5, 88, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(5, 74, line, &Font12, BLACK, WHITE);
 
+    char upload_clock_str[24];
     if (snap->last_upload_valid) {
-        char clock_str[24];
-        display_status_format_clock(snap->last_upload_at_ms, clock_str, sizeof(clock_str));
-        snprintf(line, sizeof(line), "Last upload: %s", clock_str);
+        display_status_format_clock(snap->last_upload_at_ms, upload_clock_str, sizeof(upload_clock_str));
     } else {
-        snprintf(line, sizeof(line), "Last upload: never");
+        snprintf(upload_clock_str, sizeof(upload_clock_str), "never");
     }
-    Paint_DrawString_EN(5, 101, line, &Font12, BLACK, WHITE);
-
-    snprintf(line, sizeof(line), "Pending uploads: %u", (unsigned)snap->pending_count);
-    Paint_DrawString_EN(5, 114, line, &Font12, BLACK, WHITE);
+    snprintf(line, sizeof(line), "Last: %s  Pending: %u", upload_clock_str, (unsigned)snap->pending_count);
+    Paint_DrawString_EN(5, 87, line, &Font12, BLACK, WHITE);
 
     return end_frame_and_refresh();
 }

@@ -222,15 +222,23 @@ bool storage_append_record(const vital_record_t *record) {
     }
 
     if (is_duplicate) {
+        printf("[STORAGE] duplicate suppressed: type=%d source_kind=%d value=%d device_measured_key=%u\n",
+               record->type, record->source_kind, (int)record->value,
+               (unsigned)record->device_measured_key);
         return true;
     }
 
-    // 同一種類型如果已經有一筆還沒上傳成功的舊紀錄（PENDING 或 FAILED），直接
-    // 用這筆最新的蓋掉，不要讓同類型的資料一直堆積、上傳好幾筆重複/過時的值
-    // （裝置量測完常常會持續廣播一段時間，同一輪可能被連上好幾次）。
+    // 同一種類型「且同一個來源裝置」如果已經有一筆還沒上傳成功的舊紀錄（PENDING
+    // 或 FAILED），直接用這筆最新的蓋掉，不要讓同類型/同來源的資料一直堆積、
+    // 上傳好幾筆重複/過時的值（裝置量測完常常會持續廣播一段時間，同一輪可能被
+    // 連上好幾次）。source_kind 也要比對——VITAL_TYPE_PULSE_RATE 同時由血壓計
+    // 跟血氧計回報，只比對 type 的話兩種裝置的待傳脈搏紀錄會互相蓋掉，其中一筆
+    // 永遠不會被上傳（判重邏輯在上面已經有比對 source_kind，這裡要保持一致）。
     for (size_t i = 0; i < s_record_count; i++) {
-        if (s_records[i].type == record->type &&
+        if (s_records[i].type == record->type && s_records[i].source_kind == record->source_kind &&
             (s_records[i].status == UPLOAD_STATUS_PENDING || s_records[i].status == UPLOAD_STATUS_FAILED)) {
+            printf("[STORAGE] replacing pending record: type=%d source_kind=%d old_value=%d new_value=%d\n",
+                   record->type, record->source_kind, (int)s_records[i].value, (int)record->value);
             s_records[i] = *record;
             persist_pending_records();
             return true;
@@ -238,6 +246,8 @@ bool storage_append_record(const vital_record_t *record) {
     }
 
     if (s_record_count >= MAX_PENDING_RECORDS) {
+        printf("[STORAGE] pending queue full (%d records), dropping: type=%d source_kind=%d value=%d\n",
+               MAX_PENDING_RECORDS, record->type, record->source_kind, (int)record->value);
         return false;
     }
     s_records[s_record_count++] = *record;

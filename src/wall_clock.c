@@ -114,3 +114,9 @@ uint64_t wall_clock_to_epoch_ms(uint64_t boot_ms) {
     // 用「校時那一刻的 boot ms 對應到哪個 epoch ms」直接線性平移，跟先後順序無關。
     return s_sync_epoch_ms + (boot_ms - s_sync_boot_ms);
 }
+
+bool wall_clock_epoch_is_plausible(uint64_t epoch_ms, uint64_t window_ms) {
+    uint64_t now_epoch_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
+    uint64_t diff_ms = epoch_ms > now_epoch_ms ? epoch_ms - now_epoch_ms : now_epoch_ms - epoch_ms;
+    return diff_ms <= window_ms;
+}
