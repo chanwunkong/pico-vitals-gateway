@@ -18,6 +18,10 @@
 
 void storage_init(void);
 
+// 開機時按住 KEY2 觸發的「清空重來」，把 littlefs 分區整個重新格式化——見
+// storage.c 的說明。**要在 storage_init() 之前呼叫**，main.c 負責檢查按鍵。
+void storage_factory_reset(void);
+
 // 讀取先前儲存的設定；若尚未設定過（flash 是空的）回傳 false。
 bool storage_load_config(device_config_t *out);
 
@@ -30,14 +34,23 @@ bool storage_append_record(const vital_record_t *record);
 // 取出最多 max_count 筆待傳（status == PENDING）的紀錄，回傳實際取出筆數。
 size_t storage_pending_records(vital_record_t *out, size_t max_count);
 
-// 將上一次 storage_pending_records() 取出的前 count 筆標記為上傳結果；
-// 上傳成功的紀錄會被移除，失敗的保留供下次重試。
-void storage_mark_uploaded(size_t count, uint64_t uploaded_at_ms, bool success);
+// 將上一次 storage_pending_records() 取出的紀錄裡、來源裝置種類是
+// source_kind「且」device_measured_key 也相同的那些（PENDING 或 FAILED）
+// 標記為上傳結果；上傳成功的紀錄會被移除，失敗的保留供下次重試，其他來源/
+// 其他時間點的紀錄不受影響。後端一次上傳是一筆彙整過的紀錄、一個時間點只能
+// 有一個值（見 upload_api.c 的說明），mode_upload.c 依 (source_kind,
+// device_measured_key) 分組個別呼叫上傳 API 之後，要能只標記「剛剛那組」的
+// 結果，不能影響到陣列裡其他組別、還沒處理過的紀錄——這對額溫槍/血氧計這種
+// 沒有裝置時間戳的裝置沒有影響（device_measured_key 恆為 0，等同只依
+// source_kind 分組，跟這個函式原本的行為一樣）；對血壓計/MD6 這種一次連線
+// 可能抓到好幾個不同時間點記錄的裝置，才會真的按時間點分開標記。
+void storage_mark_uploaded_for_group(
+    uint8_t source_kind, uint32_t device_measured_key, uint64_t uploaded_at_ms, bool success);
 
 // 查詢某一種生理數值「這次開機以來」最後一次收到的讀值，跟有沒有上傳成功無關
-// ——上傳成功的紀錄會從待傳佇列被移除（見 storage_mark_uploaded()），但畫面
-// 顯示需要「最後量到多少」這個資訊，所以另外留一份，只存在 RAM，不跨開機
-// 持久化（重開機後要等收到新讀值才會再有值，這是刻意的簡化，見
+// ——上傳成功的紀錄會從待傳佇列被移除（見 storage_mark_uploaded_for_group()），
+// 但畫面顯示需要「最後量到多少」這個資訊，所以另外留一份，只存在 RAM，不跨
+// 開機持久化（重開機後要等收到新讀值才會再有值，這是刻意的簡化，見
 // PROJECT_PLAN.md 第 12.6 節）。回傳 false 代表這次開機還沒收過這種類型。
 bool storage_get_last_reading(vital_type_t type, vital_record_t *out);
 
@@ -64,5 +77,15 @@ size_t storage_get_upload_history_count(void);
 // 從最舊開始取不同，這個是從最新往回取），一樣最舊的排前面、最新的排最後，
 // 回傳實際取出筆數。畫面顯示「最近幾筆上傳紀錄」用。
 size_t storage_get_recent_upload_history(vital_record_t *out, size_t max_count);
+
+// 血壓計/MD6 backfill 用的「上次同步到哪一筆」定位點：8 bytes 是那個裝置
+// 種類最新一筆記錄的原始內容（不是解析過的數值，也不是裝置時間戳——裝置
+// 時鐘不可信任，改成直接比對原始 bytes 是不是同一筆，見 storage.c 裡
+// MAX_BACKFILL_ANCHOR_KINDS 的說明）。source_kind 當不透明的 uint8_t 用，
+// 跟 vital_record_t.source_kind 是同一組值（fora_device_kind_t）。
+// storage_get_backfill_anchor() 回傳 false 代表這個種類還沒有存過定位點
+// （例如第一次連線這種裝置）。
+bool storage_get_backfill_anchor(uint8_t source_kind, uint8_t out_anchor[8]);
+void storage_set_backfill_anchor(uint8_t source_kind, const uint8_t anchor[8]);
 
 #endif // STORAGE_H

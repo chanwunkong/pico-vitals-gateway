@@ -417,6 +417,11 @@ static const char *vital_label(vital_type_t type) {
         case VITAL_TYPE_GLUCOSE:     return "Gluc ";
         case VITAL_TYPE_SYSTOLIC:    return "Sys  ";
         case VITAL_TYPE_DIASTOLIC:   return "Dia  ";
+        case VITAL_TYPE_HCT:         return "HCT  ";
+        case VITAL_TYPE_KETONE:      return "Ket  ";
+        case VITAL_TYPE_UA:          return "UA   ";
+        case VITAL_TYPE_CHOL:        return "Chol ";
+        case VITAL_TYPE_HB:          return "HB   ";
         default:                     return "?    ";
     }
 }
@@ -429,6 +434,11 @@ static const char *vital_unit(vital_type_t type) {
         case VITAL_TYPE_GLUCOSE:     return "mg/dL";
         case VITAL_TYPE_SYSTOLIC:    return "mmHg";
         case VITAL_TYPE_DIASTOLIC:   return "mmHg";
+        case VITAL_TYPE_HCT:         return "%";
+        case VITAL_TYPE_KETONE:      return "mmol/L";
+        case VITAL_TYPE_UA:          return "mg/dL";
+        case VITAL_TYPE_CHOL:        return "mg/dL";
+        case VITAL_TYPE_HB:          return "g/dL";
         default:                     return "";
     }
 }
@@ -476,6 +486,43 @@ static const char *pulse_source_tag(vital_type_t type, uint8_t source_kind) {
     }
 }
 
+// MD6 六合一測試儀血糖以外的 5 項——血糖沿用既有的 Gluc 那一行（同一個
+// VITAL_TYPE_GLUCOSE，不管是血壓計還是 MD6 量到的都顯示在那裡），畫面空間
+// 有限（見 render_ble_receive() 的說明，只留得下一行給這 5 項共用），只顯示
+// 這 5 項裡「最後更新的那一項」，用縮寫標籤分辨是哪一項，見 PROJECT_PLAN.md
+// 第 6.5 節的說明。
+static const vital_type_t MD6_EXTRA_TYPES[] = {
+    VITAL_TYPE_HCT, VITAL_TYPE_KETONE, VITAL_TYPE_UA, VITAL_TYPE_CHOL, VITAL_TYPE_HB,
+};
+
+static void draw_md6_extra_row(int y, const ble_snapshot_t *snap) {
+    int best = -1;
+    for (size_t i = 0; i < sizeof(MD6_EXTRA_TYPES) / sizeof(MD6_EXTRA_TYPES[0]); i++) {
+        vital_type_t type = MD6_EXTRA_TYPES[i];
+        if (!snap->reading_valid[type]) {
+            continue;
+        }
+        if (best < 0 || snap->reading_received_at_ms[type] > snap->reading_received_at_ms[MD6_EXTRA_TYPES[best]]) {
+            best = (int)i;
+        }
+    }
+
+    char line[48];
+    if (best < 0) {
+        snprintf(line, sizeof(line), "MD6   -- (never)");
+    } else {
+        vital_type_t type = MD6_EXTRA_TYPES[best];
+        char value_str[16];
+        format_vital_value(value_str, sizeof(value_str), type, snap->reading_value[type]);
+        char clock_str[24];
+        format_reading_clock(snap->reading_received_at_ms[type], snap->reading_device_measured_key[type],
+                              clock_str, sizeof(clock_str));
+        snprintf(line, sizeof(line), "MD6 %s %s%s (%s)", vital_label(type), value_str, vital_unit(type),
+                 clock_str);
+    }
+    Paint_DrawString_EN(5, y, line, &Font12, BLACK, WHITE);
+}
+
 static void draw_reading_row(int y, vital_type_t type, const ble_snapshot_t *snap) {
     char line[48];
     if (snap->reading_valid[type]) {
@@ -502,8 +549,8 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     Paint_DrawString_EN(5, 2, line, &Font12, BLACK, WHITE);
 
     // ID/狀態合併一行、Last upload/Pending 合併一行（各省一行），vitals 區塊
-    // 從 y=22 開始、13px 一行；騰出來的畫面下方空間（y=99 之後到面板底部
-    // y=128）保留給之後 FORA MD6 六合一新增的項目用。
+    // 從 y=22 開始、13px 一行；y=100 那行是 FORA MD6 六合一血糖以外 5 項的
+    // 合併列（見 draw_md6_extra_row() 的說明），血糖本身沿用上面的 Gluc 行。
     draw_reading_row(22, VITAL_TYPE_TEMPERATURE, snap);
     draw_reading_row(35, VITAL_TYPE_SPO2, snap);
     draw_reading_row(48, VITAL_TYPE_PULSE_RATE, snap);
@@ -530,6 +577,8 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     }
     snprintf(line, sizeof(line), "Last: %s  Pending: %u", upload_clock_str, (unsigned)snap->pending_count);
     Paint_DrawString_EN(5, 87, line, &Font12, BLACK, WHITE);
+
+    draw_md6_extra_row(100, snap);
 
     return end_frame_and_refresh();
 }

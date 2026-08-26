@@ -26,6 +26,13 @@ int main(void) {
 
     led_status_init();
     button_input_init();
+    // 開機時按住 KEY2 不放＝清空重來（littlefs 分區整個重新格式化，待傳佇列/
+    // 上傳歷史/設定全部歸零），見 storage_factory_reset() 的說明。要在
+    // storage_init() 真的掛載/讀取之前檢查，不然清空就沒意義了。
+    if (button_input_key2_is_held()) {
+        printf("[main] KEY2 held at boot, factory-resetting storage...\n");
+        storage_factory_reset();
+    }
     storage_init();
 
     // Phase 1 硬體驗證畫面（display_status_show_boot_test()）不在正常開機流程

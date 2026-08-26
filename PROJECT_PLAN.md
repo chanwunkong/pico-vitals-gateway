@@ -137,8 +137,11 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
 | 裝置 | 冷卻時間 | 官方休眠門檻（2026-08-06 使用者確認） | 說明 |
 |---|---|---|---|
 | 額溫槍 | 60 秒 | 1 分鐘 | 冷卻等於門檻，沒有額外餘裕 |
-| 血氧計 | 5 秒 | **未知，待確認**（見第 7 節待確認事項） | 目前是暫定值，不是根據官方休眠時間設定的 |
+| 血氧計 | **非固定值，見下方說明** | **未知，待確認**（見第 7 節待確認事項） | 表格初始值是 0，實際冷卻時間由量測邏輯動態覆寫 |
 | 血壓計 | 4 分鐘 | 3 分鐘 | 多留 1 分鐘餘裕，避免剛好卡在門檻邊緣被提早重連 |
+| FORA MD6 六合一 | 10 秒 | 未知（多合一機型沒有單一休眠門檻可參考） | 刻意設短，方便使用者連續測不同試片；每次連線結束前還會做一段「往回翻頁」抓同一次測試 session 其餘項目，見第 6.5 節 |
+
+**2026-08-26 校正（跟程式碼核對後更新，`mode_ble_receive.c`）**：血氧計早已不是簡單的固定冷卻時間，`DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_OXIMETER]` 只是開機後、還沒開始一輪觀察 session 之前用的初始值 0，實際邏輯改成「30 秒觀察視窗」：血氧計是夾著手指持續量測的裝置，連線後每 3 秒（`OXIMETER_RESAMPLE_INTERVAL_MS`）重新取樣一次候選值，視窗內只保留最新一筆，滿 30 秒（`OXIMETER_SETTLE_WINDOW_MS`，比照臨床「等 30-60 秒讀數穩定再記錄」的慣例取下限）才真正送出當作正式讀值；送出之後才進入 90 秒（`OXIMETER_POST_SETTLE_COOLDOWN_MS`）的冷卻，避免緊接著又開始下一輪觀察。
 
 ## 4. LED 燈號規範
 
@@ -173,11 +176,17 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
 
 ## 6. 支援的裝置與藍牙協定（重要，之後擴充新裝置前必讀）
 
-三種裝置都用裝置廣播名稱含 `"FORA"` 判斷是不是要連線的裝置，再用名稱裡的其他字元判斷是哪一種型號（見 `fora_protocol_matches_advertisement()`）。**這個判斷邏輯很脆弱**：如果之後買到名稱不含這些關鍵字的新裝置，或現有裝置改款換了廣播名稱，需要回來調整。
+三種裝置都用裝置廣播名稱含 `"FORA"` 判斷是不是要連線的裝置，再用名稱裡的其他字元判斷是哪一種型號（見 `fora_protocol_matches_advertisement()`）。**2026-08-26 已改成每一種都要求明確比對到型號關鍵字**（不再是「其餘都當成額溫槍」的舊邏輯）：名稱含 `"FORA"` 但比對不出 `"O2"`／`"D40"`／`"IR42"` 任何一個關鍵字的裝置會直接回傳 false、不連線——這是為了修一個實際發生過的事故：FORA MD6（還沒支援）曾經被舊邏輯誤判成額溫槍，回應被誤解成一筆體溫讀值（錯誤數值如 12.8°C）上傳出去。
+
+**實機確認過的廣播名稱**（2026-08-26，用 Arduino IDE 序列埠監控直接看 `debug_print_advertisement()` 的 log confirm，見 `mode_ble_receive.c`）：
+- 額溫槍：`"FORA IR42"`（先前只是猜測，這次終於實機驗證過，猜對了）
+- 血氧計：`"FORA O2"`（先前已確認）
+- 血壓計：`"FORA D40"`（先前已確認）
+- FORA MD6 六合一：`"FORA MD6"`——含明確的 `"MD6"` 字串，可以直接明確比對，不會跟其他型號混淆。
 
 ### 6.1 FORA IR42 額溫槍（`FORA_DEVICE_THERMOMETER`，kind=1）
 
-- 判斷依據：名稱含 `"FORA"`，且不含 `"O2"`／`"D40"`（預設落在這一種）。
+- 判斷依據：名稱含 `"FORA"`，且含 `"IR42"`（2026-08-26 前是「不含 O2/D40 就預設當這一種」，已改成明確比對，見上方說明）。
 - **不是標準 Bluetooth SIG Health Thermometer Service**（雖然也宣告 0x1809，但那個不是真正資料管道，連線/訂閱都會成功但永遠收不到資料）。
 - 實際協定：借用 Nordic nRF5 SDK 範例板的 "LED and Button Service"（FORA/Taidoc 常見 OEM 做法）：
   - Service：`00001523-1212-efde-1523-785feabcd123`
@@ -244,9 +253,9 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
   官方程式的合理性檢查：`glucose == 65535` 或 `glucose == 255` 時視為無效讀值（`Invalid`），不是真正的血糖數字。
 - **已實作、已實機驗證（2026-08-06）**：`fora_protocol_parse_reading(FORA_DEVICE_BLOOD_PRESSURE, ...)` 收到組好的 8 bytes 後會先檢查 `byte[2] & 0x80`，0 就照上表解析血糖、回傳 `VITAL_TYPE_GLUCOSE`，非 0 才照原本的血壓邏輯解析；`mode_ble_receive.c` 原本「送 part A/B、組 8 bytes」的流程不用改，分流是在解析階段做的。實機測試量到一筆血糖 107 mg/dL，`byte[2]` bit7 正確判斷成血糖、數值換算跟手動核算封包位元組吻合，完整走過解析→判重→存 flash→上傳全部成功。畫面（`display_status.c` 的血糖列）、上傳（`upload_api.c`／`test_server/app.py` 的 `VITAL_TYPE_NAMES`）也都正確顯示/傳送。**已跟裝置螢幕實際顯示的數字比對一致**，見第 7.2 節第 11 點。
 
-### 6.5 FORA MD6 六合一測試儀（2026-08-13 協定已反推，完全還沒實作，下次接續開發先看這裡）
+### 6.5 FORA MD6 六合一測試儀（2026-08-26 已實機驗證：連線/配對/正式解析/多筆記錄往回翻頁全部跑通，見下方「目前還沒解決的問題」）
 
-**現況一句話**：確認了 MD6 走跟 D40 完全同一套指令管道，只是把血糖泛化成六個項目；但機型辨識方式、六個新項目的數值 scale/單位都還不確定，**故意沒有動任何程式碼**（沒加新的 `fora_device_kind_t`、沒改 `fora_protocol_parse_reading()`），避免拿不確定的假設寫出連線階段就分類錯誤、或數值單位錯誤的程式碼——這比完全不支援還糟，見下面「不確定、需要實機驗證」。
+**現況一句話**：MD6 走跟 D40 完全同一套指令管道，只是把血糖泛化成六個項目；廣播名稱、連線/配對、兩段式取記錄、正式解析（`fora_protocol_parse_reading()` 已經是正式路徑，會存進 storage/上傳，不再是診斷輸出）、`cmd 0x2B` 問記錄筆數、非 0 index 往回翻頁抓同一次測試的其他項目，全部都已經實機驗證成功。目前還沒解決的是「Hb 好像不是獨立記錄」「HCT 以外的其他項目數值 scale 沒驗證過」「往回翻頁沒有 flash 持久化基準點，每次連線都整批重抓」，見下方清單。
 
 **反推來源跟怎麼重現**：這台機器（`WunKong` 帳號）上裝了官方 Windows 程式「FORA Health Care Management System_BLE」（`%APPDATA%\FORA Health Care Management System_BLE\`，`image\` 資料夾裡有一張「福爾旗艦6合1測試儀 FORA MD6.jpg」確認這支程式認得 MD6），反編譯目標是同一支 `DLL\BLE_PCLink_Library.dll`，工具鏈跟第 8 節記錄的血壓計反推方法完全相同（`ilspycmd` 8.2.0.7535）。**這台機器上 `dotnet`／`ilspycmd` 都已經裝好，但不在這個 session 的 PATH 裡**——跟 pico-sdk 工具鏈一樣的問題（見第 0 節），要重新反編譯的話：
 
@@ -265,22 +274,78 @@ ilspycmd -p -o <輸出資料夾> "$env:APPDATA\FORA Health Care Management Syste
 - `byte[4..5]`：16-bit 小端數值，`65535` 視為無效讀值（跟血糖一樣）。
 - `byte[6]`：ambient（環境溫度），不用。
 - `byte[7]` 是 MD6 新增的關鍵欄位，跟血糖共用同一個 byte 但語意更豐富：
-  - bits 6-7（`&0xC0`，右移 6）＝量測情境：0=一般（`byte[3]` bits5-7==4 時視為「運動」）、1=飯前(AC)、2=飯後(PC)、**3=QC（品管/對照液測試，不是真的病人數值，理論上不該當成待傳資料上傳，但這個位元的實際行為還沒實機驗證過）**。
-  - bits 2-5（`&0x3C`，右移 2）＝這筆記錄是六合一裡的哪一項：`0`=血糖 Glucose、`6`=HCT（血球比容）、`7`=酮體 Ketone、`8`=尿酸 UA、`9`=總膽固醇 CHOL、`11`=血紅素 HB、`12`=乳酸 Lactate、`13`=三酸甘油脂 TG（`1/2/3/4/5/10` 官方程式碼裡沒有對應項目）。
+  - bits 6-7（`&0xC0`，右移 6）＝量測情境：0=一般（`byte[3]` bits5-7==4 時視為「運動」）、1=飯前(AC)、2=飯後(PC)、3=QC（品管/對照液測試）。**2026-08-26 實機驗證發現這個 QC 慣例只在血糖項目上成立**：往回翻頁抓到一筆 HCT=50（跟裝置螢幕顯示值相符，不是品管測試），但它的 context bits 剛好是 3——如果比照血糖邏輯把 context==3 一律當 QC 丟掉，會誤刪這種真的病人數值。目前 `fora_protocol.c` 已經改成**只有 `item_code==0`（血糖）才套用這個過濾**，其餘 5 項不套用；這 2 個 bit 對非血糖項目實際代表什麼還不知道。
+  - bits 2-5（`&0x3C`，右移 2）＝這筆記錄是哪一項，代碼共用自「多合一血糖機」通用協定 class（見上方說明），但 **MD6 是「六合一」機型，實際只會出現其中 6 個**：`0`=血糖 Glucose、`6`=HCT（血球比容/紅血球容積比）、`7`=酮體 Ketone、`8`=尿酸 UA、`9`=總膽固醇 CHOL、`11`=血紅素 HB。`12`=乳酸 Lactate、`13`=三酸甘油脂 TG 是同一套協定 class 給其他型號（例如八合一之類的機型）用的代碼，MD6 不會回報這兩個（2026-08-26 使用者確認：MD6 官方就是六合一，不是八合一，先前這裡誤寫成 8 項）。
   - bits 0-1：跟項目欄位共用「code number」概念（不同項目用不同試片），這個專案目前不需要額外解析。
 
-**不確定、需要實機驗證，不要照抄就實作**：
+**~~2. 廣播階段沒辦法用裝置名稱分辨是不是 MD6~~ 已解決（2026-08-26）**：原本以為要連線送 `cmd 0x24` 才能分辨，結果實機用 Arduino IDE 序列埠監控直接看 `debug_print_advertisement()` 的 log，MD6 的廣播名稱其實就是 `"FORA MD6"`，明確含 `"MD6"` 字串，跟 O2/D40/IR42 完全不會混淆，廣播階段就能直接明確分辨，不需要「連線後送 cmd 0x24 查 ProjectNo」這個工作量比較大的方案。目前 `fora_protocol_matches_advertisement()` 已經改成「每種型號都要求明確比對關鍵字」（見第 6 節開頭的說明），MD6 目前會正確地「認出名稱含 FORA、但比對不出任何已知型號」而回傳 false、不連線——這個安全行為已經實機驗證過（MD6 廣播了 13 次都沒有被誤連線）。**下一步只要把 `"MD6"` 加進去比對清單、新增 `FORA_DEVICE_MD6` kind 就能開始連線階段的開發**，不用再繞去查 ProjectNo。
 
-1. **血糖以外六項的數值 scale／單位**：官方程式碼裡 `GlucoseUnitEnum`/`CHOLUnitEnum`/`TGUnitEnum` 都有 mg/dL 跟 mmol/L 兩種模式（裝置端可切換）、`UAUnitEnum` 是 mg/dL 跟 umol/L、`HbCUnitEnum` 只有 g/dL、`HCTUnitEnum` 只有 %——`readMeasureRange()` 裡對 Glucose/CHOL/TG 的量測範圍門檻值有額外 `*10` 的縮放邏輯，但看不出這個縮放是不是也適用在 `byte[4..5]` 的實際量測值上。實際連線時應該先確認裝置目前的單位設定，不能假設一定是 mg/dL、也不能假設一定不用縮放。
-2. **廣播階段沒辦法用裝置名稱分辨是不是 MD6**：官方程式是連線後送 `cmd 0x24`（`GetMeterInfo`）問到 ProjectNo 才決定機型，不是像 O2/D40 那樣看廣播封包名稱關鍵字（見 `fora_protocol_matches_advertisement()`）。要支援 MD6 得先決定「怎麼在廣播階段先篩選要不要連線」——最簡單的做法是沿用「名稱含 FORA 就先連線」的既有邏輯、連上後再送 `cmd 0x24` 問 ProjectNo 判斷，但這樣會讓額溫槍/血氧計/血壓計的連線流程多一道查詢，需要評估要不要接受這個改動。
-3. **MD6 實際對應哪個 ProjectNo**：程式碼裡看到 `"4230"`/`"4232"`/`"4240"`/`"4255"`/`"4261"` 幾個代碼共用同一個 `GenBgmMeter` class，但沒有任何地方明確標示哪一個是 MD6，要連線後送 `cmd 0x24` 才能實測確認。
+**~~廣播/連線/配對/兩段式取記錄/正式解析~~ 已實機驗證成功（2026-08-26）**：`fora_protocol.h` 已加 `FORA_DEVICE_MD6`，`fora_protocol_matches_advertisement()` 已加 `"MD6"` 比對，`fora_protocol_parse_reading()` 的 MD6 分支已經是正式解析路徑（不是診斷輸出），`common.h` 已加 `VITAL_TYPE_HCT/KETONE/UA/CHOL/HB`，`upload_api.c` 已加對應 JSON 欄位跟 `dataSource=FORAMD6`。連線流程完全比照血壓計（需要配對，`sm_request_pairing()`），送 `cmd 0x25`/`0x26` 兩段式取記錄跟 D40 共用同一套邏輯。血糖數值驗證：裝置螢幕 128 跟解出來的 raw_value 一模一樣，不需要縮放，`byte[4..5]` 16-bit 小端直接就是 mg/dL。日期時間解碼也驗證正確（跟裝置實際量測時間一致，例如 2026-08-26 10:03）。
 
-**下次接續開發，建議順序**：
+**~~多筆記錄往回翻頁~~ 已實機驗證成功並實作（2026-08-26）**：`mode_ble_receive.c` 的 `md6_backfill_state_t` 狀態機——index=0 這筆正式 commit 之後，連線先不斷線，送 `cmd 0x2B` 問記錄筆數（`byte[2]|byte[3]<<8`，實測回應 4/6 都跟實際能抓到的筆數吻合），接著把 `send_bp_get_record_part_at_index()` 的 index 塞進 p1/p2（16-bit 小端），從 index=1 一路往回抓到裝置回報的筆數（安全上限 `MD6_BACKFILL_SAFETY_CAP=8`，連續 2 筆解析失敗也會停手）。同一次連線內完整實測過一次「3 合一試紙測 2 次 + 裝置裡一筆 5 月舊記錄」共 6 筆，全部正確抓到、正確歸類、正確存進待傳佇列，一筆沒漏（過程中抓到並修正了兩個實作 bug，見下方）。
 
-1. 有 MD6 實機的話，先接一次官方 Windows 程式配對，找出它回報的 ProjectNo（或直接寫一小段測試韌體送 `cmd 0x24` 問）。
-2. 確認裝置目前的單位設定（mg/dL vs mmol/L 等），量幾筆不同項目的樣本，跟裝置螢幕顯示的數字比對 `byte[4..5]` 的 raw value 到底要不要縮放。
-3. 決定廣播階段的篩選策略（上面第 2 點），再動 `fora_protocol.h`（新增 `FORA_DEVICE_MD6`）、`fora_protocol.c`（`fora_protocol_matches_advertisement()`／`fora_protocol_parse_reading()`）、`common.h`（新增六個 `VITAL_TYPE_*`）、`storage.c`（既有邏輯是泛型的，理論上不用改，但要跑一遍確認）、`display_status.c`（畫面空間有限，六項不太可能一項一行，可能要比照 BP 那樣做「顯示最後一次量到的是哪一項」的合併列）、`upload_api.c`（新增 JSON 欄位名稱）。
-4. 全部接完之後才更新這裡的狀態，並把這一節標記從「協定已反推，完全還沒實作」改成「已實作，還沒/已實機驗證」。
+**已解決的實作 bug（2026-08-26，都是靠實機 log 抓到的，不是 code review 發現的）**：
+
+1. **QC 過濾要不要套用在非血糖項目，來回改了三次，最後用實機螢幕畫面定案：只在血糖套用**。時序：
+   (1) 往回翻頁抓到一筆 HCT=50（跟裝置螢幕相符）卻剛好情境 bits==3，一開始臆測「數字看起來合理，不像 QC」，改成只在血糖套用過濾；
+   (2) 反編譯官方 PC 端程式（`TaiDoc.BLE_PcLink.Meter.Record.BloodGlucose` class）發現官方碼對全部項目統一套用「情境 bits==3＝QC」，改成統一套用——但這個推論其實有漏洞：反編譯出來的只是「PC 軟體怎麼分類/標示」，不代表官方軟體看到 QC 分類就會把記錄丟棄不存，這一步的邏輯跳躍沒有根據；
+   (3) 使用者直接核對裝置螢幕：那 2 筆 HCT（46、50）**螢幕上完全沒有顯示 QC 標記**，確認是正常讀值，改回只在血糖套用——**這次有實機畫面證據**。使用者後續補充的官方說明書內容也解釋了原因：裝置對「血糖／3合一／酮體試片」有自動 QC 偵測（吸入品管液才會觸發，操作者用真血液測試不會誤觸發），但**膽固醇／尿酸的 QC 要手動按 M 鍵才會啟用，不會自動偵測**——這暗示 context bits 對非血糖項目本來就不是可靠的「是否為 QC」指標，跟三次反覆的最終結論一致。`fora_protocol.c` 的 BP 血糖分支（D40）原本完全沒有這個過濾，這次也一併補上（同一套 `BloodGlucose` class，理論上有一樣的風險，D40 只測血糖，不受這次反覆影響）。詳見下方「反編譯出來的官方解析邏輯」跟「官方說明書：品管測試」。
+2. **pending 佇列覆蓋邏輯只比對 type+source_kind，沒比對 device_measured_key，翻頁翻到舊記錄時會蓋掉剛抓到的新記錄**：`storage_append_record()` 原本的「同類型+同來源就直接覆蓋 pending」對血壓計/血糖機這種「只有一筆當前值」的裝置沒問題，但 MD6 一次連線會抓到同 type 好幾筆不同時間點的記錄，往回翻到比較舊的那筆時反而蓋掉剛抓到的新讀值，整批資料最後只剩最舊那筆能上傳。已修正：兩筆記錄都有 device_measured_key 時，要時間戳也相同才覆蓋，不同時間點的記錄各自獨立存成一筆 pending 記錄。額溫槍/血氧計（沒有裝置時間戳）行為不變。
+3. **量測情境（一般/飯前/飯後）已解析並上傳**：`common.h` 新增 `vital_record_t.measurement_mode`，`fora_protocol.c` 解析 `byte[7]` 高 2 bit 填入（血壓計血糖／MD6 都有），`upload_api.c` 依這個欄位把血糖分流到後端既有的 `glu_ac`（一般/飯前，預設）／`glu_pc`（飯後）兩個欄位，不再固定送 `glu_ac`。
+
+**反編譯出來的官方解析邏輯（2026-08-26，`ilspycmd` 反編譯 `BLE_PCLink_Library.dll`，`TaiDoc.BLE_PcLink.Meter.Record.BloodGlucose` 建構子逐行核對）**：跟這個專案獨立反推出來的協定完全一致，包含日期/時間解碼、`value=byte[5]*256+byte[4]`、`ambient=byte[6]`。額外確認：`BloodParameter2` enum 就是 `Glucose=0, HCT=6, Ketone=7, UA=8, CHOL=9, HB=11, Lactate=12, TG=13`，跟這個專案的 item code switch 完全對應（證實 `HB=11` 這個映射本身沒有錯，不是猜的）。`codeNo = byte[7] & 0x3F`（這個專案目前不需要）。情境判斷 `num2 = (byte[7] & 0xC0) / 64`：0＝Gen（`byte[3]` bits5-7==4 時是「運動」子狀態，這個專案目前不解析）、1＝AC、2＝PC、3 或任何其他值＝QC。**這個判斷是 PC 軟體對全部項目統一套用的，但如上面第 1 點所述，這不代表 context bits 對非血糖項目也真的是「有沒有做 QC」的意思——實機證據跟官方說明書都指向並非如此。**
+
+**官方說明書：品管測試（2026-08-26 使用者提供，`FORA MD6` 使用手冊節錄）**：
+- 品管液測試結果應落在試片包裝標示的容許範圍內，用來檢視儀器/試片運作是否正常。
+- **自動 QC 偵測只適用於血糖、3合1、酮體試片**：這幾種試片吸入品管液後，儀器會自動判定為 QC 模式，不須使用者手動切換。
+- **膽固醇、尿酸的 QC 測試沒有自動偵測**：必須在試片插入後手動按 M 鍵選擇 QC 模式，否則「可能會導致錯誤的品管結果」（官方原文用詞）——換句話說，這兩項就算真的用品管液測試，如果使用者忘記按 M 鍵，裝置也不會自動標記成 QC。
+- 品管測試結果會自動存進裝置記憶，並有「QC」標示。
+- **裝置可儲存 1000 組含日期時間的測試結果**，超過 1000 筆時最新的會自動覆蓋最舊的（循環緩衝）。血糖有 7/14/21/28/60/90 天平均值功能；HCT/Hb/Ketone/CHOL/UA/QC 結果都不提供平均值計算——這點只是背景知識，跟這個專案的解析/上傳邏輯無關。**這個「1000 組」的容量數字對現有的往回翻頁安全上限有直接影響，見下方「目前還沒解決的問題」第 4 點。**
+
+**2026-08-26 後續實機驗證（同一天，跟上面反編譯/QC 反覆同一輪）**：
+- **D40 往回翻頁已實機驗證成功**：連線抓到 `record count=38`，安全上限 8 的情況下抓到 index=0~7 共 8 筆（1 筆血糖 GEN + 7 組血壓，各組 SYS/DIA/PULSE），全部正確解析、正確存成各自獨立的 pending 記錄，沒有互相覆蓋（storage.c 的修正對 D40 一樣有效）。
+- **AC/PC 情境解析已實機驗證成功**：MD6 測到一筆飯後(PC)血糖 115（`byte[7]=0x81`），正確解析成 `mode=PC`，其餘同一批往回翻頁抓到的舊記錄都正確顯示 `mode=GEN`，兩者對比清楚。AC 因為跟 PC 是同一段程式碼、只有 bit 值不同（1 vs 2），使用者確認不需要另外測。血糖也已經依 `mode` 分流到 `glu_ac`/`glu_pc`（`upload_api.c`），但**上傳本身還沒實機驗證過**（卡在下面的 WiFi 密碼問題）。
+
+**~~flash 持久化同步基準點 + 分批跨連線抓取~~ 已實作（2026-08-26），還沒實機驗證**：這是這一輪優先順序最高的項目——見上面「安全上限遠遠不夠」的說明，MD6 最多 1000 組、D40 實測至少 38 組，都遠超過單次連線能處理的量。設計／實作：
+- `storage.h`/`storage.c` 新增 `backfill_sync_state_t{ synced_up_to_key, resume_index }`，依裝置種類（`source_kind`）分開持久化在新的 `backfill_sync.bin`（跟 `config.bin` 同樣的單一結構讀寫模式）。
+- `mode_ble_receive.c` 的 `record_backfill_state_t` 翻頁流程改成：每次連線最多翻 `RECORD_BACKFILL_SAFETY_CAP`（8）個 index，起始 index 是 `resume_index`（沒在追進度時是 1，正在追一大批舊記錄時是上次沒抓完的地方）；翻頁途中如果碰到 `measured_key` 等於已知的 `synced_up_to_key`，代表追上了，立刻停止（不用每次都抓滿安全上限）；這次連線預算用完但還沒追上的話，記住 `resume_index` 存進 flash，下次連線接著翻；真的追上（或連續兩筆解析失敗，視為到底）之後，把 index=0 的 `measured_key` 存成新的 `synced_up_to_key`、`resume_index` 重置為 1，回到「穩態」（沒有新測試的話下次連線一翻頁就會立刻碰到新基準點，不會重問舊記錄）。
+- **已知限制**：index 是「相對於目前最新一筆」的相對位置，追一大批舊記錄的過程中如果使用者又做了新測試，index 會漂移，`resume_index` 可能對不準——靠 `device_measured_key` 判重頂多是「效率打折/漏掉幾筆」，不會產生重複資料，但也不保證完全不漏。裝置沒有提供穩定的絕對記錄 ID，目前沒有更好的解法。
+- **還沒實機驗證**：目前只在小量記錄（4~38 筆，一次連線內就能追完）的裝置上測過，沒有機會測到「一次連線追不完、要跨好幾次連線接力」的情況，這個分批續傳的路徑還沒有實機證據。
+
+**~~Hb（血紅素）沒有獨立記錄~~ 已實作換算，2026-08-26 使用者決定要傳**：確認裝置往回翻頁抓到的記錄裡只有血糖跟 HCT 兩種 item code，從沒出現過 Hb 的 item code (11)，也沒有記錄解析失敗被跳過（不是漏抓，是裝置沒有這筆記錄）。核對公式 **Hb ≈ HCT × 0.34**（血液學常用換算係數）：2026-08-26 兩個實機樣本 46×0.34=15.64≈15.6、50×0.34=17.0＝17，**都精確吻合**裝置螢幕顯示的 Hb。已在 `fora_protocol.c` 的 MD6 分支實作：每次解析出一筆 HCT，額外用同一個 `measured_key`/`mode` 多回傳一筆用 `HCT×0.34` 算出來的 `VITAL_TYPE_HB`（`fora_protocol_parse_reading()` 現在 MD6 的 HCT 記錄回傳 2 筆，不是 1 筆）。**這是韌體自己估計出來的值，不是裝置量到的**，只用 2 個樣本驗證過換算係數，`upload_api.c` 的 `hb` 欄位註解已經標注這點。如果裝置以後真的回報 item_code==11 的真實 Hb 記錄，storage.c 的覆蓋邏輯（比對 measured_key）會自動用真實測量值蓋掉這裡的估計值。
+
+**2026-08-26 使用者決定：拿掉 flash 持久化同步基準點（resume_index/synced_up_to_key），往回翻頁不設安全上限，單次連線內把裝置回報的筆數全部抓完**——原本設計的「flash 存進度、跨連線分批接力」完全沒有實機驗證過，而且是板子當機前最後加的一段程式碼（連線過程中會讀寫 flash），嫌疑最大；拿掉它可以同時解掉「這段完全沒測過」跟「跨連線 resume_index 可能因為使用者中途又測了新記錄而對不準」這兩個問題。改成單次連線內用既有已驗證過的「往回翻頁到裝置回報筆數」機制（`RECORD_BACKFILL_SAFETY_CAP`，MD6/D40 都實測過 walk index=1..N 沒問題），但把這個上限從 8 調高到遠超過官方文件寫的 1000 組上限（例如 1500），純粹當作防止 `cmd 0x2B` 回應格式解析錯誤/裝置回傳異常值時的無窮迴圈保險，不是拿來限制正常抓取——正常情況下都會被裝置實際回報的筆數（或連續兩筆解析失敗）提前結束，不會真的抓到那個上限。**這是規劃決定，還沒動手改程式碼**，下次要接續開發時：
+1. 把 `mode_ble_receive.c` 現有（已經在改到一半)的 `record_backfill_state_t` 相關程式碼裡，所有 `backfill_sync_state_t`／`storage_get_backfill_sync_state()`／`storage_set_backfill_sync_state()` 的呼叫都拿掉，`finish_record_backfill()` 這個輔助函式也整個刪掉。
+2. `handle_record_backfill_notification()` 的 `RECORD_BACKFILL_WAITING_COUNT` case 改回單純的「`target_count = min(count_guess, RECORD_BACKFILL_SAFETY_CAP)`，`next_index` 固定從 1 開始」，不要再讀 flash 基準點、不要有 `start_index`/`budget_end`/`known_synced_key` 這些概念。
+3. `RECORD_BACKFILL_WAITING_PART_B` case 拿掉「碰到 `known_synced_key` 就提前結束」那段判斷（因為沒有基準點了），只保留「解析失敗連續 2 次」跟「`next_index >= target_count`」這兩個停手條件。
+4. `RECORD_BACKFILL_SAFETY_CAP` 從 `8` 調成一個遠大於 1000 的數字（純安全網，例如 `1500`）。
+5. `storage.h`/`storage.c` 的 `backfill_sync_state_t`／`storage_get_backfill_sync_state()`／`storage_set_backfill_sync_state()` 這幾個新增的東西如果沒有其他呼叫端在用，整個拿掉（含 `backfill_sync.bin` 那個 flash 檔案的讀寫）。
+6. 改完要先確認 build 過關，燒錄前列出這次改了什麼，等使用者確認才燒。
+
+**目前還沒解決的問題（使用者 2026-08-26 決定暫不處理）**：
+
+1. **HCT 以外的 Ketone/UA/CHOL 數值 scale／單位還沒實機驗證過**（目前只有 Glucose、HCT 兩項有實測過裝置螢幕數字可以比對，都確認不需要縮放）。
+2. **`cmd 0x2B` 回應格式（`byte[2]|byte[3]<<8`＝筆數）只驗證過三個樣本（4、6、10、38——D40 那次是 38），數字更大時是否還一致沒測過**。
+3. **WiFi 密碼設錯，上傳全部卡在這一步**（`link status=1` 之後變 `-2`，全部認證模式都試過，`rc=-8`）：需要透過 AP_CONFIG 熱點設定模式重新輸入正確密碼，這步驟需要使用者在裝置上操作。在這個問題解決之前，AC/PC 分流到 `glu_ac`/`glu_pc`、Hb 估計值等等這些「解析階段」已經驗證好的邏輯，都還沒辦法驗證「上傳階段」真的會照預期送到後端。
+6. **~~上傳批次一個 type 只會保留最後一筆值~~ 已修正（2026-08-26）**：`mode_upload.c` 原本只依 `source_kind` 分組、一組送一次上傳，往回翻頁抓到同一 type 好幾筆不同時間點的記錄時，`build_measurement_json()` 組 JSON 只會保留最後一筆，其餘被靜默丟掉。已改成先依 `source_kind` 分組，組內再依 `device_measured_key` 細分——額溫槍/血氧計沒有裝置時間戳（恆為 0），細分後行為不變（還是一組一次請求）；血壓計/MD6 一次連線抓到的好幾個不同時間點記錄，現在會各自送一次獨立的上傳請求。`storage_mark_uploaded_for_kind()` 也改名/改簽名為 `storage_mark_uploaded_for_group(source_kind, device_measured_key, ...)`，只標記剛剛那一組（裝置種類＋時間點）的結果。**還沒實機驗證過**（只驗證到 build 成功），下次配合 MD6 多筆記錄的情境一起測。
+
+   **官方量測範圍規格（2026-08-26 使用者提供，用來驗證解析出來的數值合不合理**——不是拿來反推 scale，只是拿來檢查「解析出來的數字有沒有落在裝置本身宣稱的合理範圍內」）：
+   - 血糖 Glucose：10-600 mg/dL（跟這次實測的 128 一致，範圍對得上）
+   - 酮體 Ketone：0.1-8.0 mmol/L
+   - 總膽固醇 CHOL：100-400 mg/dL
+   - 尿酸 UA：3-20 mg/dL
+   - HCT／HB 的官方量測範圍規格這次沒有拿到，需要之後補（Lactate／TG 不適用，MD6 是六合一機型不會回報這兩項）。
+
+**原始設計（規劃階段記錄，跟上面「已解決」重疊的部分以上面實作為準；「flash 持久化基準點」這部分還沒做，設計仍然有效，見上方「目前還沒解決的問題」第 3 點）**：
+
+- **同步演算法**：連線後從 index=0（最新）開始逐筆往回問。
+  - **裝置第一次配對（沒有任何同步基準點）**：一路往回抓到裝置回「沒有更多記錄」為止，或抓到安全上限——把裝置裡現有的歷史記錄都拿回來，不是只拿最新一筆當起點。目前的實作沒有分「第一次/之後」，每次都當第一次做。
+  - **之後每次連線（已有基準點，還沒實作）**：往回抓到「時間戳＋項目代碼都跟基準點一樣」的那一筆就停止。
+  - **判斷「同一筆記錄」**：要用「時間戳（`device_measured_key`）＋ byte[7] 的項目代碼」兩者都相同才算，不能只比時間戳——同一次測試的不同項目（例如血糖+HCT）時間戳會一樣，只比時間戳會誤判成重複而漏掉（目前用 dedup 的 type+device_measured_key 隱含達到同樣效果，因為不同項目是不同 vital_type_t）。
+  - **基準點要存進 flash**（不是只存 RAM），跟現有的 pending queue／history 一樣持久化，重開機不能忘記同步到哪——還沒實作。
+  - **中途斷線是安全的**：下次連線重新從 index=0 開始問，已經抓過的記錄再問一次只會覆蓋同一筆 pending 記錄（不會變成重複資料），只是效率上多繞一輪，不影響正確性。已實機驗證（storage.c 的 dedup 邏輯，見上方「已解決的實作 bug」第 2 點）。
+  - **~~血壓計（D40）沿用同一套機制~~ 已接上（2026-08-26），但還沒實機驗證**：`mode_ble_receive.c` 的 `record_backfill_state_t`（原本叫 `md6_backfill_state_t`，改成通用命名）觸發條件從「只有 MD6」改成「MD6 或 BLOOD_PRESSURE」，`handle_record_backfill_notification()` 內部呼叫 `fora_protocol_parse_reading()` 時也從寫死 `FORA_DEVICE_MD6` 改成用 `s_current_kind`，這樣血壓計往回翻頁抓到的記錄（可能是血壓 3 筆一組，也可能是血糖 1 筆，取決於裝置當下是哪一種模式，見 `fora_protocol.h` 的協定說明）都能正確解析。D40 的安全上限也是沿用 `RECORD_BACKFILL_SAFETY_CAP=8`，一樣不知道夠不夠（D40 的記錄容量沒有像 MD6 那樣查到官方數字）。
+- **上傳範圍**：MD6 六合一全部項目（血糖/HCT/酮體/尿酸/總膽固醇/血紅素，**不含乳酸/三酸甘油脂，MD6 這台不會回報那兩項**）都上傳，韌體端不特別挑選哪些項目才傳，量到哪項就送哪項的 JSON 欄位——**已實作**。欄位名稱沿用裝置官方縮寫：`glu_ac`（已有）、`hct`、`ketone`、`ua`、`chol`、`hb`（這 5 個目前後端 `PhysioMeasurement` 沒有對應欄位，Gson 解析時會靜默忽略、不會報錯也不會存進資料庫，韌體這邊格式已經準備好，欄位的事還沒跟後端同步）。
 
 ## 7. 待辦事項
 
@@ -292,7 +357,7 @@ ilspycmd -p -o <輸出資料夾> "$env:APPDATA\FORA Health Care Management Syste
 
 1. **TLS 憑證驗證框架已接好，但還沒有真正的憑證可以放**：見 `upload_tls_ca_cert.h`，`UPLOAD_CA_CERT_PEM` 目前是空字串，upload_api.c 會照舊用不驗證模式（並在 log 印警告）。等正式後端網址確定之後，把該伺服器的憑證/CA PEM 貼進這個檔案就會自動改成真正驗證，不用改任何其他程式碼——**這個檔案本身沒有東西要寫了，純粹是在等一個「正式後端網址」的決定**。
 2. **上傳伺服器網址/認證金鑰目前用 AP_CONFIG 表單設定，但伺服器端還沒有實作認證檢查**：`upload_api.c` 已經會在有填認證金鑰時送出 `X-API-Key` 標頭，但這是單邊的——目前唯一的測試伺服器 `test_server/app.py` 完全沒有檢查這個標頭（也不應該檢查，它就是設計給沒有認證的本機測試用）。正式後端要自己實作驗證這個標頭的邏輯。
-3. **【新增】FORA MD6 六合一測試儀支援：協定已反推，完全還沒寫程式碼**，見第 6.5 節完整發現記錄跟「下次接續開發」的建議順序。卡點是機型辨識方式（廣播階段分辨不出來，要連線後查 ProjectNo）跟六個新項目的數值 scale/單位都需要實機才能確認，故意沒有先動 `fora_device_kind_t`/解析邏輯。
+3. **FORA MD6/D40 支援：廣播辨識/連線/配對/正式解析/多筆記錄往回翻頁/flash 持久化同步基準點/AC-PC-GEN 情境解析/Hb 換算全部已實作**，D40 往回翻頁跟 AC/PC 解析已實機驗證，flash 持久化基準點的「跨連線接力」路徑還沒實機驗證過（目前測過的裝置一次連線就能追完）。還沒解決的是「Ketone/UA/CHOL 數值 scale 未驗證」，跟卡住上傳驗證的 WiFi 密碼問題（使用者決定暫不處理），見第 6.5 節完整發現記錄。
 4. 見第 9 節「已知限制」剩下還沒有處理的項目。
 
 ### 7.2 測試/驗證層面待辦（功能已經寫好，需要實機測試確認正確）
@@ -387,6 +452,7 @@ ilspycmd -p -o <輸出資料夾> "$env:APPDATA\FORA Health Care Management Syste
 38. **裝置一直收不到任何 BLE 讀值的話，永遠沒有機會嘗試 NTP 校時**（2026-08-06 使用者提出後調整，見第 2.4 節完整說明）：`wall_clock_sync()` 只有在 `mode_upload_run()` 被呼叫時才會執行，而觸發 UPLOAD 的條件原本是「收到裝置讀值後才開始倒數 idle timeout」，如果裝置一直沒收到任何讀值就永遠不會主動切去 UPLOAD。**修法**：`mode_ble_receive.c` 新增獨立計時器，不依賴有沒有收到過讀值，只要還沒校時成功、且距離上次嘗試超過 5 分鐘（使用者確認的值，固定頻率不做失敗退避）就主動觸發一次 UPLOAD 嘗試校時。
 39. **無螢幕版本使用者拿不到每台裝置唯一衍生的熱點密碼**（2026-08-06 使用者實測反饋後調整）：AP 熱點密碼原本是從 RP2040 board ID 衍生的每台裝置唯一值（見第 24 點），但無螢幕版本沒有任何管道能讓使用者知道衍生出來的密碼是什麼。**修法**：`generate_ap_password()` 改成回傳固定值 `02750963`（所有裝置都一樣，可以事先印在文件/貼紙上）；SSID 仍然維持每台裝置唯一衍生（`generate_ap_ssid()` 不變，只是前綴從 `"PicoGateway-Setup-"` 縮短成 `"GATEWAY-"`，用來分辨機台）。`pico_get_unique_board_id()`／`pico/unique_id.h`／`CMakeLists.txt` 的 `pico_unique_id` 連結都一併移除（不再需要衍生密碼）。
 40. **AP_CONFIG 設定網頁加簡約手機版 CSS 時踩到 printf 格式化字串的坑，一度讓設定頁面打不開/captive portal 偵測失敗**（2026-08-06 使用者實機測試抓到）：`html_append()` 內部用 `vsnprintf()` 實作，所有傳進去的字串都會被當成 printf 格式化字串解析。新加的 CSS 內容 `"width:100%;..."` 裡的 `%` 沒有跳脫成 `%%`，`%;` 不是合法的格式化指定字元，屬於未定義行為，導致設定網頁一度打不開、captive portal 也偵測不到。雖然當下就找到並修好了這個特定問題（`%%` 逃脫），但使用者測試時又發現手機出現「無法連上網路」的提示（之前的版本不會），為了不在測試現場冒風險，**最終決定整個復原成加 CSS/`<label>` 結構之前的版面**，只保留「拿掉 WiFi 訊號強度 dBm 顯示」這一項改動（純文字內容變動，不涉及 CSS，沒有格式化字串風險）。**教訓**：這個檔案裡任何要傳給 `html_append()`/`append()` 的字串（包含 CSS、使用者輸入以外的固定字串），只要包含字面上的 `%` 字元，都必須寫成 `%%`，之後如果再嘗試加 CSS／其他包含 `%` 的內容務必注意這點。電子紙 AP_CONFIG 畫面的 SSID/密碼改用 Font8 顯示（見第 22.5 節、`display_status.c`）不受這次事件影響，維持不變。
+41. **KEY2 歷史畫面只看得到已上傳成功的紀錄，使用者反應不夠用**（2026-08-26 使用者反應後調整，尚未實機測試）：見第 34 點，原本的 `storage_get_recent_upload_history()`／`display_status_show_upload_history()` 只顯示已經上傳成功、進到環狀緩衝（`s_upload_history[]`）的紀錄，還在待傳佇列裡（`PENDING`/`FAILED`）的紀錄完全看不到。**修法**：`storage.c` 新增 `storage_get_recent_records()`，把待傳佇列跟已上傳歷史兩份資料一起按 `received_at_ms` 排序、取最新 max_count 筆（用小型插入排序暫存陣列取代一次性容納全部紀錄的大陣列，避免 Pico 堆疊塞不下最多 128+200 筆的合併陣列）；`display_status.c` 的 `display_status_show_upload_history()` 改名為 `display_status_show_history()`，每一行前面依紀錄自己的 `status` 欄位（`common.h` 的 `upload_status_t`）加一個單字元狀態標記（`+` 已上傳、`!` 上傳失敗、`.` 待傳中）；`mode_ble_receive.c` 的 KEY2 分支跟著改用新函式，`total_count` 也改成待傳筆數＋已上傳歷史筆數的合計。原本的 `storage_get_recent_upload_history()` 已無其他呼叫端，直接移除。
 
 ## 9. 已知限制 / 正式上線前必須處理
 
@@ -531,9 +597,11 @@ Waveshare 資料手冊列了幾點面板保護要求，**其中「不能長時�
 | 模式 | 畫面內容 | 對應函式 |
 |---|---|---|
 | AP_CONFIG 熱點設定 | 熱點 SSID/密碼文字、目前已存的個案編號（ASCII 過濾過，沒設定過就顯示 `(unset)`）、操作提示、WiFi QR code（見 12.7 節） | `display_status_show_ap_config()` |
-| BLE_RECEIVE | 個案編號（方案 A）、目前狀態（`Scanning (MM/DD HH:MM)`，見下方心跳說明）、體溫/血氧/脈搏/**血糖（協定已實作，見 6.4 節，沒量過的話顯示 `-- (never)`）**/血壓各自最後一筆數值＋時間戳（已校時顯示 `MM/DD HH:MM` 絕對時間，血壓計顯示的是**裝置自己的量測時間**而非 Pico 收到時間，見第 6.3 節；未校時且無裝置時間戳顯示 `unsynced,+Nm`）、**最後一次成功上傳時間**、待上傳筆數 | `display_status_set_ble_receive()` + `display_status_poll()` |
+| BLE_RECEIVE | 個案編號（方案 A）、目前狀態（`Scanning (MM/DD HH:MM)`，見下方心跳說明）、體溫/血氧/脈搏/**血糖（協定已實作，見 6.4 節，沒量過的話顯示 `-- (never)`）**/血壓各自最後一筆數值＋時間戳（已校時顯示 `MM/DD HH:MM` 絕對時間，血壓計顯示的是**裝置自己的量測時間**而非 Pico 收到時間，見第 6.3 節；未校時且無裝置時間戳顯示 `unsynced,+Nm`）、**MD6 六合一血糖以外 5 項合併列**（HCT/Ketone/UA/Chol/HB，見下方說明）、**最後一次成功上傳時間**、待上傳筆數 | `display_status_set_ble_receive()` + `display_status_poll()` |
 
-（2026-08-13 版面優化，**已 build 成功，還沒燒錄/肉眼驗證實際排版**：ID 跟狀態文字合併成一行、Last upload 跟 Pending 合併成一行，各省一行螢幕空間；體溫/血氧/脈搏/血糖/血壓五行往上移到 y=22~74，省下來的空間（y≈87 附近）留給以後 FORA MD6 六合一新增的項目用，見第 6.5 節。）
+（2026-08-13 版面優化，**已 build 成功，還沒燒錄/肉眼驗證實際排版**：ID 跟狀態文字合併成一行、Last upload 跟 Pending 合併成一行，各省一行螢幕空間；體溫/血氧/脈搏/血糖/血壓五行往上移到 y=22~74，省下來的空間留給 FORA MD6 六合一新增的項目用，見第 6.5 節。）
+
+**2026-08-26 校正（跟 `display_status.c` 核對後更新）**：上面「留給以後 MD6 用」的空間已經實作完成，不再只是預留——`draw_md6_extra_row()` 在 y=100 畫一行**合併列**，顯示 HCT/Ketone/UA/Chol/HB 這 5 項裡「最後更新的那一項」（用 `MD6 <縮寫> <數值><單位> (時間)` 格式，例如 `MD6 HCT 46% (08/26 10:05)`），5 項共用同一行、不是各自一行；沒有任何一項量過時顯示 `MD6   -- (never)`。血糖不管是血壓計還是 MD6 量到的，一律沿用原本的 Gluc 那一行，不受這個合併列影響。
 | UPLOAD | WiFi SSID + 目前階段/結果文字（`Connecting...`/`Success (N records)`/`Failed, will retry`） | `display_status_show_upload()` |
 | 錯誤 | 一句英文錯誤訊息，取代難記的三連閃燈號 | `display_status_show_error()` |
 
@@ -544,7 +612,7 @@ Waveshare 資料手冊列了幾點面板保護要求，**其中「不能長時�
 ### 12.7 AP_CONFIG 的 WiFi QR code（原規劃 Phase 4 提前）
 
 - 手機相機掃到 `WIFI:T:WPA;S:<ssid>;P:<password>;;` 這個特定前綴的字串會自動跳出系統內建的「加入 WiFi」提示——這是業界慣例（源自 ZXing），**QR code 本身沒有什麼特殊格式/模式**，跟顯示純文字/網址的 QR code 用的是同一套編碼方式，差別只在字串內容。SSID/密碼裡如果出現 `\`、`;`、`,`、`:`、`"` 這幾個字元，依慣例要加反斜線跳脫（`display_status.c` 的 `append_escaped_wifi_field()`）——`AP_SSID` 是寫死字串、`generate_ap_password()` 衍生出的密碼固定是 `pico-` 加 8 位十六進位字元，兩者都不會出現這些字元，但當初先做完整這件事現在證實是對的：密碼後來（見第 8.5 節第 24 點）真的從寫死字串改成動態產生了，這個跳脫邏輯不用跟著改。
-- 這個 QR code 編碼的是**熱點本身**的 SSID/密碼（`generate_ap_ssid()`/`generate_ap_password()` 衍生出的每台裝置專屬 SSID/密碼，見第 8.5 節第 24 點，讓手機能連上 Pico 的設定用熱點），**不是**個案要接的目標 WiFi（`device_config_t.wifi_ssid`/`wifi_password`，那組帳密是使用者在熱點頁面的表單裡填的，不會出現在任何 QR code 上）。
+- 這個 QR code 編碼的是**熱點本身**的 SSID/密碼（讓手機能連上 Pico 的設定用熱點），**不是**個案要接的目標 WiFi（`device_config_t.wifi_ssid`/`wifi_password`，那組帳密是使用者在熱點頁面的表單裡填的，不會出現在任何 QR code 上）。**2026-08-26 校正（跟 `mode_ap_config.c` 核對後更新）**：熱點 SSID 仍是 `generate_ap_ssid()` 衍生的每台裝置專屬值（`GATEWAY-XXXX`，見第 8.5 節第 24 點）；但密碼**不再是**動態衍生值——見第 8.5 節第 39 點，因為無螢幕版本沒有任何管道能讓使用者知道衍生出來的密碼，密碼已改回固定值 `02750963`（所有裝置共用同一組），QR code 編的就是這個固定密碼加上該台裝置的 SSID。
 - QR code 編碼器：從 Nayuki 的 `QR-Code-generator`（`c/qrcodegen.c`/`.h`，MIT 授權）複製進專案根目錄 `qrcode/`，純 C89、沒有外部依賴（只用標準函式庫），沒有改動任何一行。呼叫 `qrcodegen_encodeText()`，ECC 等級用 MEDIUM（可以容忍約 15% 資料損毀，兼顧掃描容錯率與 QR 大小），版本上限給 10（`qrcodegen_BUFFER_LEN_FOR_VERSION(10)` 對應的 buffer 只有 408 bytes，對這種 40~50 bytes 的短字串綽綽有餘，實際會落在 version 2~3 左右，遠用不到上限）。
 - 畫在 AP_CONFIG 畫面右側（`draw_qr_code()`，把 QR 的每個 module 依比例放大成好幾個實際像素畫上去，四周留白靠 `Paint_Clear(WHITE)` 清出來的背景自然滿足，不用額外處理），文字（SSID/密碼/個案編號/操作提示）留在左側，兩者之間留了足夠間距。
 - ✅ **2026-08-06 已實機掃碼驗證**，見第 7.2 節第 8 點。

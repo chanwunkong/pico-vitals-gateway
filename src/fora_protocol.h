@@ -65,6 +65,19 @@ extern const uint8_t FORA_TRIGGER_COMMAND[8];
 #define FORA_BP_CMD_GET_RECORD_COUNT  0x2B
 #define FORA_BP_USER_CURRENT          0x00
 
+// 血糖/MD6 記錄 byte[7] 高 2 bit 的量測情境，數值跟原始 bit pattern 直接對應
+// （0/1/2/3），2026-08-26 反編譯官方 PC 端程式（`BloodGlucose` class）逐行核對
+// 確認：0=一般（官方程式碼還有「運動」子狀態，見 byte[3] bits5-7==4，這個
+// 專案目前不解析）、1=飯前(AC)、2=飯後(PC)、3=QC（品管/對照液測試，包含
+// 任何無法辨識的值，官方程式碼是 `default: QC`）。QC 不是病人數值，
+// `fora_protocol_parse_reading()` 會直接濾掉、不會回傳成一筆記錄，所以
+// `vital_record_t.measurement_mode`／這個 enum 不會出現代表 QC 的值。
+typedef enum {
+    FORA_MEASUREMENT_MODE_GEN = 0,
+    FORA_MEASUREMENT_MODE_AC = 1,
+    FORA_MEASUREMENT_MODE_PC = 2,
+} fora_measurement_mode_t;
+
 // 組出上面說明的 8 byte 指令（含自動算好的 checksum，見 out[7]）。
 void fora_protocol_build_command(uint8_t cmd, uint8_t p1, uint8_t p2, uint8_t p3, uint8_t p4, uint8_t out[8]);
 
@@ -93,12 +106,24 @@ typedef enum {
     FORA_DEVICE_THERMOMETER,
     FORA_DEVICE_OXIMETER,
     FORA_DEVICE_BLOOD_PRESSURE,
+    // FORA MD6 六合一測試儀，廣播名稱含 "MD6"（2026-08-26 實機確認，見
+    // PROJECT_PLAN.md 第 6.5 節）。走跟血壓計完全相同的指令管道（同樣需要
+    // 配對、同樣用 FORA_BP_CMD_GET_RECORD_PART_A/B 兩段式取記錄），但六個
+    // 項目的數值單位/scale 都還沒實機驗證過，目前 mode_ble_receive.c 只把
+    // 收到的記錄印出來人工比對，不會存進待傳佇列/上傳，見該檔案的說明。
+    FORA_DEVICE_MD6,
     FORA_DEVICE_KIND_COUNT,
 } fora_device_kind_t;
 
 // 依掃描到的廣播封包判斷是否為要連線的 FORA 裝置：比對裝置名稱是否包含
 // "FORA"，並依名稱進一步判斷是哪一種型號（*out_kind，可傳 NULL 不取）——
-// 用名稱有沒有包含 "O2" 分辨血氧計、"D40" 分辨血壓計，其餘視為額溫槍。
+// 用名稱有沒有包含 "O2" 分辨血氧計、"D40" 分辨血壓計、"IR42" 分辨額溫槍、
+// "MD6" 分辨六合一測試儀（全部 2026-08-26 實機用序列埠監控確認過，見
+// PROJECT_PLAN.md 第 6 節）。**每一種都要明確比對到關鍵字才算數**：名稱含
+// "FORA" 但比對不出任何已知型號會回傳 false，不會像舊版那樣預設當成額溫
+// 槍——曾經真的發生過 MD6 被誤判成額溫槍、回應被誤解成一筆體溫讀值上傳
+// 出去的事故，不能讓「認不出型號」的裝置有機會被當成任何一種已支援的裝置
+// 去連線/解析。
 bool fora_protocol_matches_advertisement(
     const uint8_t *adv_data, uint8_t adv_len, fora_device_kind_t *out_kind);
 
@@ -115,6 +140,15 @@ bool fora_protocol_matches_advertisement(
 //   血壓計 kind（3 筆血壓，或 1 筆血糖）：value/len 是呼叫端已經組好的
 //     8 bytes 記錄（見上方 FORA_BP_CMD_* 說明），不檢查 byte[0]==0x51。
 //     依上方協定說明的 byte[2] bit7 分辨血壓/血糖並各自解析。
+//   MD6 kind（1 筆，HCT 是 2 筆）：跟血壓計一樣是呼叫端已經組好的 8 bytes
+//     記錄，日期時間解碼方式相同，但 byte[7] 換成「量測情境（bits6-7）＋
+//     項目代碼（bits2-5）」——QC（品管/對照液測試，情境代碼 3）只在血糖項目
+//     視為無效讀值不回傳，其餘 5 項不套用這個過濾（見 fora_protocol.c MD6
+//     分支的說明）；項目代碼對應 VITAL_TYPE_GLUCOSE/HCT/KETONE/UA/CHOL/HB
+//     其中一種，認不出的代碼（MD6 六合一不會用到的乳酸/三酸甘油脂）也不
+//     回傳。**HCT 額外多回傳第 2 筆換算出來的 VITAL_TYPE_HB**（裝置沒有
+//     獨立的 Hb 記錄可以要，見 fora_protocol.c 的說明，這筆是估計值不是
+//     裝置量到的）。
 size_t fora_protocol_parse_reading(
     fora_device_kind_t kind, const uint8_t *value, uint16_t len,
     vital_record_t out[FORA_MAX_READINGS_PER_NOTIFICATION]);

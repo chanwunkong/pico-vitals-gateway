@@ -141,6 +141,8 @@ Pico 開機時沒有網路，不知道真實時間，量測當下只能記錄開
 
 **（2026-08-06 加做，尚未實機測試）** 新增 `storage_get_upload_history_count()`（回傳目前總筆數）跟 `storage_get_recent_upload_history()`——跟 `storage_get_upload_history()` 從最舊開始取不同，這個是從最新往回取最近 N 筆（一樣最舊排前面、最新排最後），給 `mode_ble_receive.c` 的 KEY2 歷史畫面用，見「板載按鍵」章節。
 
+**（2026-08-26 加做，尚未實機測試，使用者反應歷史畫面只看得到已上傳的不夠用）** KEY2 歷史畫面原本只顯示 `storage_get_recent_upload_history()`（只有已上傳成功的），看不到還在待傳佇列裡（`PENDING`/`FAILED`）的紀錄。改成新增 `storage_get_recent_records()`，把待傳佇列跟已上傳歷史兩份資料一起按 `received_at_ms` 排序取最新 N 筆（不開一個容納全部紀錄的大陣列，用小型插入排序暫存陣列取代，避免 Pico 堆疊塞不下），呼叫端用每筆紀錄自己的 `status` 欄位（`common.h` 的 `upload_status_t`）分辨狀態。原本的 `storage_get_recent_upload_history()` 已移除（呼叫端全部改用新函式，舊函式沒有其他用途）。
+
 `storage_pending_records()` 會撈出 `PENDING` 跟 `FAILED` 狀態的紀錄（不是只有 `PENDING`——之前這裡篩選條件寫錯，導致上傳失敗過一次的紀錄永遠不會再被重傳，是修過的一個 bug）。上傳失敗+斷電都不會遺失資料：失敗的紀錄留在佇列裡（標記 `FAILED`，不會被丟棄），只要佇列非空、BLE_RECEIVE 閒置就會被 `mode_ble_receive_run()` 觸發重新嘗試上傳，不需要額外的定時器；待傳佇列本身持久化在 flash，斷電重開機後 `storage_init()` 會讀回繼續重試。
 
 **（2026-08-05 加的判重機制，見 `storage_append_record()`）** 裝置量測完常常會持續廣播一段時間，同一輪可能被連上好幾次，重複拿到「目前最新一筆」記錄。判重邏輯：先跟同類型（`vital_type_t`）**且同一種裝置回報**（`source_kind` 也要相同，見 `common.h` 的說明）的「最後讀值」比對——雙方都有裝置認證過的量測時間戳（`device_measured_key != 0`）就直接比對是否相等，沒有這個資訊的裝置（額溫槍/血氧計）才退回用「數值完全相同+時間間隔在 `DUPLICATE_SUPPRESS_WINDOW_MS`（10 分鐘）內」的經驗法則。判定為重複的話，畫面顯示用的 `s_last_reading` 照樣更新（時間戳往前推進，證明裝置剛剛還確認過這個數值仍是最新的），但不會塞進待傳佇列。
@@ -176,7 +178,7 @@ Waveshare Pico-ePaper-2.9 電子紙顯示器封裝，跟 `led_status.c` 平行�
 
 - `display_status_show_ap_config()`：熱點 SSID/密碼 + 目前已存的個案編號（ASCII 過濾過，見下方）+ WiFi QR code（`draw_qr_code()`，見下方 `qrcode/` 說明），`mode_ap_config.c` 開熱點後呼叫一次，內容整個設定階段不會變，不需要輪詢。
 - `display_status_show_upload()` / `display_status_show_error()`：`mode_upload.c` 在連線中/成功/失敗等幾個關鍵時間點呼叫，一樣是直接畫、直接刷新。
-- `display_status_show_upload_history()`（2026-08-06 加做，尚未實機測試）：`mode_ble_receive.c` 按 KEY2 時呼叫，畫最多 7 筆最近已上傳歷史（`vital_label()`/`vital_unit()` 順便補上原本缺的 `VITAL_TYPE_SYSTOLIC`/`DIASTOLIC` case），一樣是直接畫、直接刷新，呼叫端負責計時多久之後要換回即時畫面，見「板載按鍵」章節。
+- `display_status_show_history()`（2026-08-06 加做，2026-08-26 改名並改成合併顯示，尚未實機測試）：`mode_ble_receive.c` 按 KEY2 時呼叫，畫最多 7 筆最近紀錄（`vital_label()`/`vital_unit()` 順便補上原本缺的 `VITAL_TYPE_SYSTOLIC`/`DIASTOLIC` case），一樣是直接畫、直接刷新，呼叫端負責計時多久之後要換回即時畫面，見「板載按鍵」章節。**2026-08-26**：原本（`display_status_show_upload_history()`）只顯示已上傳成功的紀錄，使用者反應看不到還在待傳/上傳失敗的東西不夠用，改成顯示 `storage_get_recent_records()` 回傳的合併清單，每行前面加一個狀態標記（`status_marker()`：`+` 已上傳、`!` 上傳失敗、`.` 待傳中）。
 - `display_status_set_ble_receive()` + `display_status_poll()`：`mode_ble_receive.c` 的主迴圈是持續數十秒到數分鐘的緊迴圈，內容（狀態文字、各生理值的最後讀值、待傳筆數）會持續變動，用類似 `led_status_set()`/`led_status_poll()` 的呼叫慣例——`set_ble_receive()` 只是更新「想顯示的內容」（便宜），實際要不要刷新畫面由 `poll()`（跟 `led_status_poll()` 一樣每輪主迴圈呼叫）內部比對「這次的內容」跟「上次真的畫到螢幕上的內容」決定，只有真的不一樣才觸發一次全刷（全刷要 3 秒、會阻塞主迴圈，不能每輪都刷，見 PROJECT_PLAN.md 12.5 節）。**這個比對刻意不包含任何「距今 N 分鐘」這種會隨時間漂移的文字**，只比對原始數值/時間戳/筆數/狀態文字/`device_measured_key`，所以畫面上顯示的時間戳是「上次刷新當下」算出來的，不是即時的——這是為了不讓時間流逝本身觸發刷新風暴的刻意簡化。
 
 **時間戳顯示邏輯（`draw_reading_row()` 內部的 `format_reading_clock()`）**：有裝置自己認證過的量測時間戳（`device_measured_key != 0`，目前只有血壓計）就優先顯示裝置實際量測的時間（`fora_protocol_measured_key_to_datetime()` 直接解碼成 `MM/DD HH:MM`，不經過 wall_clock 換算），其餘裝置（額溫槍/血氧計）才用 `display_status_format_clock()` 顯示「Pico 收到 BLE 通知的時間」（校時過顯示絕對時間，沒校時顯示 `unsynced,+Nm`）。**血糖列**（`VITAL_TYPE_GLUCOSE`）協定已接上並實作（見 PROJECT_PLAN.md 第 6.4 節），量到血糖時會正常顯示，尚未實機驗證過；沒量過的話跟其他生理值一樣顯示 `-- (never)`。

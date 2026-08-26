@@ -12,8 +12,18 @@
 #define LWIP_NETCONN                0
 
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    4000
-#define MEMP_NUM_TCP_SEG            32
+// 2026-08-26：AP_CONFIG 設定頁改版後（CSS+JS+base64 內嵌 ITRI 標誌圖片）單一
+// HTTP 回應膨脹到約 17~18KB，遠超過舊版（約 3~4KB）。mode_ap_config.c 用
+// tcp_write(..., TCP_WRITE_FLAG_COPY) 一次把整個回應送出，這個呼叫的資料會
+// 從這個 MEM_SIZE 堆積複製進 PBUF_RAM，且必須一次塞進 TCP_SND_BUF 裡（見下方）
+// ——原本 4000/11680 bytes 舊版頁面偶爾勉強夠用，這次頁面變大後一定會失敗
+// （tcp_write 直接回傳 ERR_MEM，什麼都沒送出去，連線就關閉），導致設定頁
+// 打不開。調高到能一次裝下最大頁面（含最多 15 個掃到的 WiFi SSID）還有餘裕。
+// 這片板子 RAM 充足（.bss 目前約 140KB，總共 264KB），加這些不會有壓力。
+#define MEM_SIZE                    32768
+// lwIP 的 sanity check 要求 MEMP_NUM_TCP_SEG >= TCP_SND_QUEUELEN（下面用
+// TCP_SND_BUF 算出來的值，20*1460 送出緩衝區換算約 80），這裡抓寬一點。
+#define MEMP_NUM_TCP_SEG            96
 #define MEMP_NUM_ARP_QUEUE          10
 #define PBUF_POOL_SIZE              24
 
@@ -52,7 +62,9 @@ void wall_clock_sntp_set_system_time_us(uint32_t sec, uint32_t us);
 
 #define TCP_MSS                     1460
 #define TCP_WND                     (8 * TCP_MSS)
-#define TCP_SND_BUF                 (8 * TCP_MSS)
+// 20*1460=29200 bytes，一次裝得下 AP_CONFIG 設定頁最大回應（見上面 MEM_SIZE
+// 的說明），不然 tcp_write() 會因為超過可用送出緩衝區直接失敗。
+#define TCP_SND_BUF                 (20 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
 
 #define LWIP_NETIF_STATUS_CALLBACK  1

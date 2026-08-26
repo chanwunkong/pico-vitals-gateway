@@ -64,15 +64,58 @@ static fora_device_kind_t s_current_kind = FORA_DEVICE_UNKNOWN;
 // 數值比對，見 storage.c 的 storage_append_record()），冷卻時間只要「夠長、
 // 能讓裝置真的睡著」就好：
 //   額溫槍：官方休眠門檻 1 分鐘 → 冷卻設 60 秒。
-//   血壓計：官方休眠門檻 3 分鐘 → 冷卻設 4 分鐘（240 秒，多留 1 分鐘餘裕）。
-//   血氧計：官方休眠門檻未知，5 秒是暫定值，見 PROJECT_PLAN.md 第 7 節。
+//   血壓計：官方休眠門檻 3 分鐘（180 秒）→ 2026-08-26 使用者要求設 200 秒
+//   （原本多留 1 分鐘餘裕、共 240 秒），比官方休眠門檻多留 20 秒，連續量
+//   兩次的情境下能比原本更快收到第二筆，使用者已知悉這個取捨。
+//   血氧計：不是固定值，見下面 OXIMETER_SETTLE_WINDOW_MS/
+//   OXIMETER_RESAMPLE_INTERVAL_MS/OXIMETER_POST_SETTLE_COOLDOWN_MS 的說明，
+//   這裡的表格項只是初始值（開機後、還沒開始一輪觀察 session 之前用得到），
+//   實際冷卻時間由 handle_oximeter_reading() 動態覆寫。
 static const uint32_t DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_KIND_COUNT] = {
     [FORA_DEVICE_UNKNOWN] = 0,
     [FORA_DEVICE_THERMOMETER] = 60 * 1000,
-    [FORA_DEVICE_OXIMETER] = 5 * 1000,
-    [FORA_DEVICE_BLOOD_PRESSURE] = 240 * 1000,
+    [FORA_DEVICE_OXIMETER] = 0,
+    [FORA_DEVICE_BLOOD_PRESSURE] = 200 * 1000,
+    // MD6 現在有正式的量測解析/儲存/上傳流程（見 fora_protocol.c），冷卻給
+    // 短一點方便連續測不同試片；每次連線結束前還會多做一段「往回翻頁」把
+    // 同一次測試 session 其餘項目也抓完（見下面 record_backfill_state_t 的
+    // 說明），冷卻時間跟這段翻頁無關。
+    [FORA_DEVICE_MD6] = 10 * 1000,
 };
 static absolute_time_t s_kind_cooldown_until[FORA_DEVICE_KIND_COUNT];
+
+// 血氧計是夾著手指持續量測的裝置，跟額溫槍/血壓計那種「量一次就結束」不同：
+// 手指沒拿開的話裝置可能一直有新讀值。居家照護的量測慣例是「等數值穩定再
+// 記錄」（FDA／臨床衛教一致建議等 30-60 秒讓讀數穩定，這裡取下限 30 秒），
+// 不是把量測過程中每一次連線收到的值都當成正式讀值——用「30 秒觀察視窗，
+// 視窗內只保留最新一筆候選、視窗到了才真的送出」來近似這個做法，見
+// handle_oximeter_reading() 的說明。
+#define OXIMETER_SETTLE_WINDOW_MS (30 * 1000)
+// 觀察視窗還沒到之前，冷卻設短一點讓 Pico 很快再連一次抓下一筆候選值，逼近
+// 「持續觀察直到視窗結束」的效果；抓太密集沒有意義（BLE 連線本身有開銷），
+// 3 秒抓一次、30 秒視窗大概抓 10 次，足夠代表「數值穩定下來的最新結果」。
+// 沒有實機量到裝置真實刷新頻率可以參考（試過「連線中不斷線、收到就立刻再
+// 觸發」的量測方式，但那次測試沒有收到任何 BLE 事件，原因待查），3 秒是
+// 憑經驗抓的合理值，之後如果有機會量到真實數據，可以再微調。
+#define OXIMETER_RESAMPLE_INTERVAL_MS (3 * 1000)
+// 觀察視窗結束、真的送出候選值之後的冷卻時間——代表這次量測（這個 session）
+// 已經結束，不要緊接著又開始下一輪 30 秒觀察，跟額溫槍/血壓計的冷卻邏輯
+// 精神一致（給裝置機會真的休眠/病患把手指移開），90 秒是目前的估計值。
+#define OXIMETER_POST_SETTLE_COOLDOWN_MS (90 * 1000)
+
+// 血氧計目前這一輪 30 秒觀察 session 的狀態：session 有沒有在進行中、什麼
+// 時候開始的、目前收到的最新候選讀值是什麼。**故意不在 mode_ble_receive_run()
+// 開頭重置**（跟 s_kind_cooldown_until[] 同樣的道理）：如果 session 進行到
+// 一半、剛好被切去 UPLOAD 模式（見 mode_ble_receive_run() 主迴圈裡 idle 逾時
+// 的判斷——現在只有真的送出候選值那一刻才會推進 idle 計時器，見
+// handle_oximeter_reading()/commit_records() 的說明，所以 session 進行中不會
+// 卡住其他裝置資料的上傳時效），回到 BLE_RECEIVE 後這個 session 要能接著算，
+// 不能從頭重新倒數 30 秒。s_oximeter_session_start 用的是開機以來的單調時鐘
+// （get_absolute_time()），跨越模式切換依然正確，不受切換期間電台關閉影響。
+static bool s_oximeter_session_active = false;
+static absolute_time_t s_oximeter_session_start;
+static vital_record_t s_oximeter_latest_candidate[FORA_MAX_READINGS_PER_NOTIFICATION];
+static size_t s_oximeter_latest_candidate_count = 0;
 
 // 這一輪（這次進入 BLE_RECEIVE 到現在）有沒有收到過任何一筆生理訊號？在收到
 // 第一筆之前，idle timeout 不該開始算——像血壓計整個充放氣量測要 30-45 秒，
@@ -96,6 +139,49 @@ static fora_handle_cache_t s_handle_cache[FORA_DEVICE_KIND_COUNT];
 // 先暫存在這裡，等第二段回應收到後才跟它接成 8 bytes 一起解析。
 static uint8_t s_bp_record_part_a[4];
 static bool s_bp_waiting_for_part_b = false;
+
+// 血壓計（D40）跟 MD6 每次連線抓到「目前這一筆」（index=0）記錄、正式
+// commit 之後，趁裝置還沒斷線，繼續往回翻頁把同一次連線視窗內裝置回報的
+// 其他記錄也抓完——2026-08-26 在 MD6 跟 D40 上都實機驗證過：cmd 0x2B 回應的
+// byte[2]|byte[3]<<8、把 FORA_BP_CMD_GET_RECORD_PART_A/B 的 index 參數
+// （塞進 p1/p2，之前固定填 0）改成非 0 值，兩個假設都成立（MD6 index=1 真的
+// 翻到一筆日期時間跟 index=0 相同、但項目/數值不同的記錄，例如同一次測試的
+// HCT；D40 往回翻頁抓到血壓/血糖混合的歷史記錄，全部正確解析），見
+// PROJECT_PLAN.md 第 6.5 節。
+//
+// 每次連線固定從 index=1 開始翻到 min(裝置回報筆數, RECORD_BACKFILL_SAFETY_CAP)，
+// 不做跨連線的 flash 持久化進度（那一層設計過但還沒實機驗證就先不上，見
+// PROJECT_PLAN.md）——2026-08-26 使用者決定單次連線內把裝置回報的筆數全部
+// 抓完，不要用一個很小的數字卡住正常抓取。RECORD_BACKFILL_SAFETY_CAP 只是
+// 防止 cmd 0x2B 回應格式解析錯誤/裝置回傳異常值時的無窮迴圈保險，故意設得
+// 遠大於官方文件寫的 MD6 最大容量（1000 組），正常情況下都會被裝置實際
+// 回報的筆數，或連續兩筆解析失敗，提前結束，不會真的抓到這個上限。
+#define RECORD_BACKFILL_SAFETY_CAP 1500
+typedef enum {
+    RECORD_BACKFILL_IDLE = 0,
+    RECORD_BACKFILL_WAITING_COUNT,
+    RECORD_BACKFILL_WAITING_PART_A,
+    RECORD_BACKFILL_WAITING_PART_B,
+} record_backfill_state_t;
+static record_backfill_state_t s_record_backfill_state = RECORD_BACKFILL_IDLE;
+// 這次連線打算翻頁抓到第幾個 index（不含，夾在 RECORD_BACKFILL_SAFETY_CAP
+// 以內）、目前翻到第幾個 index、連續解析失敗次數。
+static uint16_t s_record_backfill_target_count = 0;
+static uint16_t s_record_backfill_next_index = 0;
+static uint8_t s_record_backfill_consecutive_skips = 0;
+static uint8_t s_record_backfill_record_part_a[4];
+
+// 「上次同步到哪一筆」的定位點，在 process_reading_payload() 處理 index=0
+// （最新那筆）時從 flash 載入一次，backfill 往回翻頁（index 1, 2, 3...）時
+// 拿同一份來比對——不是每翻一頁就重新讀 flash，是連線開始時的那一份，直到
+// 這次連線走完 backfill 都不變（新的定位點要等這次連線真的處理完最新那筆
+// 之後才會存回 flash，見 process_reading_payload() 的說明，不能提早覆蓋，
+// 不然 backfill 比對的對象會變成剛剛才存的「這次最新那筆」，永遠比不出
+// 「哪裡是上次同步的邊界」）。裝置時鐘不可信任，這裡比對的是原始 8 bytes
+// 記錄內容本身，不是解析出來的裝置時間戳，見 storage.h
+// storage_get_backfill_anchor() 的說明。
+static uint8_t s_backfill_sync_anchor[8];
+static bool s_backfill_sync_anchor_valid = false;
 
 static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
@@ -189,18 +275,209 @@ static void send_trigger_command(void) {
         sizeof(FORA_TRIGGER_COMMAND), (uint8_t *)FORA_TRIGGER_COMMAND);
 }
 
-// 血壓計「問目前這筆記錄」的兩段式交換第一/二段（見 fora_protocol.h 的協定
-// 說明）：cmd 只會是 FORA_BP_CMD_GET_RECORD_PART_A 或 _PART_B，索引固定填 0
-// （最新一筆），使用者編號固定用 FORA_BP_USER_CURRENT——這台裝置這兩個假設
-// 目前都還沒有機會驗證是不是所有情況都成立，見 PROJECT_PLAN.md 12 節的說明。
-static void send_bp_get_record_part(uint8_t cmd) {
+// 血壓計/MD6「問記錄」的兩段式交換第一/二段（見 fora_protocol.h 的協定
+// 說明）：cmd 只會是 FORA_BP_CMD_GET_RECORD_PART_A 或 _PART_B，使用者編號
+// 固定用 FORA_BP_USER_CURRENT。index=0 是文件記載的「目前這一筆」，正式
+// 流程一律用 0；非 0 的 index 塞進 p1/p2（16-bit 小端，呼應 cmd 0x2B 回應
+// 筆數也是 byte[2]|byte[3]<<8 這種編碼），p3 保留填 0——2026-08-26 實機驗證
+// 過 index=1 真的能翻到跟 index=0 同一次測試 session、但不同項目的另一筆
+// 記錄（見 record_backfill_state_t 的說明、PROJECT_PLAN.md 第 6.5 節）。
+static void send_bp_get_record_part_at_index(uint8_t cmd, uint16_t index) {
     uint8_t command[8];
-    fora_protocol_build_command(cmd, 0x00, 0x00, 0x00, FORA_BP_USER_CURRENT, command);
+    uint8_t p1 = (uint8_t)(index & 0xFF);
+    uint8_t p2 = (uint8_t)((index >> 8) & 0xFF);
+    fora_protocol_build_command(cmd, p1, p2, 0x00, FORA_BP_USER_CURRENT, command);
     gatt_client_write_value_of_characteristic_without_response(
         s_connection_handle, s_fora_characteristic.value_handle, sizeof(command), command);
 }
 
-// 三種裝置的 Notify payload 都送進這裡解析、存起來、斷線——共用同一份邏輯。
+// 問裝置目前有幾筆記錄（cmd 0x2B），回應格式見 fora_protocol.h 的協定說明
+// ——p1=使用者編號，沿用跟記錄查詢一樣的 FORA_BP_USER_CURRENT；byte[2]|
+// byte[3]<<8 = 筆數這個假設已經實機驗證過（見 record_backfill_state_t 的
+// 說明），但樣本數不多，數字大時是否還一致沒測過，所以 backfill 流程仍用
+// RECORD_BACKFILL_SAFETY_CAP 夾住上限（純粹防止這個回應值異常時無窮迴圈，
+// 不是拿來限制正常抓取，見上面宣告處的說明）。
+static void send_bp_get_record_count(void) {
+    uint8_t command[8];
+    fora_protocol_build_command(FORA_BP_CMD_GET_RECORD_COUNT, FORA_BP_USER_CURRENT, 0x00, 0x00, 0x00, command);
+    gatt_client_write_value_of_characteristic_without_response(
+        s_connection_handle, s_fora_characteristic.value_handle, sizeof(command), command);
+}
+
+// 純粹方便看序列埠 log 對照用的可讀名稱，不是任何協定/儲存邏輯的一部分。
+static const char *vital_type_debug_name(vital_type_t type) {
+    switch (type) {
+        case VITAL_TYPE_TEMPERATURE: return "TEMP";
+        case VITAL_TYPE_SPO2:        return "SPO2";
+        case VITAL_TYPE_PULSE_RATE:  return "PULSE";
+        case VITAL_TYPE_SYSTOLIC:    return "SYS";
+        case VITAL_TYPE_DIASTOLIC:   return "DIA";
+        case VITAL_TYPE_GLUCOSE:     return "GLUCOSE";
+        case VITAL_TYPE_HCT:         return "HCT";
+        case VITAL_TYPE_KETONE:      return "KETONE";
+        case VITAL_TYPE_UA:          return "UA";
+        case VITAL_TYPE_CHOL:        return "CHOL";
+        case VITAL_TYPE_HB:          return "HB";
+        default:                     return "UNKNOWN";
+    }
+}
+
+// 同上，量測情境（見 fora_protocol.h 的 fora_measurement_mode_t）；只有血糖/
+// MD6 這幾種裝置會填有意義的值，其他裝置固定是 0，印出來也是 "GEN" 但沒有
+// 實際意義，不影響判讀。
+static const char *measurement_mode_debug_name(uint8_t mode) {
+    switch ((fora_measurement_mode_t)mode) {
+        case FORA_MEASUREMENT_MODE_AC: return "AC";
+        case FORA_MEASUREMENT_MODE_PC: return "PC";
+        default:                       return "GEN";
+    }
+}
+
+// 把已經確定要採信的讀值真正存進待傳佇列——這是唯一會推進 idle 計時器
+// （s_last_reading_at/s_got_any_reading_this_session）的地方。血氧計觀察
+// session 進行中收到的候選讀值不會呼叫這個函式（見 handle_oximeter_reading()
+// 的說明），只有視窗到了、真的採信某一筆的那一刻才會呼叫，這樣血氧計的手指
+// 沒拿開、一直有動靜也不會讓 idle 計時器一直被重置、卡住其他裝置已經量好、
+// 在待傳佇列裡等待上傳的資料。
+static void commit_records(const vital_record_t *records, size_t record_count) {
+    uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+    for (size_t i = 0; i < record_count; i++) {
+        vital_record_t record = records[i];
+        record.received_at_ms = now_ms;
+        record.status = UPLOAD_STATUS_PENDING;
+        storage_append_record(&record);
+        // 手動格式化浮點數，避免依賴 newlib-nano 預設未啟用的 printf float 支援；
+        // 用四捨五入到小數點後 1 位，不是無條件捨去。
+        int tenths = (int)(record.value * 10.0f + (record.value >= 0.0f ? 0.5f : -0.5f));
+        int whole = tenths / 10;
+        int frac = tenths % 10;
+        if (frac < 0) {
+            frac = -frac;
+        }
+        printf("[BLE] parsed reading: type=%s(%d) value=%d.%d mode=%s\n",
+               vital_type_debug_name(record.type), record.type, whole, frac,
+               measurement_mode_debug_name(record.measurement_mode));
+    }
+    s_last_reading_at = get_absolute_time();
+    s_got_any_reading_this_session = true;
+    led_status_set(LED_HEARTBEAT);
+}
+
+// record_backfill_state_t 翻頁流程收到的回應：每翻到一筆能解析成功的記錄就
+// 呼叫 commit_records() 正式存進待傳佇列（不同項目是不同 vital_type_t，就算
+// device_measured_key 相同——同一次測試 session——storage.c 判重也不會互相
+// 誤判，見 common.h device_measured_key 欄位的說明）。連續兩筆解析失敗（視為
+// 已經到底）、或抓到裝置回報的筆數（夾在 RECORD_BACKFILL_SAFETY_CAP 內），
+// 都會停手斷線。血壓計（D40）跟 MD6 共用這一套機制（都是 s_current_kind ==
+// BLOOD_PRESSURE/MD6 才會觸發，見 process_reading_payload() 的說明），用
+// s_current_kind 決定要用哪一種格式解析，不是寫死 MD6。
+static void handle_record_backfill_notification(const uint8_t *value, uint16_t value_len) {
+    switch (s_record_backfill_state) {
+        case RECORD_BACKFILL_WAITING_COUNT: {
+            uint16_t count_guess = value_len >= 4 ? (uint16_t)(value[2] | (value[3] << 8)) : 0;
+            uint16_t capped = count_guess > RECORD_BACKFILL_SAFETY_CAP ? RECORD_BACKFILL_SAFETY_CAP : count_guess;
+            printf("[BLE] kind=%d record count=%u, backfilling index=1..%u...\n",
+                   s_current_kind, count_guess, capped == 0 ? 0 : (unsigned)(capped - 1));
+            if (capped <= 1) {
+                // 裝置說只有 1 筆（或查詢失敗回 0/1），index=0 剛剛已經拿過
+                // 了，沒有更多要補的。
+                s_record_backfill_state = RECORD_BACKFILL_IDLE;
+                gap_disconnect(s_connection_handle);
+                return;
+            }
+            s_record_backfill_target_count = capped;
+            s_record_backfill_next_index = 1;
+            s_record_backfill_consecutive_skips = 0;
+            s_record_backfill_state = RECORD_BACKFILL_WAITING_PART_A;
+            send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_A, s_record_backfill_next_index);
+            break;
+        }
+        case RECORD_BACKFILL_WAITING_PART_A: {
+            memcpy(s_record_backfill_record_part_a, &value[2], sizeof(s_record_backfill_record_part_a));
+            s_record_backfill_state = RECORD_BACKFILL_WAITING_PART_B;
+            send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_B, s_record_backfill_next_index);
+            break;
+        }
+        case RECORD_BACKFILL_WAITING_PART_B: {
+            uint8_t combined[8];
+            memcpy(&combined[0], s_record_backfill_record_part_a, sizeof(s_record_backfill_record_part_a));
+            memcpy(&combined[4], &value[2], 4);
+
+            // 翻到「上次同步到哪」那一筆了：這筆跟更舊的之前都同步過，直接
+            // 停手斷線，不用繼續往回翻、也不要把這筆重新存一次。
+            if (s_backfill_sync_anchor_valid && memcmp(combined, s_backfill_sync_anchor, 8) == 0) {
+                printf("[BLE] kind=%d index=%u matches last-synced anchor, stopping backfill "
+                       "(older records already synced).\n", s_current_kind, s_record_backfill_next_index);
+                s_record_backfill_state = RECORD_BACKFILL_IDLE;
+                gap_disconnect(s_connection_handle);
+                break;
+            }
+
+            vital_record_t records[FORA_MAX_READINGS_PER_NOTIFICATION];
+            size_t count = fora_protocol_parse_reading(s_current_kind, combined, sizeof(combined), records);
+            if (count > 0) {
+                commit_records(records, count);
+                s_record_backfill_consecutive_skips = 0;
+            } else {
+                printf("[BLE] kind=%d index=%u did not parse as a valid reading, skipping.\n",
+                       s_current_kind, s_record_backfill_next_index);
+                s_record_backfill_consecutive_skips++;
+            }
+            s_record_backfill_next_index++;
+            if (s_record_backfill_consecutive_skips >= 2 ||
+                s_record_backfill_next_index >= s_record_backfill_target_count) {
+                s_record_backfill_state = RECORD_BACKFILL_IDLE;
+                gap_disconnect(s_connection_handle);
+            } else {
+                s_record_backfill_state = RECORD_BACKFILL_WAITING_PART_A;
+                send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_A, s_record_backfill_next_index);
+            }
+            break;
+        }
+        default:
+            s_record_backfill_state = RECORD_BACKFILL_IDLE;
+            gap_disconnect(s_connection_handle);
+            break;
+    }
+}
+
+// 血氧計是夾著手指持續量測的裝置，量到的每一筆通知不能直接當成正式讀值
+// （見 OXIMETER_SETTLE_WINDOW_MS 宣告處的說明：居家照護慣例是等數值穩定
+// 再記錄，不是把量測過程中的每一次讀值都記下來）。這裡用「30 秒觀察視窗，
+// 視窗內只保留最新一筆候選、視窗到了才真的 commit」近似這個做法：
+//   - 收到讀值時，如果這是這一輪 session 的第一筆，記下 session 開始時間；
+//     不管是不是第一筆，都用這次的值覆蓋掉候選值（只留最新一筆）。
+//   - 如果距離 session 開始已經超過 OXIMETER_SETTLE_WINDOW_MS，代表視窗到了，
+//     把候選值真的 commit_records() 進待傳佇列，session 結束，冷卻時間設成
+//     OXIMETER_POST_SETTLE_COOLDOWN_MS（這次量測告一段落，不要馬上又開始
+//     下一輪 30 秒觀察）。
+//   - 視窗還沒到的話，只更新候選值、不 commit，冷卻時間設成
+//     OXIMETER_RESAMPLE_INTERVAL_MS，讓 Pico 很快再連一次抓下一筆候選。
+static void handle_oximeter_reading(const vital_record_t *records, size_t record_count) {
+    if (!s_oximeter_session_active) {
+        s_oximeter_session_active = true;
+        s_oximeter_session_start = get_absolute_time();
+        printf("[BLE] oximeter reading session started, observing up to %us before committing.\n",
+               (unsigned)(OXIMETER_SETTLE_WINDOW_MS / 1000));
+    }
+    memcpy(s_oximeter_latest_candidate, records, record_count * sizeof(vital_record_t));
+    s_oximeter_latest_candidate_count = record_count;
+
+    int64_t elapsed_ms = absolute_time_diff_us(s_oximeter_session_start, get_absolute_time()) / 1000;
+    if (elapsed_ms >= OXIMETER_SETTLE_WINDOW_MS) {
+        printf("[BLE] oximeter settle window elapsed (%lldms), committing latest reading.\n",
+               (long long)elapsed_ms);
+        commit_records(s_oximeter_latest_candidate, s_oximeter_latest_candidate_count);
+        s_oximeter_session_active = false;
+        s_kind_cooldown_until[FORA_DEVICE_OXIMETER] = make_timeout_time_ms(OXIMETER_POST_SETTLE_COOLDOWN_MS);
+    } else {
+        s_kind_cooldown_until[FORA_DEVICE_OXIMETER] = make_timeout_time_ms(OXIMETER_RESAMPLE_INTERVAL_MS);
+    }
+}
+
+// 三種裝置的 Notify payload 都送進這裡解析——共用同一份解析邏輯，但血氧計
+// 走觀察視窗（見 handle_oximeter_reading() 的說明），其他兩種裝置量到就直接
+// commit。不管走哪條路，處理完都主動斷線，回到掃描狀態等下一次連線。
 static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
     vital_record_t records[FORA_MAX_READINGS_PER_NOTIFICATION];
     size_t record_count = fora_protocol_parse_reading(s_current_kind, value, value_len, records);
@@ -209,26 +486,52 @@ static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
         return;
     }
 
-    uint64_t now_ms = to_ms_since_boot(get_absolute_time());
-    for (size_t i = 0; i < record_count; i++) {
-        records[i].received_at_ms = now_ms;
-        records[i].status = UPLOAD_STATUS_PENDING;
-        storage_append_record(&records[i]);
-        // 手動格式化浮點數，避免依賴 newlib-nano 預設未啟用的 printf float 支援；
-        // 用四捨五入到小數點後 1 位，不是無條件捨去。
-        int tenths = (int)(records[i].value * 10.0f + (records[i].value >= 0.0f ? 0.5f : -0.5f));
-        int whole = tenths / 10;
-        int frac = tenths % 10;
-        if (frac < 0) {
-            frac = -frac;
+    if (s_current_kind == FORA_DEVICE_OXIMETER) {
+        handle_oximeter_reading(records, record_count);
+    } else {
+        bool backfillable = (s_current_kind == FORA_DEVICE_MD6 || s_current_kind == FORA_DEVICE_BLOOD_PRESSURE);
+
+        // index=0（最新那筆）先跟「上次同步到哪」的定位點比對——原始 8 bytes
+        // 完全相同就代表這筆（以及更舊的）之前都同步過了，裝置端沒有新資料，
+        // 不用再存一次、也不用進 backfill 往回翻頁。這裡才是每次連線真正載入
+        // 定位點的地方，backfill 往回翻頁時用的是同一份，不會每翻一頁重讀。
+        if (backfillable) {
+            s_backfill_sync_anchor_valid =
+                storage_get_backfill_anchor((uint8_t)s_current_kind, s_backfill_sync_anchor);
         }
-        printf("[BLE] parsed reading: type=%d value=%d.%d\n", records[i].type, whole, frac);
+        bool already_synced = backfillable && s_backfill_sync_anchor_valid && value_len >= 8 &&
+            memcmp(value, s_backfill_sync_anchor, 8) == 0;
+
+        if (already_synced) {
+            printf("[BLE] kind=%d index=0 matches last-synced anchor, nothing new this connection.\n",
+                   s_current_kind);
+            s_kind_cooldown_until[s_current_kind] = make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[s_current_kind]);
+            gap_disconnect(s_connection_handle);
+            return;
+        }
+
+        commit_records(records, record_count);
+        s_kind_cooldown_until[s_current_kind] = make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[s_current_kind]);
+        if (backfillable && s_record_backfill_state == RECORD_BACKFILL_IDLE) {
+            // 這是新資料，把它記成新的「上次同步到哪」定位點——注意這裡存的是
+            // s_backfill_sync_anchor_valid/s_backfill_sync_anchor 載入時的舊值
+            // 已經不需要了，可以放心覆寫成新值；backfill 往回翻頁比對用的是
+            // 呼叫 storage_get_backfill_anchor() 當下複製出來的那份，不會受
+            // 這裡 storage_set_backfill_anchor() 寫回 flash 影響。
+            if (value_len >= 8) {
+                storage_set_backfill_anchor((uint8_t)s_current_kind, value);
+            }
+            // index=0 這筆已經正式存進待傳佇列了，先別斷線，繼續往回翻頁把
+            // 這次連線視窗內裝置回報的其他記錄也抓完，見 record_backfill_state_t
+            // 的說明。血壓計（D40）跟 MD6 共用同一套機制。
+            printf("[BLE] index=0 record committed, backfilling remaining records...\n");
+            s_record_backfill_state = RECORD_BACKFILL_WAITING_COUNT;
+            send_bp_get_record_count();
+            return;
+        }
     }
-    s_last_reading_at = get_absolute_time();
-    s_got_any_reading_this_session = true;
-    s_kind_cooldown_until[s_current_kind] = make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[s_current_kind]);
-    led_status_set(LED_HEARTBEAT);
-    // 已經拿到這次量測的數值，主動斷線，回到掃描狀態等下一次量測。
+    // 已經拿到這次連線的數值（不管是不是最終要採信的那一筆），主動斷線，
+    // 回到掃描狀態等下一次連線。
     gap_disconnect(s_connection_handle);
 }
 
@@ -364,14 +667,18 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                 // process_reading_payload() 之後 poll() 自然會因為讀值/時間戳
                 // 改變而刷新一次，那次才是使用者真正在意的內容。
                 printf("[BLE] value updates enabled (att_status=0x%02x)\n", att_status);
-                if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE) {
-                    // 血壓計走跟額溫槍/血氧計一樣的自訂 pipe，但要用「問記錄」
-                    // 的兩段式交換取值（見 fora_protocol.h 的協定說明），不是
-                    // 單一次觸發指令。這裡先送第一段，第二段在收到第一段回應
-                    // 後才送（見 GATT_EVENT_NOTIFICATION 那邊的處理）。
+                if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE || s_current_kind == FORA_DEVICE_MD6) {
+                    // 血壓計/MD6 走跟額溫槍/血氧計一樣的自訂 pipe，但要用「問
+                    // 記錄」的兩段式交換取值（見 fora_protocol.h 的協定說明），
+                    // 不是單一次觸發指令。這裡先送第一段，第二段在收到第一段
+                    // 回應後才送（見 GATT_EVENT_NOTIFICATION 那邊的處理）。
                     s_bp_waiting_for_part_b = false;
-                    printf("[BLE] requesting latest BP record (part A)...\n");
-                    send_bp_get_record_part(FORA_BP_CMD_GET_RECORD_PART_A);
+                    // 每次新連線都重置翻頁狀態機——上次連線如果翻頁翻到一半
+                    // 就被裝置斷線中斷，殘留的非 IDLE 值會讓這次連線的 index=0
+                    // 回應被誤判成翻頁回應，見 record_backfill_state_t 的說明。
+                    s_record_backfill_state = RECORD_BACKFILL_IDLE;
+                    printf("[BLE] requesting latest record (part A)...\n");
+                    send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_A, 0);
                 } else {
                     printf("[BLE] sending trigger command...\n");
                     send_trigger_command();
@@ -389,9 +696,15 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
             }
             printf("\n");
 
-            if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE) {
+            if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE || s_current_kind == FORA_DEVICE_MD6) {
                 if (value_len < 6 || value[0] != 0x51) {
-                    printf("[BLE] unexpected BP response, ignoring.\n");
+                    printf("[BLE] unexpected BP/MD6 response, ignoring.\n");
+                    break;
+                }
+                // 這個 if 分支本身已經限定 kind 是 BLOOD_PRESSURE 或 MD6（見
+                // 外層條件），兩者共用同一套翻頁機制，不用再檢查 kind。
+                if (s_record_backfill_state != RECORD_BACKFILL_IDLE) {
+                    handle_record_backfill_notification(value, value_len);
                     break;
                 }
                 if (!s_bp_waiting_for_part_b) {
@@ -400,9 +713,12 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                     memcpy(s_bp_record_part_a, &value[2], sizeof(s_bp_record_part_a));
                     s_bp_waiting_for_part_b = true;
                     printf("[BLE] got record part A, requesting part B...\n");
-                    send_bp_get_record_part(FORA_BP_CMD_GET_RECORD_PART_B);
+                    send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_B, 0);
                 } else {
-                    // 第二段回應：跟第一段接成 8 bytes，交給共用的解析/儲存邏輯。
+                    // 第二段回應：跟第一段接成 8 bytes，交給共用的解析/儲存
+                    // 邏輯——血壓計跟 MD6 現在都是正式流程，fora_protocol.c
+                    // 的 fora_protocol_parse_reading() 依 kind 各自解析成
+                    // 對應的 vital_record_t（見該檔案的說明）。
                     uint8_t combined[8];
                     memcpy(&combined[0], s_bp_record_part_a, sizeof(s_bp_record_part_a));
                     memcpy(&combined[4], &value[2], 4);
@@ -513,10 +829,13 @@ static void handle_hci_event(uint8_t packet_type, uint16_t channel, uint8_t *pac
         }
         s_connection_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
         printf("[BLE] connected, handle=0x%04x\n", s_connection_handle);
-        if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE) {
+        if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE || s_current_kind == FORA_DEVICE_MD6) {
             // 先配對，配對完成後才繼續探索/訂閱（見 proceed_after_pairing()）。
             // 額溫槍/血氧計不需要配對就能用同一套自訂 pipe，但血壓計這台實測
             // 需要先配對成功才能訂閱/寫入成功，繼續保留這個差異，沒有一起拿掉。
+            // MD6 跟血壓計共用同一套底層實作（見 fora_protocol.h 的說明），
+            // 還沒實機驗證過是否也需要配對，先假設需要——就算其實不需要，
+            // 多走一次配對流程通常也不會出錯，比連不上、猜錯風險低。
             s_ble_state = BLE_STATE_PAIRING;
             sm_request_pairing(s_connection_handle);
         } else if (s_handle_cache[s_current_kind].cached) {
@@ -620,7 +939,6 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
             return MODE_BLE_RECEIVE_EXIT_UPLOAD;
         }
 
-        // KEY2：顯示已上傳歷史摘要畫面，看幾秒後自動換回即時畫面。
         if (button_input_key2_pressed()) {
             vital_record_t history[KEY2_HISTORY_DISPLAY_ROWS];
             size_t shown = storage_get_recent_upload_history(history, KEY2_HISTORY_DISPLAY_ROWS);

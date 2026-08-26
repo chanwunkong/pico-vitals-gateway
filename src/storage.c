@@ -11,6 +11,16 @@
 #define CONFIG_FILENAME "config.bin"
 #define PENDING_FILENAME "pending.bin"
 #define HISTORY_FILENAME "history.bin"
+#define BACKFILL_ANCHOR_FILENAME "backfill_anchor.bin"
+
+// 血壓計/MD6 backfill 用的「上次同步到哪一筆」定位點，依裝置種類（fora_
+// device_kind_t，這裡當不透明的 uint8_t 用，理由跟 vital_record_t.source_kind
+// 一樣，見 common.h）分開存一份，每份是那個種類「最新一筆」記錄的原始 8
+// bytes（不是解析過的數值，也不是裝置時間戳——2026-08-26 使用者決定不能信任
+// 裝置時鐘，見 PROJECT_PLAN.md，改成直接比對原始 bytes 是不是同一筆）。
+// 8 是目前 fora_device_kind_t 實際種類數的好幾倍，抓寬一點餘裕，不會因為
+// 之後新增裝置種類就要改 flash 格式。
+#define MAX_BACKFILL_ANCHOR_KINDS 8
 
 #define MAX_PENDING_RECORDS 128
 
@@ -28,9 +38,12 @@ static vital_record_t s_upload_history[MAX_UPLOAD_HISTORY];
 static uint32_t s_upload_history_count = 0;
 static uint32_t s_upload_history_next = 0;
 
+static uint8_t s_backfill_anchor[MAX_BACKFILL_ANCHOR_KINDS][8];
+static bool s_backfill_anchor_valid[MAX_BACKFILL_ANCHOR_KINDS];
+
 // 畫面顯示用的「最後一筆讀值」，跟上面待傳佇列分開存——待傳佇列裡的紀錄
-// 上傳成功後就會被移除（見 storage_mark_uploaded()），但螢幕仍然需要能顯示
-// 「最後量到多少」，見 storage.h 裡 storage_get_last_reading() 的說明。
+// 上傳成功後就會被移除（見 storage_mark_uploaded_for_group()），但螢幕仍然
+// 需要能顯示「最後量到多少」，見 storage.h 裡 storage_get_last_reading() 的說明。
 static vital_record_t s_last_reading[VITAL_TYPE_COUNT];
 static bool s_last_reading_valid[VITAL_TYPE_COUNT];
 
@@ -69,12 +82,28 @@ static bool lfs_mount_or_format(void) {
     return true;
 }
 
+// 開機時按住 KEY2（見 button_input_key2_is_held()）觸發的「清空重來」：把
+// littlefs 分區整個重新格式化，待傳佇列/上傳歷史/設定全部歸零，跟真的拿到
+// 一台全新裝置一樣。**要在 storage_init() 之前呼叫**（main.c 負責），格式化
+// 完直接讓 storage_init() 照原本流程掛載一個乾淨的分區，不用另外處理掛載
+// 狀態。只清這個專案自己的 littlefs 分區，不會動到 BTstack 的 BLE 配對資料
+// （那是 flash 上另一塊獨立的區域，這個專案沒有工具能直接清，見
+// PROJECT_PLAN.md）。
+void storage_factory_reset(void) {
+    printf("[STORAGE] factory reset requested (KEY2 held at boot), formatting flash partition...\n");
+    int fmt_err = lfs_format(&s_lfs, &lfs_pico_cfg);
+    if (fmt_err != 0) {
+        printf("[STORAGE] storage_factory_reset: lfs_format() failed (err=%d)\n", fmt_err);
+    }
+}
+
 void storage_init(void) {
     s_record_count = 0;
     s_upload_history_count = 0;
     s_upload_history_next = 0;
     memset(s_last_reading_valid, 0, sizeof(s_last_reading_valid));
     s_last_upload_valid = false;
+    memset(s_backfill_anchor_valid, 0, sizeof(s_backfill_anchor_valid));
 
     s_lfs_mounted = lfs_mount_or_format();
     if (!s_lfs_mounted) {
@@ -118,6 +147,18 @@ void storage_init(void) {
                 printf("[STORAGE] history.bin truncated/corrupt (read %ld bytes), discarding.\n",
                        (long)data_read);
             }
+        }
+        lfs_file_close(&s_lfs, &file);
+    }
+
+    if (lfs_file_open(&s_lfs, &file, BACKFILL_ANCHOR_FILENAME, LFS_O_RDONLY) == 0) {
+        lfs_ssize_t valid_read = lfs_file_read(&s_lfs, &file, s_backfill_anchor_valid,
+                                                sizeof(s_backfill_anchor_valid));
+        lfs_ssize_t anchor_read = lfs_file_read(&s_lfs, &file, s_backfill_anchor, sizeof(s_backfill_anchor));
+        if (valid_read != (lfs_ssize_t)sizeof(s_backfill_anchor_valid) ||
+            anchor_read != (lfs_ssize_t)sizeof(s_backfill_anchor)) {
+            printf("[STORAGE] backfill_anchor.bin truncated/corrupt, discarding.\n");
+            memset(s_backfill_anchor_valid, 0, sizeof(s_backfill_anchor_valid));
         }
         lfs_file_close(&s_lfs, &file);
     }
@@ -184,6 +225,38 @@ static void persist_upload_history(void) {
     lfs_file_close(&s_lfs, &file);
 }
 
+static void persist_backfill_anchor(void) {
+    if (!s_lfs_mounted) {
+        return;
+    }
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, BACKFILL_ANCHOR_FILENAME,
+                       LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) != 0) {
+        printf("[STORAGE] persist_backfill_anchor: lfs_file_open failed\n");
+        return;
+    }
+    lfs_file_write(&s_lfs, &file, s_backfill_anchor_valid, sizeof(s_backfill_anchor_valid));
+    lfs_file_write(&s_lfs, &file, s_backfill_anchor, sizeof(s_backfill_anchor));
+    lfs_file_close(&s_lfs, &file);
+}
+
+bool storage_get_backfill_anchor(uint8_t source_kind, uint8_t out_anchor[8]) {
+    if (source_kind >= MAX_BACKFILL_ANCHOR_KINDS || !s_backfill_anchor_valid[source_kind]) {
+        return false;
+    }
+    memcpy(out_anchor, s_backfill_anchor[source_kind], 8);
+    return true;
+}
+
+void storage_set_backfill_anchor(uint8_t source_kind, const uint8_t anchor[8]) {
+    if (source_kind >= MAX_BACKFILL_ANCHOR_KINDS) {
+        return;
+    }
+    memcpy(s_backfill_anchor[source_kind], anchor, 8);
+    s_backfill_anchor_valid[source_kind] = true;
+    persist_backfill_anchor();
+}
+
 // 上傳成功的紀錄加進環狀歷史緩衝，跟待傳佇列（只保留還沒傳完的）是分開的兩份資料。
 static void append_to_upload_history(const vital_record_t *record) {
     s_upload_history[s_upload_history_next] = *record;
@@ -213,6 +286,14 @@ bool storage_append_record(const vital_record_t *record) {
         }
     }
 
+    // 2026-08-26：原本這裡還有一段拿 device_measured_key（裝置時間戳）比對
+    // 已上傳歷史來抓重複的邏輯，後來拿掉了——裝置時鐘不可信任（見
+    // PROJECT_PLAN.md），拿它當比對依據反而有風險：如果裝置時鐘壞掉、對不同
+    // 的真實記錄算出同一個時間戳，這裡會誤判成「已經上傳過」而悄悄丟掉真正
+    // 沒上傳過的新資料，比重複上傳更糟。血壓計/MD6 backfill 重複抓到舊記錄
+    // 的問題改在 mode_ble_receive.c 用「上次同步到的那一筆原始 8 bytes」擋
+    // 在源頭（backfill 一比對到就直接停手，不會走到這裡），不需要這裡再處理。
+
     // 不論待傳佇列那邊結果如何，畫面顯示用的「最後一筆讀值」一律先更新——就算
     // 判定是重複量測，時間戳照樣往前推進，這樣畫面上才看得出「裝置剛剛還有
     // 確認過這個數值仍然是最新的」，不是凍結在很久以前的舊時間。
@@ -234,15 +315,28 @@ bool storage_append_record(const vital_record_t *record) {
     // 連上好幾次）。source_kind 也要比對——VITAL_TYPE_PULSE_RATE 同時由血壓計
     // 跟血氧計回報，只比對 type 的話兩種裝置的待傳脈搏紀錄會互相蓋掉，其中一筆
     // 永遠不會被上傳（判重邏輯在上面已經有比對 source_kind，這裡要保持一致）。
+    //
+    // 雙方都有裝置時間戳時（目前是血壓計/MD6），還要比對 device_measured_key
+    // 是不是同一筆才能蓋掉——2026-08-26 加上 MD6 往回翻頁抓歷史記錄後才發現
+    // 這裡原本會出事：一次連線內會抓到同一個 type 好幾筆「不同時間點」的記錄
+    // （例如好幾次測試各自的血糖值），照舊邏輯「同類型就蓋掉」的話，翻到比較
+    // 舊的那筆時會反而蓋掉剛剛才抓到的最新讀值，整批資料變成只剩最舊那筆能
+    // 上傳，見 PROJECT_PLAN.md 第 6.5 節的說明。額溫槍/血氧計沒有裝置時間戳
+    // （device_measured_key 恆為 0），維持舊行為：同類型/來源只保留最新一筆。
     for (size_t i = 0; i < s_record_count; i++) {
-        if (s_records[i].type == record->type && s_records[i].source_kind == record->source_kind &&
-            (s_records[i].status == UPLOAD_STATUS_PENDING || s_records[i].status == UPLOAD_STATUS_FAILED)) {
-            printf("[STORAGE] replacing pending record: type=%d source_kind=%d old_value=%d new_value=%d\n",
-                   record->type, record->source_kind, (int)s_records[i].value, (int)record->value);
-            s_records[i] = *record;
-            persist_pending_records();
-            return true;
+        if (s_records[i].type != record->type || s_records[i].source_kind != record->source_kind ||
+            (s_records[i].status != UPLOAD_STATUS_PENDING && s_records[i].status != UPLOAD_STATUS_FAILED)) {
+            continue;
         }
+        bool both_have_keys = record->device_measured_key != 0 && s_records[i].device_measured_key != 0;
+        if (both_have_keys && record->device_measured_key != s_records[i].device_measured_key) {
+            continue; // 不是同一筆測量（不同時間點），留著，繼續找真的同一筆
+        }
+        printf("[STORAGE] replacing pending record: type=%d source_kind=%d old_value=%d new_value=%d\n",
+               record->type, record->source_kind, (int)s_records[i].value, (int)record->value);
+        s_records[i] = *record;
+        persist_pending_records();
+        return true;
     }
 
     if (s_record_count >= MAX_PENDING_RECORDS) {
@@ -267,24 +361,22 @@ size_t storage_pending_records(vital_record_t *out, size_t max_count) {
     return n;
 }
 
-void storage_mark_uploaded(size_t count, uint64_t uploaded_at_ms, bool success) {
-    if (success && count > 0) {
+void storage_mark_uploaded_for_group(
+    uint8_t source_kind, uint32_t device_measured_key, uint64_t uploaded_at_ms, bool success) {
+    if (success) {
         s_last_upload_at_ms = uploaded_at_ms;
         s_last_upload_valid = true;
     }
 
-    size_t marked = 0;
     bool history_changed = false;
-    for (size_t i = 0; i < s_record_count && marked < count; i++) {
-        // 篩選條件要跟 storage_pending_records() 一致，否則重試批次裡原本是
-        // FAILED 的紀錄不會被這裡比對到，結果標記到陣列裡其他不相關的紀錄上。
+    for (size_t i = 0; i < s_record_count; i++) {
+        if (s_records[i].source_kind != source_kind || s_records[i].device_measured_key != device_measured_key) {
+            continue; // 不是這一組（裝置種類＋時間點）的紀錄，這一輪不處理，留給別組。
+        }
         if (s_records[i].status == UPLOAD_STATUS_PENDING || s_records[i].status == UPLOAD_STATUS_FAILED) {
             s_records[i].status = success ? UPLOAD_STATUS_UPLOADED : UPLOAD_STATUS_FAILED;
             s_records[i].uploaded_at_ms = uploaded_at_ms;
-            marked++;
             if (success) {
-                // 上傳成功才留底——失敗的紀錄還留在待傳佇列裡準備重試，不算
-                // 「已經處理完的歷史」，見 append_to_upload_history() 的說明。
                 append_to_upload_history(&s_records[i]);
                 history_changed = true;
             }
@@ -294,7 +386,8 @@ void storage_mark_uploaded(size_t count, uint64_t uploaded_at_ms, bool success) 
         persist_upload_history();
     }
 
-    // 壓縮陣列：移除已成功上傳的紀錄，保留 PENDING/FAILED 供下次重試。
+    // 壓縮陣列：移除這一組裡已成功上傳的紀錄，其他裝置種類（可能還沒被
+    // 處理到）的紀錄原封不動保留。
     size_t write_idx = 0;
     for (size_t i = 0; i < s_record_count; i++) {
         if (s_records[i].status != UPLOAD_STATUS_UPLOADED) {

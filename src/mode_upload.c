@@ -18,9 +18,6 @@
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 #define MAX_BATCH_SIZE 32
 
-// DEVICE_CLOCK_SANITY_WINDOW_MS 定義在 wall_clock.h，跟 display_status.c 共用
-// 同一個門檻，見該處說明。
-
 // 認證模式不寫死——分享器種類很多，依常見程度排序嘗試，直到成功或全部試完。
 static const uint32_t WIFI_AUTH_MODES_TO_TRY[] = {
     CYW43_AUTH_WPA2_AES_PSK,
@@ -121,48 +118,74 @@ void mode_upload_run(void) {
     if (count == 0) {
         display_status_show_upload(config.wifi_ssid, "Connected, nothing to send");
     } else {
-        // 量測時 Pico 還沒連網路，received_at_ms 存的是 boot-relative 的 ms，
-        // 沒有意義給人看，換算成真實世界時間再送出去（校時失敗就照舊傳
-        // boot-relative 值，不影響上傳本身，只是這批資料的時間看起來還是不準）。
-        for (size_t i = 0; i < count; i++) {
-            bool used_device_clock = false;
-            if (batch[i].device_measured_key != 0) {
-                // 裝置本身有認證過的量測時間戳（目前只有血壓計，見
-                // fora_protocol.h 的說明），比「Pico 收到 BLE 通知的時間」更
-                // 準確——裝置量完到被 Pico 連上讀到資料之間可能有延遲，甚至
-                // 不需要靠 NTP 校時（這個時間戳跟 wall_clock 完全無關）。但
-                // 裝置自己的時鐘不保證校時過（電池換過、從沒設定過、韌體
-                // 預設值都可能差好幾年），跟 Pico 已校時過的現在時間比對一下
-                // 合理性，差距太大就不信任，退回用 Pico 收到時間。
-                uint64_t device_epoch_ms = fora_protocol_measured_key_to_epoch_ms(batch[i].device_measured_key);
-                if (wall_clock_is_synced()) {
-                    if (wall_clock_epoch_is_plausible(device_epoch_ms, DEVICE_CLOCK_SANITY_WINDOW_MS)) {
-                        batch[i].received_at_ms = device_epoch_ms;
-                        used_device_clock = true;
-                    } else {
-                        printf("[UPLOAD] device clock for record %u looks wrong, "
-                               "falling back to Pico's receive time.\n", (unsigned)i);
+        // 後端一次上傳是一筆彙整過的紀錄，一個時間點只能有一個值、dataSource
+        // 也只能標示一種醫材來源（見 upload_api.c 開頭的說明），待傳批次要先
+        // 依裝置種類（source_kind）分組，同一個裝置種類裡再依
+        // device_measured_key（裝置回報的量測時間戳）細分——額溫槍/血氧計沒有
+        // 裝置時間戳（恆為 0），細分後全部落在同一組，行為跟以前一樣；血壓計/
+        // MD6 一次連線可能抓到好幾個不同時間點的記錄（例如 MD6 往回翻頁抓到
+        // 好幾次測試各自的血糖值），細分後才會各自送一次上傳請求，不會像
+        // 以前那樣同一個 type 好幾筆值被硬塞進同一個 JSON、只有最後一筆送得
+        // 出去（見 PROJECT_PLAN.md 第 6.5 節的說明）。
+        // uploadTime 是「上傳當下」的真實世界時間，不是個別讀值的量測時間——
+        // 校時失敗的話 wall_clock_is_synced() 是 false，upload_api_post_batch()
+        // 會整個省略 uploadTime 欄位，不會謊報一個假的時間戳。
+        uint64_t upload_time_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
+        bool synced = wall_clock_is_synced();
+
+        size_t groups_sent = 0;
+        size_t groups_succeeded = 0;
+        for (int kind = 0; kind < FORA_DEVICE_KIND_COUNT; kind++) {
+            // 先找出這個裝置種類這一輪待傳批次裡出現過哪些不同的
+            // device_measured_key。
+            uint32_t seen_keys[MAX_BATCH_SIZE];
+            size_t seen_key_count = 0;
+            for (size_t i = 0; i < count; i++) {
+                if (batch[i].source_kind != (uint8_t)kind) {
+                    continue;
+                }
+                uint32_t key = batch[i].device_measured_key;
+                bool already_seen = false;
+                for (size_t j = 0; j < seen_key_count; j++) {
+                    if (seen_keys[j] == key) {
+                        already_seen = true;
+                        break;
                     }
-                } else {
-                    // Pico 自己都還沒校時過，沒有基準可以比對合理性，這種
-                    // 情況下裝置時間戳是唯一可用的真實時間來源，照樣採用。
-                    batch[i].received_at_ms = device_epoch_ms;
-                    used_device_clock = true;
+                }
+                if (!already_seen) {
+                    seen_keys[seen_key_count++] = key;
                 }
             }
-            if (!used_device_clock) {
-                batch[i].received_at_ms = wall_clock_to_epoch_ms(batch[i].received_at_ms);
+
+            for (size_t sk = 0; sk < seen_key_count; sk++) {
+                vital_record_t group[MAX_BATCH_SIZE];
+                size_t group_count = 0;
+                for (size_t i = 0; i < count; i++) {
+                    if (batch[i].source_kind == (uint8_t)kind && batch[i].device_measured_key == seen_keys[sk]) {
+                        group[group_count++] = batch[i];
+                    }
+                }
+                groups_sent++;
+                bool ok = upload_api_post_batch(config.patient_id, config.upload_server_host,
+                                                 config.upload_api_key, group, group_count,
+                                                 upload_time_ms, synced, (uint8_t)kind);
+                printf("[UPLOAD] upload_api_post_batch() kind=%d measured_key=%u (%u record(s)) -> %s\n",
+                       kind, (unsigned)seen_keys[sk], (unsigned)group_count, ok ? "success" : "failed");
+                // 依（裝置種類＋時間點）分開標記結果——storage_mark_uploaded_for_group()
+                // 只會動到這一組的紀錄，其他還沒處理到的組別不受影響，見該函式的說明。
+                storage_mark_uploaded_for_group(
+                    (uint8_t)kind, seen_keys[sk], to_ms_since_boot(get_absolute_time()), ok);
+                if (ok) {
+                    groups_succeeded++;
+                }
             }
         }
 
-        bool success = upload_api_post_batch(config.patient_id, config.upload_server_host,
-                                              config.upload_api_key, batch, count);
-        printf("[UPLOAD] upload_api_post_batch() -> %s\n", success ? "success" : "failed");
-        storage_mark_uploaded(count, to_ms_since_boot(get_absolute_time()), success);
-
+        // "group(s)" 不是「裝置種類數」——同一種裝置種類現在可能因為有好幾個
+        // 不同時間點的記錄而拆成好幾組各自上傳，見上面的說明。
         char result_text[32];
-        snprintf(result_text, sizeof(result_text), "%s (%u record%s)",
-                 success ? "Success" : "Failed, will retry", (unsigned)count, count == 1 ? "" : "s");
+        snprintf(result_text, sizeof(result_text), "%u/%u group(s) OK",
+                 (unsigned)groups_succeeded, (unsigned)groups_sent);
         display_status_show_upload(config.wifi_ssid, result_text);
     }
 

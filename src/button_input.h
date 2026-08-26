@@ -23,4 +23,9 @@ bool button_input_key1_pressed(void);
 // KEY2 邊緣觸發，用法同 button_input_key1_pressed()。
 bool button_input_key2_pressed(void);
 
+// KEY2 這一刻是不是正被按住——跟上面的邊緣觸發版本是分開的即時讀值，開機時
+// main.c 檢查一次用（「開機時按住 KEY2」＝清除 flash 裡的待傳佇列/設定，見
+// storage_factory_reset() 的說明），不會互相干擾彼此的內部狀態。
+bool button_input_key2_is_held(void);
+
 #endif // BUTTON_INPUT_H

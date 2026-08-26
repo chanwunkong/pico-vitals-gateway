@@ -44,6 +44,15 @@ typedef enum {
     VITAL_TYPE_SYSTOLIC,
     VITAL_TYPE_DIASTOLIC,
     VITAL_TYPE_GLUCOSE,
+    // FORA MD6 六合一測試儀新增的 5 項（血糖沿用上面既有的 VITAL_TYPE_GLUCOSE，
+    // 不重複定義），2026-08-26 實機確認過血糖不用縮放，這 5 項先套用同樣的
+    // 「raw value 直接當數值、不縮放」假設，還沒逐項實機驗證，見
+    // PROJECT_PLAN.md 第 6.5 節的說明。
+    VITAL_TYPE_HCT,     // 血球比容/紅血球容積比，單位 %
+    VITAL_TYPE_KETONE,  // 酮體，單位 mmol/L
+    VITAL_TYPE_UA,      // 尿酸，單位 mg/dL
+    VITAL_TYPE_CHOL,    // 總膽固醇，單位 mg/dL
+    VITAL_TYPE_HB,      // 血紅素，單位 g/dL
     VITAL_TYPE_COUNT, // 型別數量，不是實際的量測類型，只用來宣告陣列大小
 } vital_type_t;
 
@@ -73,6 +82,17 @@ typedef struct {
     // storage_append_record() 判重時要求 source_kind 也要相同才算重複，見
     // 該函式的說明。
     uint8_t source_kind;
+    // 血糖/MD6 記錄的量測情境（一般/飯前/飯後，見 fora_protocol.h 的
+    // fora_measurement_mode_t），不透明的 uint8_t，理由跟 source_kind 一樣。
+    // 品管測試（QC）**只在血糖項目**會在 fora_protocol.c 解析階段被過濾掉、
+    // 不會變成一筆記錄（2026-08-26 實機比對裝置螢幕確認：MD6 血糖以外的 5
+    // 項，context bits 的 QC 值不代表真的做了品管測試，見 fora_protocol.c
+    // MD6 分支的說明）——所以只有血糖類型的記錄保證不會出現代表 QC 的值，
+    // 其餘 5 項理論上可能出現原始 bit pattern 剛好等於 QC 的情況，這個欄位
+    // 對那 5 項的實際意義還不確定，先原樣保留、不特別處理。沒有這個概念的
+    // 裝置（額溫槍/血氧計/血壓收縮壓等）固定是 0，純粹欄位預設值，不代表
+    // 「一般」有意義。
+    uint8_t measurement_mode;
 } vital_record_t;
 
 #endif // COMMON_H

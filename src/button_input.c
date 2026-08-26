@@ -62,3 +62,7 @@ bool button_input_key2_pressed(void) {
     s_key2_was_pressed = pressed;
     return edge;
 }
+
+bool button_input_key2_is_held(void) {
+    return key_is_pressed(KEY2_PIN);
+}
