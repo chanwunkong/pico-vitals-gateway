@@ -21,6 +21,7 @@ add_executable(pico_gateway
     src/mode_ap_config.c
     src/mode_ble_receive.c
     src/fora_protocol.c
+    src/rightest_protocol.c
     src/mode_upload.c
     src/upload_api.c
     src/led_status.c

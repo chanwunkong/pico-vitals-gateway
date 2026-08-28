@@ -5,6 +5,7 @@
 #include "display_status.h"
 #include "fora_protocol.h"
 #include "led_status.h"
+#include "rightest_protocol.h"
 #include "storage.h"
 #include "wall_clock.h"
 
@@ -37,6 +38,14 @@ typedef enum {
     BLE_STATE_ENABLE_NOTIFY,
     BLE_STATE_LISTENING,
     BLE_STATE_PAIRING,
+    // Rightest GM700SB 專用：PCL 開通/查型號/查記錄總數/逐筆讀記錄/PCL 關閉
+    // 這一整段流程共用這一個狀態，實際進度靠 s_rightest_session_state 分辨
+    // （見該 enum 的說明），不是每個步驟都各自開一個 ble_receive_state_t——
+    // GM700SB 的通訊模型（三個各自獨立的 characteristic：控制/通知/寫入）
+    // 跟 FORA 系列（單一 characteristic 兼 write+notify）差太多，硬塞進既有
+    // 的 DISCOVER_SERVICE/DISCOVER_CHARACTERISTIC/ENABLE_NOTIFY 狀態會讓那些
+    // 狀態的意義變得模糊，所以另外開一個。
+    BLE_STATE_RIGHTEST_SESSION,
 } ble_receive_state_t;
 
 static btstack_packet_callback_registration_t s_hci_event_callback_registration;
@@ -81,6 +90,10 @@ static const uint32_t DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_KIND_COUNT] = {
     // 同一次測試 session 其餘項目也抓完（見下面 record_backfill_state_t 的
     // 說明），冷卻時間跟這段翻頁無關。
     [FORA_DEVICE_MD6] = 10 * 1000,
+    // GM700SB 沒有官方休眠門檻可以參考（不是 FORA 裝置，見 fora_protocol.h
+    // FORA_DEVICE_RIGHTEST_GM700SB 的說明），比照 MD6 抓一個短一點的猜測值，
+    // 方便使用者連續測試/確認結果，2026-08-28 還沒實機驗證過是否合適。
+    [FORA_DEVICE_RIGHTEST_GM700SB] = 10 * 1000,
 };
 static absolute_time_t s_kind_cooldown_until[FORA_DEVICE_KIND_COUNT];
 
@@ -183,6 +196,62 @@ static uint8_t s_record_backfill_record_part_a[4];
 static uint8_t s_backfill_sync_anchor[8];
 static bool s_backfill_sync_anchor_valid = false;
 
+// --- Rightest GM700SB 專用狀態（見 BLE_STATE_RIGHTEST_SESSION 的說明）---
+//
+// GM700SB 用 3 個各自獨立的 characteristic（FEE1 控制/FEE2 通知/FEE3
+// 寫入），跟 FORA 系列共用 s_fora_service/s_fora_characteristic 的單一
+// characteristic 模型不通用，另外開一組。**目前每次連線都重新做完整的
+// service/characteristic 探索，沒有比照 s_handle_cache 做 handle 快取**——
+// GM700SB 不像 FORA 那樣量測完就急著斷線，量測資料量測完仍會持續廣播一段
+// 時間，多花一輪探索的時間成本可以接受，先求正確、不做這個最佳化，見
+// PROJECT_PLAN.md。
+static gatt_client_service_t s_rightest_service;
+static gatt_client_characteristic_t s_rightest_char_pcl;    // FEE1
+static gatt_client_characteristic_t s_rightest_char_notify; // FEE2
+static gatt_client_characteristic_t s_rightest_char_write;  // FEE3
+static bool s_rightest_char_pcl_found;
+static bool s_rightest_char_notify_found;
+static bool s_rightest_char_write_found;
+static gatt_client_notification_t s_rightest_notification_listener;
+static rightest_reassembly_t s_rightest_reassembly;
+
+// 寫入用的靜態緩衝區——BTstack 的 gatt_client_write_value_of_characteristic()
+// 需要 value 指標在呼叫當下有效，用區域變數（函式一返回就消失）不保險，
+// 比照 fora_protocol.c 的 FORA_TRIGGER_COMMAND 用持久性的緩衝區，見
+// send_rightest_pcl_mode()/send_rightest_command() 的說明。
+static uint8_t s_rightest_pcl_value;
+static uint8_t s_rightest_command_buffer[8]; // 目前最長的指令（讀記錄）是 5 bytes，8 留餘裕
+
+// GM700SB 這一整段流程（開 PCL -> 等自動推播的 meter ID -> 查記錄總數/書籤
+// -> 逐筆讀記錄 -> 關 PCL，型號查詢已拿掉，見下面 enum 的說明）都在
+// BLE_STATE_RIGHTEST_SESSION
+// 這一個 ble_receive_state_t 底下跑，靠這個子狀態機分辨目前進度、指揮下一步
+// 要送什麼指令。狀態轉換完全由收到的 FEE2 Notify（重組完成後）推進，寫入
+// FEE1/FEE3 的 ATT 回應（GATT_EVENT_QUERY_COMPLETE）刻意不處理、當作 no-op
+// （見 handle_gatt_client_event() 裡 BLE_STATE_RIGHTEST_SESSION 的分支）——
+// 寫入完成不代表裝置已經處理完、真正的下一步要等對應的 Notify 回來才知道。
+typedef enum {
+    RIGHTEST_SESSION_IDLE = 0,
+    // 2026-08-28 實機測試：ATT 協定同一條連線一次只能有一個進行中的請求。
+    // 訂閱完 Notify 先只等 meter-ID 自動推播（不主動送任何指令），推播到了
+    // 才送 PCL 開啟，**PCL 開啟自己的 ATT 回應**（GATT_EVENT_QUERY_COMPLETE，
+    // 不是等 Notify）到了才送型號查詢，見 RIGHTEST_SESSION_PCL_ON_PENDING。
+    // 這裡故意只加這一個新狀態、範圍盡量小——加更多狀態、動到
+    // finish_rightest_session() 的那個版本燒錄後整台裝置完全沒有任何序列埠
+    // 輸出（疑似撞到 BTstack 內部斷言當機），已經還原，這次改用更保守的
+    // 做法，見 PROJECT_PLAN.md 第 6.6 節。
+    RIGHTEST_SESSION_WAIT_METER_ID,   // 剛訂閱完 Notify，等裝置自動推播一次 meter ID（內容忽略）
+    RIGHTEST_SESSION_PCL_ON_PENDING,  // 已送 PCL 開啟指令，等它自己的 ATT 回應（不是等 Notify）；
+                                       // 這段期間如果意外收到 Notify，直接忽略，不觸發任何寫入
+                                       // （見 handle_rightest_notification() 的 case，不落入 default）
+    RIGHTEST_SESSION_WAIT_SUMMARY,    // 已送 TYPE 1 查詢（index=0），等總筆數/書籤
+    RIGHTEST_SESSION_WAIT_RECORD,     // 已送 TYPE 2 查詢，等這一筆記錄內容
+} rightest_session_state_t;
+static rightest_session_state_t s_rightest_session_state = RIGHTEST_SESSION_IDLE;
+static rightest_record_summary_t s_rightest_summary;
+static uint16_t s_rightest_next_index;
+static uint16_t s_rightest_target_count; // 這次連線打算讀到第幾個 index（含）
+
 static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
 // 畫面顯示用的個案設定，開機/每次進入這個模式時讀一次 flash 就好（讀取本身
@@ -264,6 +333,76 @@ static void enable_value_updates(void) {
     gatt_client_write_client_characteristic_configuration(
         handle_gatt_client_event, s_connection_handle, &s_fora_characteristic,
         GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
+}
+
+// Rightest GM700SB 專用：走 Service 0xFEE0，跟 FORA 系列的 128-bit UUID
+// 自訂 pipe 完全不同，見 rightest_protocol.h 開頭的說明。
+static void discover_rightest_service(void) {
+    s_ble_state = BLE_STATE_DISCOVER_SERVICE;
+    s_discovery_found = false;
+    gatt_client_discover_primary_services_by_uuid16(
+        handle_gatt_client_event, s_connection_handle, RIGHTEST_SERVICE_UUID16);
+}
+
+// 一次探索整個 service 底下全部的 characteristic（不像 FORA 用 UUID 指定
+// 只找一個），逐一比對 uuid16 收集 FEE1/FEE2/FEE3 三個控制/通知/寫入
+// characteristic，見 GATT_EVENT_CHARACTERISTIC_QUERY_RESULT 的處理。
+static void discover_rightest_characteristics(void) {
+    s_ble_state = BLE_STATE_DISCOVER_CHARACTERISTIC;
+    s_discovery_found = false;
+    s_rightest_char_pcl_found = false;
+    s_rightest_char_notify_found = false;
+    s_rightest_char_write_found = false;
+    gatt_client_discover_characteristics_for_service(
+        handle_gatt_client_event, s_connection_handle, &s_rightest_service);
+}
+
+static void enable_rightest_notify(void) {
+    s_ble_state = BLE_STATE_ENABLE_NOTIFY;
+    gatt_client_listen_for_characteristic_value_updates(
+        &s_rightest_notification_listener, handle_gatt_client_event, s_connection_handle,
+        &s_rightest_char_notify);
+    gatt_client_write_client_characteristic_configuration(
+        handle_gatt_client_event, s_connection_handle, &s_rightest_char_notify,
+        GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
+}
+
+// 寫 FEE1（PCL Mode 開關），mode 是 RIGHTEST_PCL_MODE_ON/OFF。這個
+// characteristic 同時列出 Write/Write Without Response 兩種屬性（2026-08-28
+// LightBlue 實機確認），但為了跟下面 send_rightest_command() 一致（FEE3
+// 只有 Write，沒有 Write Without Response，必須用等 ATT 回應的寫入方式），
+// 這裡也統一用等回應的版本，簡化程式碼、不用分兩套。回應本身（
+// GATT_EVENT_QUERY_COMPLETE）刻意不處理，見 s_rightest_session_state 宣告處
+// 的說明。
+static void send_rightest_pcl_mode(uint8_t mode) {
+    s_rightest_pcl_value = mode;
+    gatt_client_write_value_of_characteristic(
+        handle_gatt_client_event, s_connection_handle,
+        s_rightest_char_pcl.value_handle, 1, &s_rightest_pcl_value);
+}
+
+// 組好一筆指令（見 rightest_protocol_build_command()）寫進 FEE3。**FEE3 只
+// 支援 Write（沒有 Write Without Response，2026-08-28 LightBlue 實機確認），
+// 一定要用這個等 ATT 回應的版本**，不能像 FORA 那樣用
+// gatt_client_write_value_of_characteristic_without_response()。
+static void send_rightest_command(uint8_t cmd, const uint8_t *data, uint8_t data_len) {
+    size_t len = rightest_protocol_build_command(cmd, data, data_len, s_rightest_command_buffer);
+    // 2026-08-28 除錯用：印出實際要寫進 FEE3 的原始 bytes、value_handle，
+    // 跟 gatt_client_write_value_of_characteristic() 呼叫本身的回傳碼（不是
+    // ATT 層的回應，是 BTstack 這一層「有沒有成功排進佇列」的回傳值）——
+    // 型號查詢完全收不到回應，需要先確認寫入這一步本身有沒有問題。
+    printf("[BLE] rightest: writing to FEE3 (handle=0x%04x, %u bytes):", s_rightest_char_write.value_handle,
+           (unsigned)len);
+    for (size_t i = 0; i < len; i++) {
+        printf(" %02x", s_rightest_command_buffer[i]);
+    }
+    printf("\n");
+    uint8_t rc = gatt_client_write_value_of_characteristic(
+        handle_gatt_client_event, s_connection_handle,
+        s_rightest_char_write.value_handle, (uint16_t)len, s_rightest_command_buffer);
+    if (rc != ERROR_CODE_SUCCESS) {
+        printf("[BLE] rightest: gatt_client_write_value_of_characteristic() rejected the write, rc=0x%02x\n", rc);
+    }
 }
 
 // 訂閱成功後，裝置不會自動推播，要主動寫入觸發指令才會回傳目前量到的數值
@@ -361,6 +500,118 @@ static void commit_records(const vital_record_t *records, size_t record_count) {
     s_last_reading_at = get_absolute_time();
     s_got_any_reading_this_session = true;
     led_status_set(LED_HEARTBEAT);
+}
+
+// 結束這次 GM700SB 連線（不管是正常讀完、身份核對失敗、還是解析出錯）：
+// 一律先嘗試關閉 PCL 模式再斷線，避免裝置停留在鎖定畫面（見
+// rightest_protocol.h FEE1 的說明）。**這裡送出關閉指令後沒有等待它真的
+// 送出就馬上呼叫 gap_disconnect()，這個時序假設 2026-08-28 還沒有實機驗證
+// 過**——如果之後發現裝置常常沒有真的收到這個關閉指令、卡在 PCL 畫面，
+// 這裡要改成等 GATT_EVENT_QUERY_COMPLETE 確認寫入完成後才斷線。
+static void finish_rightest_session(void) {
+    s_rightest_session_state = RIGHTEST_SESSION_IDLE;
+    s_kind_cooldown_until[FORA_DEVICE_RIGHTEST_GM700SB] =
+        make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_RIGHTEST_GM700SB]);
+    printf("[BLE] rightest: closing PCL mode and disconnecting...\n");
+    send_rightest_pcl_mode(RIGHTEST_PCL_MODE_OFF);
+    gap_disconnect(s_connection_handle);
+}
+
+// GM700SB 的 FEE2 Notify 都送進這裡：先餵進重組緩衝區（見
+// rightest_reassembly_feed() 的說明），沒收完整就先返回等下一包；收完整
+// 之後依 s_rightest_session_state 目前進度決定這筆內容代表什麼、下一步要
+// 送什麼指令。整段流程（開 PCL -> 核對型號 -> 查總數/書籤 -> 逐筆讀記錄 ->
+// 關 PCL）見 rightest_session_state_t 宣告處的說明。
+static void handle_rightest_notification(const uint8_t *value, uint16_t value_len) {
+    if (s_rightest_session_state == RIGHTEST_SESSION_WAIT_METER_ID) {
+        // 2026-08-28 實機確認：這則自動推播的原始 bytes（例如 16 bytes 的
+        // 裝置序號字串）完全沒有帶協定文件說的 2-byte 分包表頭，直接是內容
+        // 本身，餵進 rightest_reassembly_feed() 會因為表頭格式對不上被誤判
+        // 成「還在等分包」而丟棄，狀態機永遠不會被推進。反正內容本來就
+        // 忽略，這裡完全跳過重組邏輯，收到任何 Notify 就當作「可以送 PCL
+        // 開啟」的訊號——**送完這裡不送下一個指令，要等它自己的 ATT 回應**
+        // （見 GATT_EVENT_QUERY_COMPLETE 的 RIGHTEST_SESSION_PCL_ON_PENDING
+        // 分支）才送型號查詢，避免兩個 ATT 請求同時在途。
+        printf("[BLE] rightest: got meter-ID push (%u bytes), enabling PCL mode...\n",
+               (unsigned)value_len);
+        s_rightest_session_state = RIGHTEST_SESSION_PCL_ON_PENDING;
+        send_rightest_pcl_mode(RIGHTEST_PCL_MODE_ON);
+        return;
+    }
+
+    if (!rightest_reassembly_feed(&s_rightest_reassembly, value, value_len)) {
+        return; // 還在收剩下的分包，或這包對不上預期已經被丟棄重來，等下一輪
+    }
+    const uint8_t *frame = s_rightest_reassembly.buffer;
+    size_t frame_len = s_rightest_reassembly.length;
+
+    switch (s_rightest_session_state) {
+        case RIGHTEST_SESSION_PCL_ON_PENDING:
+            // 正常不該在等 PCL 開啟的 ATT 回應期間又收到 Notify——保守起見
+            // 明確列出這個 case、單純忽略，**不呼叫 finish_rightest_session()
+            // 或送出任何新指令**，避免在前一個寫入還沒確認完成時又送一個，
+            // 見 rightest_session_state_t 宣告處的說明。
+            printf("[BLE] rightest: unexpected notification while PCL-on pending, ignoring.\n");
+            rightest_reassembly_reset(&s_rightest_reassembly);
+            break;
+
+        case RIGHTEST_SESSION_WAIT_SUMMARY: {
+            bool parsed = rightest_protocol_parse_record_summary(frame, frame_len, &s_rightest_summary);
+            rightest_reassembly_reset(&s_rightest_reassembly);
+            if (!parsed) {
+                printf("[BLE] rightest: failed to parse record summary, aborting.\n");
+                finish_rightest_session();
+                return;
+            }
+            printf("[BLE] rightest: total=%u max_capacity=%u last_transmission_index=%u\n",
+                   s_rightest_summary.total_count, s_rightest_summary.max_capacity,
+                   s_rightest_summary.last_transmission_index);
+            if (s_rightest_summary.last_transmission_index >= s_rightest_summary.total_count) {
+                // 裝置自己的書籤已經追上目前總筆數，沒有新記錄，見
+                // rightest_protocol.h RIGHTEST_CMD_READ_RECORD 的說明。
+                printf("[BLE] rightest: no new records since last sync.\n");
+                finish_rightest_session();
+                return;
+            }
+            s_rightest_next_index = (uint16_t)(s_rightest_summary.last_transmission_index + 1);
+            uint16_t remaining = (uint16_t)(s_rightest_summary.total_count - s_rightest_summary.last_transmission_index);
+            uint16_t capped = remaining > RECORD_BACKFILL_SAFETY_CAP ? RECORD_BACKFILL_SAFETY_CAP : remaining;
+            s_rightest_target_count = (uint16_t)(s_rightest_summary.last_transmission_index + capped);
+            printf("[BLE] rightest: reading records index=%u..%u...\n",
+                   s_rightest_next_index, s_rightest_target_count);
+            s_rightest_session_state = RIGHTEST_SESSION_WAIT_RECORD;
+            uint8_t index_bytes[2] = {
+                (uint8_t)(s_rightest_next_index & 0xFF), (uint8_t)(s_rightest_next_index >> 8) };
+            send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_bytes, sizeof(index_bytes));
+            break;
+        }
+
+        case RIGHTEST_SESSION_WAIT_RECORD: {
+            vital_record_t record;
+            bool parsed = rightest_protocol_parse_record(frame, frame_len, &record);
+            rightest_reassembly_reset(&s_rightest_reassembly);
+            if (parsed) {
+                commit_records(&record, 1);
+            } else {
+                printf("[BLE] rightest: index=%u did not parse as a valid reading "
+                       "(checksum/Hi-flag/QC), skipping.\n", s_rightest_next_index);
+            }
+            s_rightest_next_index++;
+            if (s_rightest_next_index > s_rightest_target_count) {
+                printf("[BLE] rightest: finished reading records.\n");
+                finish_rightest_session();
+                return;
+            }
+            uint8_t index_bytes[2] = {
+                (uint8_t)(s_rightest_next_index & 0xFF), (uint8_t)(s_rightest_next_index >> 8) };
+            send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_bytes, sizeof(index_bytes));
+            break;
+        }
+
+        default:
+            finish_rightest_session();
+            break;
+    }
 }
 
 // record_backfill_state_t 翻頁流程收到的回應：每翻到一筆能解析成功的記錄就
@@ -569,7 +820,11 @@ static void debug_print_advertisement(uint8_t *packet, const uint8_t *adv_data, 
     }
 
     bool is_fora = strstr(name, "FORA") != NULL || memcmp(addr, FORA_KNOWN_ADDR, sizeof(bd_addr_t)) == 0;
-    if (!is_fora) {
+    // GM700SB 廣播名稱是序號，比對不出關鍵字，只能用 Service UUID 0xFEE0
+    // 粗篩（見 rightest_protocol.h 的說明），這裡只是為了 debug log 印得
+    // 出來，不影響實際連線判斷（見 handle_advertising_report()）。
+    bool is_rightest = rightest_protocol_matches_advertisement(adv_data, adv_len);
+    if (!is_fora && !is_rightest) {
         return;
     }
 
@@ -595,7 +850,19 @@ static void handle_advertising_report(uint8_t *packet) {
     debug_print_advertisement(packet, adv_data, adv_len);
 
     fora_device_kind_t kind = FORA_DEVICE_UNKNOWN;
-    if (!fora_protocol_matches_advertisement(adv_data, adv_len, &kind)) {
+    bool matched = fora_protocol_matches_advertisement(adv_data, adv_len, &kind);
+    if (!matched && rightest_protocol_matches_advertisement(adv_data, adv_len)) {
+        // 只是初步粗篩（Service UUID 0xFEE0，廣播名稱是序號比對不出型號，
+        // 見 rightest_protocol.h 的說明）。原本規劃連線配對後再送型號查詢
+        // 二次核對身份，但 2026-08-28 實機測試發現裝置不會回應這個查詢
+        // （ATT 層寫入永遠成功，但沒有 Notify 回應——回頭看協定文件附錄的
+        // 資料同步流程圖，官方流程本來就不包含這一步），已經拿掉，目前
+        // 這個 Service UUID 粗篩是唯一的身份確認機制，見
+        // PROJECT_PLAN.md 第 6.6 節。
+        kind = FORA_DEVICE_RIGHTEST_GM700SB;
+        matched = true;
+    }
+    if (!matched) {
         return;
     }
 
@@ -608,7 +875,7 @@ static void handle_advertising_report(uint8_t *packet) {
     bd_addr_type_t addr_type = gap_event_advertising_report_get_address_type(packet);
 
     s_current_kind = kind;
-    printf("[BLE] matched FORA device %s (kind=%d), connecting...\n", bd_addr_to_str(addr), kind);
+    printf("[BLE] matched device %s (kind=%d), connecting...\n", bd_addr_to_str(addr), kind);
 
     gap_stop_scan();
     s_ble_state = BLE_STATE_CONNECTING;
@@ -624,12 +891,35 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
 
     switch (hci_event_packet_get_type(packet)) {
         case GATT_EVENT_SERVICE_QUERY_RESULT:
-            gatt_event_service_query_result_get_service(packet, &s_fora_service);
+            if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+                gatt_event_service_query_result_get_service(packet, &s_rightest_service);
+            } else {
+                gatt_event_service_query_result_get_service(packet, &s_fora_service);
+            }
             s_discovery_found = true;
             break;
 
         case GATT_EVENT_CHARACTERISTIC_QUERY_RESULT:
-            gatt_event_characteristic_query_result_get_characteristic(packet, &s_fora_characteristic);
+            if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+                // 一次探索整個 service，不是像 FORA 那樣指定 UUID 只找一個，
+                // 這裡會連續收到好幾個 characteristic，依 uuid16 分別收進
+                // FEE1/FEE2/FEE3 三個欄位，見 discover_rightest_characteristics()
+                // 的說明。
+                gatt_client_characteristic_t characteristic;
+                gatt_event_characteristic_query_result_get_characteristic(packet, &characteristic);
+                if (characteristic.uuid16 == RIGHTEST_CHARACTERISTIC_PCL_UUID16) {
+                    s_rightest_char_pcl = characteristic;
+                    s_rightest_char_pcl_found = true;
+                } else if (characteristic.uuid16 == RIGHTEST_CHARACTERISTIC_NOTIFY_UUID16) {
+                    s_rightest_char_notify = characteristic;
+                    s_rightest_char_notify_found = true;
+                } else if (characteristic.uuid16 == RIGHTEST_CHARACTERISTIC_WRITE_UUID16) {
+                    s_rightest_char_write = characteristic;
+                    s_rightest_char_write_found = true;
+                }
+            } else {
+                gatt_event_characteristic_query_result_get_characteristic(packet, &s_fora_characteristic);
+            }
             s_discovery_found = true;
             break;
 
@@ -638,6 +928,26 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
             bool is_discovery_state = s_ble_state == BLE_STATE_DISCOVER_SERVICE ||
                                        s_ble_state == BLE_STATE_DISCOVER_CHARACTERISTIC;
             if (att_status != ATT_ERROR_SUCCESS || (is_discovery_state && !s_discovery_found)) {
+                // 2026-08-28 實機測試發現：GM700SB 對 FEE2 CCCD 寫入（開啟
+                // Notify）直接回 ATT_ERROR_INSUFFICIENT_AUTHENTICATION
+                // (0x05)，不是主動送 SM Security Request（先前那個猜測，見
+                // handle_hci_event() 連線完成分支殘留的說明，已經證實走不通）
+                // ——這其實是藍牙標準裡「中央端該主動配對」的訊號：收到這個
+                // ATT 錯誤才呼叫 sm_request_pairing()，配對成功後重試剛剛
+                // 失敗的那個操作。目前只在 BLE_STATE_ENABLE_NOTIFY（訂閱
+                // FEE2）這一步實測會走到這裡，其他步驟（服務/characteristic
+                // 探索）不需要加密就能查詢成功。**這個重試邏輯本身還沒實機
+                // 驗證過**，見 PROJECT_PLAN.md 第 6.6 節。
+                if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB &&
+                    s_ble_state == BLE_STATE_ENABLE_NOTIFY &&
+                    (att_status == ATT_ERROR_INSUFFICIENT_AUTHENTICATION ||
+                     att_status == ATT_ERROR_INSUFFICIENT_ENCRYPTION)) {
+                    printf("[BLE] rightest: att_status=0x%02x (insufficient auth/encryption), "
+                           "requesting pairing then retrying...\n", att_status);
+                    s_ble_state = BLE_STATE_PAIRING;
+                    sm_request_pairing(s_connection_handle);
+                    break;
+                }
                 // 查詢本身可能「成功」完成卻完全沒有結果（陌生裝置沒有這個
                 // service/characteristic），這種情況不能當成正常繼續往下走，
                 // 不然會拿沒填過的 s_fora_service/s_fora_characteristic 去用。
@@ -647,15 +957,74 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                 break;
             }
             if (s_ble_state == BLE_STATE_DISCOVER_SERVICE) {
-                printf("[BLE] service discovered, looking up characteristic...\n");
-                discover_characteristic();
+                if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+                    printf("[BLE] rightest: service 0xFEE0 discovered, looking up characteristics...\n");
+                    discover_rightest_characteristics();
+                } else {
+                    printf("[BLE] service discovered, looking up characteristic...\n");
+                    discover_characteristic();
+                }
             } else if (s_ble_state == BLE_STATE_DISCOVER_CHARACTERISTIC) {
-                printf("[BLE] characteristic discovered...\n");
-                // 存進這種裝置專屬的快取，下次連上同種裝置可以直接跳過探索。
-                s_handle_cache[s_current_kind].cached = true;
-                s_handle_cache[s_current_kind].service = s_fora_service;
-                s_handle_cache[s_current_kind].characteristic = s_fora_characteristic;
-                enable_value_updates();
+                if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+                    if (!s_rightest_char_pcl_found || !s_rightest_char_notify_found ||
+                        !s_rightest_char_write_found) {
+                        // 掃描階段只是靠 Service UUID 粗篩，這裡才發現 3 個
+                        // characteristic 沒收齊，代表這台裝置其實不是
+                        // GM700SB（或韌體版本跟這份協定文件對不上）——放棄，
+                        // 不快取，見 rightest_protocol.h 的說明。
+                        printf("[BLE] rightest: missing expected FEE1/FEE2/FEE3 characteristic "
+                               "(pcl=%d notify=%d write=%d), disconnecting.\n",
+                               s_rightest_char_pcl_found, s_rightest_char_notify_found,
+                               s_rightest_char_write_found);
+                        gap_disconnect(s_connection_handle);
+                        break;
+                    }
+                    printf("[BLE] rightest: FEE1/FEE2/FEE3 all found, enabling notify...\n");
+                    enable_rightest_notify();
+                } else {
+                    printf("[BLE] characteristic discovered...\n");
+                    // 存進這種裝置專屬的快取，下次連上同種裝置可以直接跳過探索。
+                    s_handle_cache[s_current_kind].cached = true;
+                    s_handle_cache[s_current_kind].service = s_fora_service;
+                    s_handle_cache[s_current_kind].characteristic = s_fora_characteristic;
+                    enable_value_updates();
+                }
+            } else if (s_ble_state == BLE_STATE_RIGHTEST_SESSION) {
+                // 大部分 FEE3 指令寫入的 ATT 回應刻意不處理——那幾步的下一步
+                // 是靠收到的 FEE2 Notify 推進，不是靠寫入完成推進。只有 PCL
+                // 開啟這個寫入例外：它自己的 ATT 回應才是「可以送型號查詢」
+                // 的訊號（不是 Notify），見 rightest_session_state_t 宣告處
+                // 的說明——同一條連線一次只能有一個在途的 ATT 請求，這裡如果
+                // 也當 no-op，會跟型號查詢指令撞在一起送不出去。**這裡刻意
+                // 不處理 PCL 關閉（finish_rightest_session()）的 ATT 回應，
+                // 維持送出就直接斷線的舊寫法**——加了對應狀態的那個版本燒錄
+                // 後整台裝置沒有任何序列埠輸出，已經還原，這次改用範圍更小
+                // 的做法，只處理已經證實會卡住的這一個環節，見
+                // PROJECT_PLAN.md 第 6.6 節。
+                if (s_rightest_session_state == RIGHTEST_SESSION_PCL_ON_PENDING) {
+                    // 2026-08-28 實機測試：型號查詢（0xB0 0x00）的寫入本身
+                    // 在 ATT 層永遠成功確認，但裝置從沒回過任何 Notify——
+                    // 回頭看協定文件附錄的「Measurement Data transmission
+                    // Flow」流程圖，官方流程是 PCL 開啟後直接送「讀取總
+                    // 筆數/書籤」（0xB0 0x61 0x00 0x00），中間完全沒有經過
+                    // 型號查詢這一步（型號查詢是文件另一節單獨列出的指令
+                    // 範例，不是資料同步流程的一部分）。改成照官方流程圖
+                    // 走，跳過型號查詢；掃描階段的 Service UUID 0xFEE0 粗篩
+                    // 是目前唯一的身份確認機制，沒有型號字串二次核對這道
+                    // 保險，見 PROJECT_PLAN.md 第 6.6 節。
+                    printf("[BLE] rightest: PCL mode enabled, querying record summary...\n");
+                    s_rightest_session_state = RIGHTEST_SESSION_WAIT_SUMMARY;
+                    uint8_t index_zero[2] = { 0x00, 0x00 };
+                    send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_zero, sizeof(index_zero));
+                } else {
+                    // 2026-08-28 除錯用：型號查詢完全收不到回應，這裡印出來
+                    // 確認「寫入這一步本身的 ATT 回應」到底有沒有收到——這個
+                    // if 分支到得了，代表 att_status 已經是 SUCCESS（外層的
+                    // att_status!=SUCCESS 檢查會在更前面攔截並印出/斷線）。
+                    printf("[BLE] rightest: write acknowledged (session_state=%d), waiting for notify...\n",
+                           s_rightest_session_state);
+                }
+                break;
             } else if (s_ble_state == BLE_STATE_ENABLE_NOTIFY) {
                 s_ble_state = BLE_STATE_LISTENING;
                 s_connected_and_ready = true;
@@ -667,7 +1036,17 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                 // process_reading_payload() 之後 poll() 自然會因為讀值/時間戳
                 // 改變而刷新一次，那次才是使用者真正在意的內容。
                 printf("[BLE] value updates enabled (att_status=0x%02x)\n", att_status);
-                if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE || s_current_kind == FORA_DEVICE_MD6) {
+                if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+                    // 接下來整段流程（開 PCL -> 核對型號 -> 查總數/書籤 ->
+                    // 逐筆讀記錄 -> 關 PCL）都在 BLE_STATE_RIGHTEST_SESSION
+                    // 底下跑，見該狀態、rightest_session_state_t 的說明。
+                    // **先只等 meter-ID 自動推播，不在這裡送 PCL 開啟**——
+                    // 同一條連線一次只能有一個在途的 ATT 請求，等推播到了
+                    // 才送 PCL 開啟，見 handle_rightest_notification()。
+                    s_ble_state = BLE_STATE_RIGHTEST_SESSION;
+                    rightest_reassembly_reset(&s_rightest_reassembly);
+                    s_rightest_session_state = RIGHTEST_SESSION_WAIT_METER_ID;
+                } else if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE || s_current_kind == FORA_DEVICE_MD6) {
                     // 血壓計/MD6 走跟額溫槍/血氧計一樣的自訂 pipe，但要用「問
                     // 記錄」的兩段式交換取值（見 fora_protocol.h 的協定說明），
                     // 不是單一次觸發指令。這裡先送第一段，第二段在收到第一段
@@ -695,6 +1074,11 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                 printf(" %02x", value[i]);
             }
             printf("\n");
+
+            if (s_ble_state == BLE_STATE_RIGHTEST_SESSION) {
+                handle_rightest_notification(value, value_len);
+                break;
+            }
 
             if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE || s_current_kind == FORA_DEVICE_MD6) {
                 if (value_len < 6 || value[0] != 0x51) {
@@ -751,8 +1135,12 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
     }
 }
 
-// 血壓計連線後先配對，配對完成後才根據有沒有快取 handle，決定直接訂閱
-// Notify 還是先做服務/特徵值探索。
+// 血壓計/MD6 連線後先配對，配對完成後才根據有沒有快取 handle，決定直接訂閱
+// Notify 還是先做服務/特徵值探索。**GM700SB 不會呼叫這個函式**——它不是
+// 我們主動配對觸發（見 handle_hci_event() 連線完成分支的說明），連線建立
+// 當下就直接呼叫 discover_rightest_service()，不等配對；`SM_EVENT_
+// PAIRING_COMPLETE` 對 GM700SB 是另外處理、不會呼叫到這裡（見
+// handle_sm_event() 的說明），避免打斷已經在進行中的探索/讀寫流程。
 static void proceed_after_pairing(void) {
     if (s_handle_cache[s_current_kind].cached) {
         s_fora_service = s_handle_cache[s_current_kind].service;
@@ -779,10 +1167,30 @@ static void handle_sm_event(uint8_t packet_type, uint16_t channel, uint8_t *pack
         case SM_EVENT_PAIRING_COMPLETE: {
             uint8_t status = sm_event_pairing_complete_get_status(packet);
             if (status == ERROR_CODE_SUCCESS) {
-                printf("[BLE] pairing complete, proceeding...\n");
-                proceed_after_pairing();
+                if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+                    // GM700SB 是收到 ATT_ERROR_INSUFFICIENT_AUTHENTICATION
+                    // 才反應式呼叫 sm_request_pairing()（見上面 GATT_EVENT_
+                    // QUERY_COMPLETE 的說明），目前唯一會走到這條路的觸發點
+                    // 是訂閱 FEE2 Notify 失敗，配對成功後重試那一步。
+                    printf("[BLE] rightest: pairing complete, retrying notify subscription...\n");
+                    enable_rightest_notify();
+                } else {
+                    printf("[BLE] pairing complete, proceeding...\n");
+                    proceed_after_pairing();
+                }
             } else {
+                // 2026-08-28 修好：配對失敗原本完全沒有設定冷卻時間，斷線後
+                // 立刻恢復掃描，如果失敗的裝置還在附近廣播，會立刻又重新
+                // 掃到、立刻又重連、立刻又配對失敗，變成無限快速重試迴圈
+                // ——GM700SB 實機測試時觸發、抓到的（血壓計/MD6 之前配對一
+                // 直成功，沒機會暴露這個漏洞，但這幾種裝置共用同一段配對
+                // 程式碼，同樣適用）。跟成功讀到資料後一樣，沿用
+                // DEVICE_RECONNECT_COOLDOWN_MS 當冷卻時間，讓這段時間內
+                // 別的裝置也有機會被掃到、連上，而不是被同一台一直配對
+                // 失敗的裝置佔住。
                 printf("[BLE] pairing failed (status=0x%02x), disconnecting.\n", status);
+                s_kind_cooldown_until[s_current_kind] =
+                    make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[s_current_kind]);
                 gap_disconnect(s_connection_handle);
             }
             break;
@@ -835,9 +1243,29 @@ static void handle_hci_event(uint8_t packet_type, uint16_t channel, uint8_t *pac
             // 需要先配對成功才能訂閱/寫入成功，繼續保留這個差異，沒有一起拿掉。
             // MD6 跟血壓計共用同一套底層實作（見 fora_protocol.h 的說明），
             // 還沒實機驗證過是否也需要配對，先假設需要——就算其實不需要，
-            // 多走一次配對流程通常也不會出錯，比連不上、猜錯風險低。
+            // 多走一次配對流程通常也不會出錯，比連不上、猜錯風險低。刻意不開
+            // bonding（見 mode_ble_receive_run() 開頭的說明）——同一次開機
+            // 期間如果先連過 GM700SB（見下面的分支，會把這個全域設定改成
+            // SM_AUTHREQ_BONDING），這裡要主動改回來，不能留著上一台裝置的
+            // 設定值。
+            sm_set_authentication_requirements(0);
             s_ble_state = BLE_STATE_PAIRING;
             sm_request_pairing(s_connection_handle);
+        } else if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+            // 2026-08-28 實機測試史：先試連線就主動 sm_request_pairing()，
+            // GM700SB 完全不回應、等滿 30 秒逾時；改成完全不主動配對、直接
+            // 探索，結果服務/characteristic 探索都不需要加密就成功，**訂閱
+            // FEE2 Notify（寫 CCCD）才失敗，回傳 ATT_ERROR_INSUFFICIENT_
+            // AUTHENTICATION**——這才是正確的訊號，代表 GM700SB 是用「直接
+            // 拒絕操作」的標準 ATT 錯誤機制要求加密，不是主動送 SM Security
+            // Request。改成收到那個 ATT 錯誤時才反應式呼叫
+            // sm_request_pairing()（見 GATT_EVENT_QUERY_COMPLETE 的處理），
+            // 這裡連線當下不主動配對，直接進探索。開 bonding（只影響
+            // GM700SB 這條路徑，血壓計/MD6 維持原本不開 bonding，理由見
+            // mode_ble_receive_run() 的說明）。**這一輪的重試邏輯還沒實機
+            // 驗證過**，見 PROJECT_PLAN.md 第 6.6 節。
+            sm_set_authentication_requirements(SM_AUTHREQ_BONDING);
+            discover_rightest_service();
         } else if (s_handle_cache[s_current_kind].cached) {
             printf("[BLE] using cached handles for kind=%d, skipping discovery.\n", s_current_kind);
             s_fora_service = s_handle_cache[s_current_kind].service;

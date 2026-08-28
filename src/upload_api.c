@@ -163,6 +163,9 @@ static const char *data_source_label(uint8_t source_kind) {
         case FORA_DEVICE_OXIMETER:      return "FORAO2";
         case FORA_DEVICE_BLOOD_PRESSURE: return "FORAD40";
         case FORA_DEVICE_MD6:           return "FORAMD6";
+        // 不是 FORA 裝置，只是共用同一個編號空間，見 fora_protocol.h
+        // FORA_DEVICE_RIGHTEST_GM700SB 的說明。
+        case FORA_DEVICE_RIGHTEST_GM700SB: return "GM700SB";
         default:                        return "PicoGateway";
     }
 }

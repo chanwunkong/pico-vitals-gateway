@@ -2,6 +2,48 @@
 
 > 狀態總覽與交接文件（2026-08-06 整理）。內容跟程式碼有衝突時一律以程式碼為準，並回頭更新這份文件。
 
+## 2026-08-28 交接 prompt（換電腦接續 Rightest GM700SB 除錯用）
+
+> 這一段是換電腦/換 AI session 接續開發時，直接貼給新 session 的起手 prompt。完整的除錯過程、每一輪實機測試的發現，見下面第 6.6 節，這裡只放接手當下需要的濃縮版。
+
+```
+接續 pico-vitals-gateway 專案，正在加入 Bionime Rightest GM700SB 血糖機支援。
+Git 分支 feature/rightest-gm700sb（從 master 分出來，master 沒動過，這個分支已經
+commit 並 push 上 GitHub）。先讀 PROJECT_PLAN.md 第 6 節（尤其是 6.6 節）跟
+src/rightest_protocol.h/.c、src/mode_ble_receive.c 裡 Rightest 相關的部分，
+了解完整協定/架構決策再繼續。
+
+目前卡住的問題：裝置能正常掃描到、連線、探索到 FEE0/FEE1/FEE2/FEE3、訂閱
+Notify、收到裝置自動推播的 meter-ID（16 bytes，沒有協定文件說的分包表頭，
+已經處理）、寫入 PCL 開啟指令也拿到 ATT 層成功確認。但接下來**任何**指令
+（型號查詢、讀取記錄總數 0xB0 0x61 0x00 0x00）寫進 FEE3 之後，ATT 層一樣
+回成功確認，裝置卻從來沒有透過 FEE2 回傳任何 Notify 內容，17 秒後連線逾時
+斷線，反覆同樣的循環。裝置螢幕全程顯示橫槓左右移動的動畫——查過官方說明書
+確認這個動畫代表「正在傳輸資料」，不是卡住畫面，但我們這邊完全收不到資料。
+
+配對本身另外卡過幾輪（裝置需要在裝置本體手動按鍵確認配對，不是純軟體
+Just Works；BTstack 的配對金鑰儲存不會被韌體重新燒錄清掉，跟裝置端的配對
+狀態對不上時會卡在等配對回應、整個沒有任何回應）。這次接手前使用者已經在
+裝置端把配對記錄清空，最近一次測試是配對不需要就直接卡在讀記錄那步，代表
+配對已經不是主要卡點，卡點在「裝置收到指令但沒有實際回應」。
+
+還沒試過、值得先試的兩個方向：
+1. 協定文件架構圖顯示 GM700SB 是「藍牙模組」+「血糖機主控 MCU」兩顆晶片
+   透過 UART 內部連接，ATT 層寫入成功只代表藍牙模組收到，不代表主控 MCU
+   真的處理完、準備好接指令——目前 PCL 開啟拿到 ATT 確認後幾乎立刻送下一
+   個指令，可能太快。可以試著在送指令前加一點延遲（例如 0.5~1 秒）。
+2. 如果使用者手機是 Android 且有開發者選項，可以請他們開「藍牙 HCI 監聽
+   記錄」（btsnoop log），用官方「瑞特血糖守護寶」App 完整跑一次同步流程
+   後把記錄匯出分析，直接看官方 App 實際的指令/間隔，比用猜的準確很多。
+
+實機測試流程（燒錄/監看序列埠的細節見第 0 節）：改完 code 要
+`cmake --build build`，裝置需要使用者手動進 BOOTSEL 模式（按住 BOOTSEL
+同時按 RUN 鍵，或拔插 USB）才能複製 .uf2 燒錄，燒錄跟按鍵都需要使用者
+在現場配合操作，這邊沒辦法自動化。序列埠是 USB CDC（COM port，因電腦而
+異），用 .NET SerialPort 監看記得手動設 DtrEnable/RtsEnable 為 true，
+不然收不到任何輸出（TinyUSB CDC 的已知行為）。
+```
+
 ## 目前狀態摘要
 
 **已完成、已實機驗證：**
@@ -346,6 +388,63 @@ ilspycmd -p -o <輸出資料夾> "$env:APPDATA\FORA Health Care Management Syste
   - **中途斷線是安全的**：下次連線重新從 index=0 開始問，已經抓過的記錄再問一次只會覆蓋同一筆 pending 記錄（不會變成重複資料），只是效率上多繞一輪，不影響正確性。已實機驗證（storage.c 的 dedup 邏輯，見上方「已解決的實作 bug」第 2 點）。
   - **~~血壓計（D40）沿用同一套機制~~ 已接上（2026-08-26），但還沒實機驗證**：`mode_ble_receive.c` 的 `record_backfill_state_t`（原本叫 `md6_backfill_state_t`，改成通用命名）觸發條件從「只有 MD6」改成「MD6 或 BLOOD_PRESSURE」，`handle_record_backfill_notification()` 內部呼叫 `fora_protocol_parse_reading()` 時也從寫死 `FORA_DEVICE_MD6` 改成用 `s_current_kind`，這樣血壓計往回翻頁抓到的記錄（可能是血壓 3 筆一組，也可能是血糖 1 筆，取決於裝置當下是哪一種模式，見 `fora_protocol.h` 的協定說明）都能正確解析。D40 的安全上限也是沿用 `RECORD_BACKFILL_SAFETY_CAP=8`，一樣不知道夠不夠（D40 的記錄容量沒有像 MD6 那樣查到官方數字）。
 - **上傳範圍**：MD6 六合一全部項目（血糖/HCT/酮體/尿酸/總膽固醇/血紅素，**不含乳酸/三酸甘油脂，MD6 這台不會回報那兩項**）都上傳，韌體端不特別挑選哪些項目才傳，量到哪項就送哪項的 JSON 欄位——**已實作**。欄位名稱沿用裝置官方縮寫：`glu_ac`（已有）、`hct`、`ketone`、`ua`、`chol`、`hb`（這 5 個目前後端 `PhysioMeasurement` 沒有對應欄位，Gson 解析時會靜默忽略、不會報錯也不會存進資料庫，韌體這邊格式已經準備好，欄位的事還沒跟後端同步）。
+
+### 6.6 Bionime Rightest GM700SB 血糖機（2026-08-28 已寫完程式碼、編譯過關，完全還沒實機測試——下次接續開發先看這裡）
+
+**現況一句話**：跟廠商拿到正式協定文件（《GM700SB Data Communication Protocol - Rev 1.1》PDF，放在專案根目錄，標記 Confidential 故意不加入版控），照文件內容完整實作了連線/配對/PCL Mode 開關/型號核對/讀取記錄總數與書籤/逐筆讀記錄/解析成 `vital_record_t` 的整條路徑，`feature/rightest-gm700sb` 分支上已編譯過關（`cmake --build build`），**但完全沒有拿實機驗證過任何一步**，包含最基本的「連得上」都還沒測。
+
+**跟 FORA 系列完全不同的地方**（第一次加入非 FORA 廠牌，見 `fora_protocol.h` `FORA_DEVICE_RIGHTEST_GM700SB` 開頭的說明）：
+- 晶片是 Dialog Semiconductor DA1458x（LightBlue 讀 Device Information 服務確認），不是 FORA 系列共用的 Nordic nRF5 SDK 範例板，走完全不同的自訂 GATT service（`0xFEE0`，底下 `FEE1`=PCL Mode 開關、`FEE2`=Notify 回應通道、`FEE3`=Write 指令通道），不是 FORA 的 Nordic LED/Button Service（`00001523...`）。
+- **廣播名稱是裝置序號**（協定文件明講，2026-08-28 LightBlue 實機確認過），沒有型號字串可以在掃描階段比對，`rightest_protocol_matches_advertisement()` 只能先用「廣播的 16-bit Service UUID 清單含 `0xFEE0`」粗篩，真正身份要連線配對、開了 PCL 之後送「查詢型號名稱」指令核對回應字串開頭是不是 `"GM7"`（見 `mode_ble_receive.c` 的 `RIGHTEST_SESSION_WAIT_MODEL_NAME` 處理）——**這代表可能會對到其他也用 `0xFEE0` 的陌生裝置先配對再確認身份失敗**，配對本身是有副作用的動作，2026-08-28 使用者已經知悉並接受這個取捨（沒有更早期、不需要配對就能核對身份的辦法）。
+- **`FEE3`（指令通道）只支援 Write，沒有 Write Without Response**（2026-08-28 LightBlue 實機確認），跟 FORA 系列全部走 write-without-response 不一樣，`send_rightest_command()`/`send_rightest_pcl_mode()` 都改用會產生 `GATT_EVENT_QUERY_COMPLETE` 的 `gatt_client_write_value_of_characteristic()`——但這個 ATT 回應目前刻意不處理（見下面「時序假設」）。
+- **回應可能跨多個 BLE Notify 封包**（協定文件的 GATT Payload Format：每個 payload 前面帶 2 bytes 表頭 `[總封包數][目前第幾包]`），FORA 系列每筆回應都在單一 Notify 收完，這次新增了 `rightest_protocol.c` 的 `rightest_reassembly_t`/`rightest_reassembly_feed()` 專門處理這個重組。
+- **不需要自己在 flash 存「上次同步到哪」的定位點**：裝置自己維護一個「last transmission index」書籤，讀某個 index 的記錄會把書籤推進到那裡（協定文件明講），下次連線的 TYPE 1 查詢會直接告訴我們書籤在哪，從 +1 開始讀到目前總筆數就好——沒有比照 FORA MD6/D40 用 `storage_get_backfill_anchor()`/`storage_set_backfill_anchor()`。**這個「書籤是裝置端全域狀態、不是每個藍牙連線各自重置」的假設是從協定文件的範例推斷出來的，不是文件白紙黑字寫的，2026-08-28 完全沒有實機驗證過**，如果實測發現不成立（例如每次新連線書籤都被重置成 0），會導致每次連線都重新讀一遍全部歷史記錄——不會產生資料庫重複（`storage.c` 的 dedup 邏輯靠 `device_measured_key` 擋著），只是效率變差，不是正確性問題。
+
+**架構決策**（2026-08-28 討論定案，跟純 FORA 裝置擴充不一樣的地方）：
+- **裝置種類編號空間沿用 `fora_device_kind_t`**（新增 `FORA_DEVICE_RIGHTEST_GM700SB`），沒有另開一個獨立 enum——雖然這台根本不是 FORA 裝置，但 `mode_upload.c`（依 `source_kind` 分組上傳的迴圈）、`mode_ble_receive.c`（冷卻時間/handle 快取陣列）都是用 `[FORA_DEVICE_KIND_COUNT]` 固定大小的陣列/迴圈邊界，另開新 enum 會讓這些邊界對不上、需要大改好幾個檔案，語意上的瑕疵（名字是 FORA 但裝置不是）比這個風險更能接受。
+- **協定/解析邏輯獨立成 `src/rightest_protocol.h`/`.c`**（不是塞進 `fora_protocol.c`），結構比照 `fora_protocol.c`：checksum、指令組裝、回應解析、廣播比對都在這裡，`mode_ble_receive.c` 只負責 BLE GATT 層的連線/探索/寫入/通知分派（跟 FORA 那幾種裝置的分工原則一致）。
+- **`device_measured_key` 沿用 `fora_protocol_decode_measured_key()` 完全相同的 bit-packing 格式**（`(year-2000)<<20 | month<<16 | day<<11 | hour<<6 | minute`）——這樣 `display_status.c`/上傳邏輯既有的 `fora_protocol_measured_key_to_datetime()`/`_to_epoch_ms()` 可以直接沿用，不用為這台裝置另外寫一份日期換算，`display_status.c`/`upload_api.c` 完全不用改。
+- **餐別標記簡化映射**（2026-08-28 使用者決定）：GM700SB 有 7 種（飯前/飯後/無餐/宵夜/睡前/運動/起床），簡化映射成既有 `fora_measurement_mode_t` 3 態——飯前→AC、飯後→PC，其餘都算 GEN，不新增欄位、不擴充後端，跟 FORA MD6/D40 的做法一致。
+- **時區固定假設台灣**（2026-08-28 使用者決定）：每筆記錄自己帶一個 5-bit 時區欄位（協定文件範例算出 GMT-4，Meter TZ Index 4=UTC+8 對應台灣），刻意不解析，跟 FORA 一樣直接用 `LOCAL_UTC_OFFSET_SEC`。
+- **沒有比照 `s_handle_cache` 做 GATT handle 快取**：GM700SB 不像 FORA 那樣量測完就急著斷線，每次連線都重新做完整的 service/characteristic 探索，用連線時間換取程式碼簡單，先求正確、不做這個最佳化。
+- **Hi 旗標（>600 mg/dL）／品管測試（Control Solution）都直接濾掉不上傳**，跟 FORA 的無效讀值／QC 過濾邏輯處理原則一致，保守起見不猜測協定文件沒講清楚的欄位語意。
+
+**2026-08-28 第一次實機測試結果**：燒錄後裝置能正確掃到 GM700SB（廣播名稱 `2782WBC1987(C)`，Service UUID `0xFEE0` 粗篩成功）、送出連線請求、`GAP_SUBEVENT_LE_CONNECTION_COMPLETE` 成功——**但 `sm_request_pairing()` 之後配對失敗，`SM_EVENT_PAIRING_COMPLETE` 回傳 `status=0x08`**（藍牙 SM 協定「Unspecified Reason」）。原因目前不確定，比較可能的方向：(1) GM700SB 可能要求 host 端也開 bonding 才接受配對——現有程式碼刻意不開 bonding（`sm_set_authentication_requirements(0)`，見 `mode_ble_receive_run()` 的說明，是避免 FORA 那種「裝置沒真的存 bonding 資訊、下次連線金鑰對不上卡住」的風險），但協定文件的 BLE Pairing Flow 圖有畫到「Paired data already exists?」分支，暗示官方 App 端有做 bonding；(2) 裝置本身可能需要先在自己螢幕上有動作才會接受配對請求。**下次接續開發要先確認這個根因，可能需要先試著開 SM_AUTHREQ_BONDING 看配對會不會成功**。
+
+**2026-08-28 同一輪測試順便抓到並修好一個共通漏洞**：配對失敗（`SM_EVENT_PAIRING_COMPLETE` 的失敗分支）原本完全沒有設定 `s_kind_cooldown_until`，斷線後立刻恢復掃描，如果失敗的裝置還在附近廣播（GM700SB 就是），會立刻又重新掃到、立刻又重連、立刻又配對失敗，變成無限快速重試迴圈——這不是 GM700SB 專屬的問題，血壓計/MD6 走的是同一段配對程式碼，只是之前配對一直成功、沒機會暴露。已修好並實機驗證：配對失敗時比照成功讀到資料後一樣，套用 `DEVICE_RECONNECT_COOLDOWN_MS[kind]` 當冷卻時間，2026-08-28 燒錄後實測配對失敗到下次重連間隔確實是 10 秒，不再無限快速重試。
+
+**2026-08-28 第二次實機測試：開 bonding 後配對還是失敗，但發現關鍵線索**——先試著在連線後臨時開 `SM_AUTHREQ_BONDING` 再呼叫 `sm_request_pairing()`（送完立刻改回 0，不影響血壓計/MD6），結果**配對足足等滿 30 秒才失敗**（`status=0x08`），跟第一次幾乎立刻失敗不一樣——代表 **GM700SB 完全沒有回應我們主動送出的 Pairing Request**，是被動逾時，不是主動拒絕。回頭比對協定文件附錄的 BLE Pairing Flow 圖，流程圖第一步是「Security Request」——這在藍牙標準用語裡是**周邊裝置主動送給中央端**要求加密的封包，不是中央端主動送配對請求，跟血壓計/MD6「連線後我們主動配對」的模式相反。
+
+同一輪測試也發現：中途有一次配對失敗顯示 `status=0x13`，這不是 GM700SB 的真實回應，是我們自己的「還沒校時成功、開機後第一次主動觸發 UPLOAD 補校時」機制把 BLE 連線強制拔斷造成的雜訊（Pico W 天線 WiFi/藍牙互斥，切模式前會強制斷線）——之後分析 log 要留意排除這種跟目標裝置無關的干擾。這次也順便看到 UPLOAD 嘗試連 WiFi 全部認證模式失敗（`rc=-8`），這是 PROJECT_PLAN.md 早就記錄過的既有問題（密碼待透過 AP_CONFIG 重新設定），跟 GM700SB 無關。
+
+**2026-08-28 第三次嘗試：不主動配對，改成直接探索——進展一大步，找到真正根因**。改成連線當下不呼叫 `sm_request_pairing()`，直接 `discover_rightest_service()` 開始探索。實機結果：**服務/characteristic 探索完全不需要加密就成功**（`FEE1/FEE2/FEE3` 三個都正確找到），**訂閱 `FEE2` Notify（寫 CCCD）才第一次失敗，回傳 `att_status=0x05`＝`ATT_ERROR_INSUFFICIENT_AUTHENTICATION`**。這才是真正的根因：GM700SB 不是用 SM Security Request 主動要求加密（第二次嘗試的猜測證實走不通），是用**標準 ATT 層直接拒絕操作**的方式要求加密——這其實是藍牙標準裡「中央端該主動配對」的明確訊號：中央端收到 `INSUFFICIENT_AUTHENTICATION`/`INSUFFICIENT_ENCRYPTION` 才呼叫 `sm_request_pairing()`，不是連線當下就主動配對。
+
+**2026-08-28 第四次嘗試：反應式配對成功了，而且金鑰有正確持久化**——`GATT_EVENT_QUERY_COMPLETE` 收到 `ATT_ERROR_INSUFFICIENT_AUTHENTICATION` 時才呼叫 `sm_request_pairing()`，實機測試**配對真的成功了**：裝置螢幕跳出配對確認畫面，使用者在裝置上按了實體按鍵確認，`SM_EVENT_PAIRING_COMPLETE` 回 `ERROR_CODE_SUCCESS`。而且因為有開 `SM_AUTHREQ_BONDING`，**金鑰有正確持久化**——後續好幾次重新連線完全不需要再走一次配對流程（沒有再出現 pairing 相關 log），bonding 的假設證實成立。這證明第 1 點（裝置螢幕沒有配對提示只顯示藍牙圖示）那次觀察，其實是「還沒真的走到會跳確認畫面的那個時間點」，不是裝置不需要使用者確認——**GM700SB 實際上需要使用者在裝置上手動按鍵確認配對**（不是純軟體 Just Works），這點列入之後燒錄測試的操作 SOP：實機測試時要留意裝置螢幕、需要時按鍵確認。
+
+**同一輪測試發現新的卡點**：配對成功後，`enable_value_updates()` 完成訂閱的同時送出「PCL 開啟」寫入指令，緊接著收到裝置自動推播的 meter-ID Notify、又立刻嘗試送「查詢型號」指令——**兩個 ATT 請求撞在一起**（同一條連線一次只能有一個在途的請求），第二個送不出去，裝置從此沒再收到任何指令，卡在 PCL 鎖定畫面（實機觀察：裝置螢幕一直顯示游標動畫）直到連線逾時（16 秒，`HCI reason=0x08`）斷線，接著無限重複這個循環。
+
+**2026-08-28 第一次修法：整台裝置當機，已還原**——改成完全序列化，同時把 `finish_rightest_session()`（收尾關閉 PCL）也改成要等它自己的 ATT 回應才真的斷線（不是送完立刻斷線）、`handle_rightest_notification()` 的 `default:` 兜底分支也會處理到新加的狀態。燒錄後**整台裝置完全沒有任何序列埠輸出**（開機/掃描的 log 都沒有），拔插 USB 完整斷電重開機也一樣——不是「卡在某個狀態」，是徹底無回應，懷疑是新狀態在某個時機被 `handle_rightest_notification()` 的 `default:` 兜底到、間接讓 `finish_rightest_session()` 在前一個寫入還沒確認完成時又送一次寫入，撞到 BTstack 內部某個「不該同時有兩個進行中請求」的保護機制導致整個當機（不是單純的邏輯錯誤，推測是更底層的當機，還沒有進一步查證根因，只確認了「改回舊版就恢復正常」）。已經還原成舊版（`git diff` 驗證 `PCL_ON_PENDING`/`PCL_OFF_PENDING` 兩個字串都已清除），確認序列埠輸出恢復正常。
+
+**2026-08-28 第二次修法：裝置沒有再整台當機，但實機測試發現另一個獨立問題**——用第一次修法的縮小版（只加 `RIGHTEST_SESSION_PCL_ON_PENDING`、明確 `case` 處理不依賴 `default:`、`finish_rightest_session()` 完全不動）燒錄後，裝置正常運作，收到 meter-ID 自動推播（16 bytes Notify），**但狀態機沒有被推進**，`enable_rightest_notify()` 之後就再也沒有下一步 log（沒有「got meter-ID push...」）。查了原始封包：`0e 32 37 38 32 57 42 43 31 39 38 37 28 43 29 2a`，解出來是 `[0x0E]"2782WBC1987(C)*"`——**這 16 bytes 完全沒有帶協定文件說的 2-byte 分包表頭（`[總封包數][目前第幾包]`），是內容原始直接送**，`rightest_reassembly_feed()` 誤判成表頭格式不符、直接丟棄整包，`handle_rightest_notification()` 因此提前 return，狀態機永遠卡在 `WAIT_METER_ID`。
+
+**已修好（已寫完程式碼、編譯過關，還沒實機驗證）**：
+1. `handle_rightest_notification()` 對 `RIGHTEST_SESSION_WAIT_METER_ID` 完全跳過重組邏輯——反正這則推播的內容本來就忽略，收到任何 Notify 直接當「可以送 PCL 開啟」的訊號，不再嘗試解析。
+2. `rightest_reassembly_feed()` 加一個判斷：**payload 第一個 byte 是不是 Return Data Header（`0x4F`）**，是的話直接當成已經收完整的單包回應（不跑 2-byte 表頭邏輯），不是才照文件說的分包表頭處理——因為不確定型號/總數/單筆記錄這幾個單包就裝得下的正式指令回應，是不是也跟 meter-ID 推播一樣省略表頭（協定文件的表頭說明適用範圍寫得不夠精確），用「回應內容本身是不是真的以 `0x4F` 開頭」這個可驗證的訊號來判斷，比死板地假設「一律有表頭」更穩健，兩種情況都能正確處理。
+
+**2026-08-28 實機驗證：前兩項都過關，卡在第三項——型號查詢完全收不到回應**。加了除錯 log 印出實際寫入 FEE3 的原始 bytes 跟 ATT 層回應狀態後確認：`b0 00 b0`（跟協定文件範例完全一致）**寫入本身在 ATT 層永遠成功確認**（`gatt_client_write_value_of_characteristic()` 呼叫成功、對應的 `GATT_EVENT_QUERY_COMPLETE` att_status 也是 SUCCESS），但裝置**從沒回過任何 Notify**，17 秒後連線逾時斷線，重複三次都一樣。裝置螢幕全程維持在游標動畫，沒有變化。排除了 ATT 碰撞、handle 寫錯、checksum 錯誤這幾種可能——寫入確實送達裝置，只是裝置的應用層沒有回應。
+
+**根因**：回頭比對協定文件附錄「Measurement Data transmission Flow」流程圖，官方的資料同步流程是 **PCL 開啟後直接送「讀取總筆數/書籤」（`0xB0 0x61 0x00 0x00`），中間完全沒有經過型號查詢這一步**——型號查詢是文件「Protocol Description」節單獨列出的指令範例，不是這個資料同步流程的一部分，GM700SB 進入 PCL 鎖定狀態後很可能根本沒實作/不理會這個指令。
+
+**已修好（已寫完程式碼、編譯過關，還沒實機驗證）**：拿掉型號查詢這一步，改成照官方流程圖走——PCL 開啟自己的 ATT 回應到了之後直接送 TYPE 1（讀取總筆數/書籤）查詢。連帶影響：**掃描階段的 Service UUID 0xFEE0 粗篩變成唯一的身份確認機制**，不再有連線後型號字串二次核對這道保險（`rightest_protocol_parse_model_name()`/`RIGHTEST_CMD_QUERY_MODEL_NAME` 相關程式碼還留在 `rightest_protocol.c/.h` 裡沒刪，只是沒接進 `mode_ble_receive.c` 的流程，之後如果想用在其他用途還在）。**下次接續開發先燒錄測試，這次要看的重點依序是**：(1) 裝置還是不會整台沒反應；(2) PCL 開啟後能不能直接收到 TYPE 1 回應（總筆數/書籤）；(3) 逐筆讀記錄能不能一路走完、解析出實際血糖數值。
+
+**還沒解決／還沒驗證的問題（下次接續開發要做的事，照風險排序）**：
+1. **配對失敗（見上方 2026-08-28 測試結果）是目前最優先要解決的問題，卡住後面所有讀取記錄的驗證**——配對不成功就完全走不到 PCL Mode/型號核對/讀記錄那幾步。
+2. **`finish_rightest_session()` 送出 PCL OFF 之後沒有等待 ATT 回應就馬上呼叫 `gap_disconnect()`**（見 `mode_ble_receive.c` 的說明）——這個時序假設「BTstack 會在斷線前把這個寫入送出去」完全沒有驗證過，如果裝置常常沒收到這個關閉指令，會卡在 PCL 鎖定畫面（協定文件原文：the BGM will be locked and display PCL on screen），需要使用者自行操作裝置解除。如果實測發現這是問題，修法是改成等 `GATT_EVENT_QUERY_COMPLETE` 確認寫入完成才斷線。
+3. **「last transmission index 是裝置端全域書籤，不是每個連線各自重置」的假設沒有驗證過**，見上面的說明。
+4. **廣播階段的 Service UUID `0xFEE0` 粗篩會不會誤配對到其他裝置**，沒有驗證過——如果現場環境有其他用到 `0xFEE0` 的藍牙裝置，會發生非預期的配對嘗試（型號核對會擋下、不會真的當成血糖資料處理，但配對這個動作本身已經發生）。
+5. **多包重組（`rightest_reassembly_t`）完全沒有實機測資料驗證過**——不確定 GM700SB 實際會不會真的觸發多包（協定文件範例都在 20 bytes 內，TYPE 2 回應剛好 21 bytes，理論上可能剛好卡在單包/多包的邊界，要看實際 ATT MTU 協商結果）。
+6. **`RIGHTEST_CMD_QUERY_MODEL_NAME` 回應格式假設 5 個 ASCII 字元**（協定文件範例 `"GM782"`），還沒確認 GM700SB 實機回應的字串長什麼樣子、開頭是不是真的是 `"GM7"`。
+7. 上傳到後端的 `dataSource="GM700SB"`、JSON 欄位沿用既有的 `glu_ac`/`glu_pc`（跟 D40/MD6 共用），後端目前應該不需要額外改動就能收，但完全沒有實機測試驗證過整條路徑（連線→解析→存 flash→上傳）。
 
 ## 7. 待辦事項
 

@@ -112,6 +112,17 @@ typedef enum {
     // 項目的數值單位/scale 都還沒實機驗證過，目前 mode_ble_receive.c 只把
     // 收到的記錄印出來人工比對，不會存進待傳佇列/上傳，見該檔案的說明。
     FORA_DEVICE_MD6,
+    // Bionime Rightest GM700SB 血糖機——**不是 FORA 裝置**，跟這個 enum 裡其他
+    // 型號完全不同廠牌/晶片/協定（Dialog Semiconductor DA1458x，走自訂
+    // Service 0xFEE0，不是 FORA 系列共用的 Nordic LED/Button Service pipe），
+    // 真正的協定/解析邏輯在 rightest_protocol.h/.c。放進這個 enum 純粹是因為
+    // `source_kind`／這個 COUNT 常數已經是專案裡「裝置種類」的統一編號空間，
+    // 被 mode_ble_receive.c/mode_upload.c/storage.c/upload_api.c/
+    // display_status.c 好幾個依 [FORA_DEVICE_KIND_COUNT] 大小配置的陣列、迴圈
+    // 共用（見 mode_upload.c 依 source_kind 分組上傳的迴圈）——另外開一個
+    // 獨立的 enum 型別會導致這些陣列/迴圈邊界對不上，風險比「名字裡有 FORA
+    // 但其實不是」這個語意瑕疵更高，2026-08-28 決定沿用同一個編號空間。
+    FORA_DEVICE_RIGHTEST_GM700SB,
     FORA_DEVICE_KIND_COUNT,
 } fora_device_kind_t;
 
