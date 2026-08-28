@@ -361,6 +361,21 @@ size_t storage_pending_records(vital_record_t *out, size_t max_count) {
     return n;
 }
 
+size_t storage_pending_records_page(vital_record_t *out, size_t max_count, size_t skip) {
+    size_t matched = 0;
+    size_t n = 0;
+    for (size_t i = 0; i < s_record_count && n < max_count; i++) {
+        if (s_records[i].status != UPLOAD_STATUS_PENDING && s_records[i].status != UPLOAD_STATUS_FAILED) {
+            continue;
+        }
+        if (matched >= skip) {
+            out[n++] = s_records[i];
+        }
+        matched++;
+    }
+    return n;
+}
+
 void storage_mark_uploaded_for_group(
     uint8_t source_kind, uint32_t device_measured_key, uint64_t uploaded_at_ms, bool success) {
     if (success) {

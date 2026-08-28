@@ -34,6 +34,12 @@ bool storage_append_record(const vital_record_t *record);
 // 取出最多 max_count 筆待傳（status == PENDING）的紀錄，回傳實際取出筆數。
 size_t storage_pending_records(vital_record_t *out, size_t max_count);
 
+// 取出待傳（PENDING 或 FAILED）紀錄的其中一頁：跳過前 skip 筆符合條件的紀錄，
+// 再取最多 max_count 筆，回傳實際取出筆數。跟 storage_pending_records() 的
+// 差別是這個給 KEY2 歷史畫面翻頁用——畫面一次只需要一頁（例如 7 筆），不需要
+// 呼叫端準備能裝下全部（最多 MAX_PENDING_RECORDS 筆）的 buffer。
+size_t storage_pending_records_page(vital_record_t *out, size_t max_count, size_t skip);
+
 // 將上一次 storage_pending_records() 取出的紀錄裡、來源裝置種類是
 // source_kind「且」device_measured_key 也相同的那些（PENDING 或 FAILED）
 // 標記為上傳結果；上傳成功的紀錄會被移除，失敗的保留供下次重試，其他來源/

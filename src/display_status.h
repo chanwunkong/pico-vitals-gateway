@@ -60,10 +60,15 @@ void display_status_format_clock(uint64_t boot_ms, char *out, size_t out_size);
 // display_status_show_xxx()，內容在該模式執行期間變動不頻繁，不需要輪詢。
 void display_status_poll(void);
 
-// 已上傳歷史摘要畫面：KEY2 觸發的陽春文字列表，最多顯示 7 筆（見 display_status.c
-// 的 HISTORY_DISPLAY_MAX_ROWS），records 應該是最舊排前面、最新排最後（見
-// storage_get_recent_upload_history()）。跟 show_upload()/show_error() 一樣是
-// 直接畫、直接刷新，呼叫端負責決定顯示多久之後要換回 BLE_RECEIVE 畫面。
-void display_status_show_upload_history(const vital_record_t *records, size_t count, size_t total_count);
+// 待傳（未上傳）紀錄畫面：KEY2 觸發的陽春文字列表，一次顯示一頁、最多
+// HISTORY_DISPLAY_MAX_ROWS 筆（見 display_status.c）。records 是
+// storage_pending_records_page() 取出的其中一頁（該頁內最舊排前面、最新排
+// 最後），page_index 是目前頁數（從 0 起算）、page_count 是總頁數，畫面上
+// 會標成「page_index+1/page_count」給使用者看。每筆記錄前面會標一個字元
+// 代表狀態：待傳中顯示 `.`，上傳失敗過顯示 `!`。跟 show_upload()/show_error()
+// 一樣是直接畫、直接刷新，呼叫端負責決定顯示多久之後要換回 BLE_RECEIVE 畫面、
+// 以及 KEY2 再按一次時頁數要怎麼推進。
+void display_status_show_pending_records(const vital_record_t *records, size_t count, size_t total_count,
+                                          size_t page_index, size_t page_count);
 
 #endif // DISPLAY_STATUS_H

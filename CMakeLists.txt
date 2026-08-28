@@ -17,7 +17,6 @@ pico_sdk_init()
 add_executable(pico_gateway
     src/main.c
     src/state_machine.c
-    src/mode_boot_select.c
     src/mode_ap_config.c
     src/mode_ble_receive.c
     src/fora_protocol.c

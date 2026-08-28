@@ -217,16 +217,27 @@ static void build_wifi_qr_text(char *out, size_t out_size, const char *ssid, con
     }
 }
 
-// 把 QR code 縮放畫到 framebuffer 上，(x0,y0) 是左上角、target_size_px 是希望
-// 佔用的邊長（實際邊長會是 module 數的整數倍，可能略小於這個值）。四周留白
-// （quiet zone）不用額外處理——整個畫面一開始就被 Paint_Clear(WHITE) 清成
-// 白色，只要旁邊的文字別畫得太靠近就自然留白。
+// 把 QR code 縮放畫到 framebuffer 上，(x0,y0) 是「保留給它的方框」左上角、
+// target_size_px 是這個方框的邊長。實際畫出來的邊長是 module 數的整數倍，
+// 通常會比 target_size_px 略小（scale 用整數除法無條件捨去)——這裡會把
+// 畫出來的內容置中在方框裡，而不是固定貼齊左上角，兩個 QR code 大小不同
+// （WiFi 帳密字串長、setup 頁網址短，見下方 display_status_show_ap_config()
+// 的兩次呼叫）並排時視覺上才會對齊。四周留白（quiet zone）不用額外處理——
+// 整個畫面一開始就被 Paint_Clear(WHITE) 清成白色，只要旁邊的文字別畫得太
+// 靠近就自然留白。
 static void draw_qr_code(const uint8_t *qr, int x0, int y0, int target_size_px) {
     int modules = qrcodegen_getSize(qr);
     int scale = target_size_px / modules;
     if (scale < 1) {
         scale = 1;
     }
+    int actual_size = modules * scale;
+    int offset = (target_size_px - actual_size) / 2;
+    if (offset < 0) {
+        offset = 0;
+    }
+    x0 += offset;
+    y0 += offset;
     for (int y = 0; y < modules; y++) {
         for (int x = 0; x < modules; x++) {
             UWORD color = qrcodegen_getModule(qr, x, y) ? BLACK : WHITE;
@@ -239,22 +250,41 @@ static void draw_qr_code(const uint8_t *qr, int x0, int y0, int target_size_px) 
     }
 }
 
+// 熱點設定頁網址，跟 mode_ap_config.c 的 mode_ap_config_run() 裡 dhcp_server_init()
+// 用的 gw IP（IP4_ADDR(&gw, 192, 168, 4, 1)）是同一個值——那裡是 lwIP 的
+// DHCP/HTTP server 綁定位址，這裡只是把同一個位址編碼成 QR code 給使用者掃，
+// 兩邊沒有共用常數（一個是 lwIP 的 ip4_addr_t，一個是給人看/掃的字串），
+// 之後如果改 gw IP 要記得兩邊一起改。
+#define AP_CONFIG_SETUP_URL "http://192.168.4.1/"
+
 void display_status_show_ap_config(const char *ap_ssid, const char *ap_password,
                                     const device_config_t *existing_config) {
     s_ble_screen_is_current = false;
     begin_frame();
 
-    Paint_DrawString_EN(5, 2, "WiFi Setup", &Font16, BLACK, WHITE);
+    // 版面（296x128，橫向，2026-08-28 第二版調整）：左側窄文字欄 + 右側並排
+    // 兩個「同樣大小」的方框各畫一個 QR code（WiFi 帳密 / 設定頁網址），標題
+    // 之外全部統一用 Font12——標題（"Setup"）用 Font16 特別大一點，其餘文字
+    // （SSID/密碼/個案編號/QR 說明）大小都一致。
+    Paint_DrawString_EN(4, 1, "Setup", &Font16, BLACK, WHITE);
 
-    // SSID/密碼用 Font8（比 Font12 窄）畫，QR code 從 x=180 開始（見下方
-    // draw_qr_code() 呼叫），左側文字只有 175px 寬可用——SSID 帶了 MAC 衍生
-    // 的字尾（例如 "PicoGateway-Setup-DC15"）長度會超過 Font12 在這個寬度
-    // 塞得下的字元數，換成 Font8 才不會被 QR code 蓋到/裁切掉。
+    // SSID/密碼/個案編號都是「標籤」+「值」各佔一行：Font12 比先前拿掉的 Font8
+    // 寬，SSID 帶了 MAC 衍生字尾（例如 "GATEWAY-DC15"）跟標籤同一行放不下，
+    // 乾脆全部統一換行，視覺上也比較一致。標籤（"SSID:"/"Pass:"/"ID:"）故意
+    // 用反色（白字黑底——Paint_DrawString_EN(fg, bg) 把前景/背景對調成
+    // (WHITE, BLACK)）畫成一個小色塊，跟下面的實際數值（維持黑字白底，方便
+    // 使用者看/抄）拉出視覺區隔，一眼就能分辨「這是欄位名稱」還是「這是要
+    // 抄下來的值」。2026-08-28：這個反色效果原本是 GUI_Paint.c 的 bug（見
+    // 該檔案 Paint_DrawString_EN() 的說明），修掉 bug 之後這裡改成只在標籤
+    // 這幾行刻意呼叫出同樣的效果，變成有意的設計而不是意外。
     char line[48];
-    snprintf(line, sizeof(line), "SSID: %s", ap_ssid);
-    Paint_DrawString_EN(5, 26, line, &Font8, BLACK, WHITE);
-    snprintf(line, sizeof(line), "Pass: %s", ap_password);
-    Paint_DrawString_EN(5, 38, line, &Font8, BLACK, WHITE);
+    Paint_DrawString_EN(4, 19, "SSID:", &Font12, WHITE, BLACK);
+    snprintf(line, sizeof(line), "%s", ap_ssid);
+    Paint_DrawString_EN(4, 32, line, &Font12, BLACK, WHITE);
+
+    Paint_DrawString_EN(4, 45, "Pass:", &Font12, WHITE, BLACK);
+    snprintf(line, sizeof(line), "%s", ap_password);
+    Paint_DrawString_EN(4, 58, line, &Font12, BLACK, WHITE);
 
     char patient_id_ascii[PATIENT_ID_MAX_LEN];
     if (existing_config != NULL && existing_config->valid) {
@@ -262,27 +292,55 @@ void display_status_show_ap_config(const char *ap_ssid, const char *ap_password,
     } else {
         patient_id_ascii[0] = '\0';
     }
-    snprintf(line, sizeof(line), "ID: %s", patient_id_ascii[0] != '\0' ? patient_id_ascii : "(unset)");
-    Paint_DrawString_EN(5, 60, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(4, 71, "ID:", &Font12, WHITE, BLACK);
+    snprintf(line, sizeof(line), "%s", patient_id_ascii[0] != '\0' ? patient_id_ascii : "(unset)");
+    Paint_DrawString_EN(4, 84, line, &Font12, BLACK, WHITE);
 
-    Paint_DrawString_EN(5, 90, "Scan QR or connect", &Font12, BLACK, WHITE);
-    Paint_DrawString_EN(5, 104, "phone to hotspot ->", &Font12, BLACK, WHITE);
-
-    // QR code 放右側。字串很短（SSID+密碼加起來不到 50 bytes），版本上限給 10
-    // 綽綽有餘（能放到數百字元），buffer 用得到的空間遠小於這個上限對應的大小。
-    char wifi_text[160];
-    build_wifi_qr_text(wifi_text, sizeof(wifi_text), ap_ssid, ap_password);
-
+    // 兩個 QR code 共用同一對靜態 buffer（version 10 綽綽有餘，兩個字串都遠小
+    // 於這個上限），畫完第一個馬上編碼畫第二個，不需要同時保留兩份。
     static uint8_t s_qr_temp[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
     static uint8_t s_qr_code[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
-    bool ok = qrcodegen_encodeText(wifi_text, s_qr_temp, s_qr_code, qrcodegen_Ecc_MEDIUM,
-                                   qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true);
-    if (ok) {
-        draw_qr_code(s_qr_code, 180, 8, 112);
+
+    // 兩個 QR code 用同樣大小的方框（AP_CONFIG_QR_BOX_PX）——WiFi 帳密字串比
+    // 網址長、編出來的 QR 版本（module 數）比較多，同一個方框裡照樣會自動縮小
+    // 到剛好塞得下（draw_qr_code() 依 module 數算 scale），不用個別調整。
+    #define AP_CONFIG_QR_BOX_PX 88
+    #define AP_CONFIG_QR1_X     112
+    #define AP_CONFIG_QR2_X     (AP_CONFIG_QR1_X + AP_CONFIG_QR_BOX_PX + 8)
+
+    // QR #1：WiFi 帳密（掃到會跳出系統「加入 WiFi」提示），標註在上方，加
+    // "1." 引導使用者先掃這個、再掃右邊的 "2."（跟下面 SSID/Pass/ID 標籤一樣
+    // 用黑底白字，見上面的說明）。
+    Paint_DrawString_EN(AP_CONFIG_QR1_X, 1, "1. Join WiFi", &Font12, WHITE, BLACK);
+    char wifi_text[160];
+    build_wifi_qr_text(wifi_text, sizeof(wifi_text), ap_ssid, ap_password);
+    bool wifi_qr_ok = qrcodegen_encodeText(wifi_text, s_qr_temp, s_qr_code, qrcodegen_Ecc_MEDIUM,
+                                            qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true);
+    if (wifi_qr_ok) {
+        draw_qr_code(s_qr_code, AP_CONFIG_QR1_X, 15, AP_CONFIG_QR_BOX_PX);
     } else {
         printf("[DISPLAY] qrcodegen_encodeText() failed, skipping WiFi QR code\n");
-        Paint_DrawString_EN(180, 40, "(QR failed)", &Font12, BLACK, WHITE);
+        Paint_DrawString_EN(AP_CONFIG_QR1_X, 45, "(QR failed)", &Font12, BLACK, WHITE);
     }
+
+    // QR #2（2026-08-28 新增）：設定頁網址本身，讓不想連 WiFi 熱點自動彈跳頁、
+    // 或彈跳頁沒跳出來（部分手機/系統設定會擋）的使用者可以直接掃碼開瀏覽器
+    // 連過去。下方另外把網址用文字印出來（掃不了 QR 的話還能用手打）。
+    // 2026-08-28：原本用 "2. Setup page"（13 字元 x Font12 7px = 91px），從
+    // AP_CONFIG_QR2_X（208）畫到 299px，超出面板可用寬度 296px（Paint.Width，
+    // 見 GUI_Paint.c 的 Paint_NewImage() ROTATE_90 換算），Paint_DrawString_EN()
+    // 內建的自動換行邏輯就把最後一個字元擠到下一行去了——縮短成 8 字元
+    // "2. Setup"（56px）留夠邊界不會再超。
+    Paint_DrawString_EN(AP_CONFIG_QR2_X, 1, "2. Setup", &Font12, WHITE, BLACK);
+    bool url_qr_ok = qrcodegen_encodeText(AP_CONFIG_SETUP_URL, s_qr_temp, s_qr_code, qrcodegen_Ecc_MEDIUM,
+                                           qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true);
+    if (url_qr_ok) {
+        draw_qr_code(s_qr_code, AP_CONFIG_QR2_X, 15, AP_CONFIG_QR_BOX_PX);
+    } else {
+        printf("[DISPLAY] qrcodegen_encodeText() failed, skipping setup-page QR code\n");
+        Paint_DrawString_EN(AP_CONFIG_QR2_X, 45, "(QR failed)", &Font12, BLACK, WHITE);
+    }
+    Paint_DrawString_EN(AP_CONFIG_QR2_X, 106, "192.168.4.1", &Font12, BLACK, WHITE);
 
     end_frame_and_refresh();
 }
@@ -293,9 +351,12 @@ void display_status_show_upload(const char *ssid, const char *result_text) {
 
     Paint_DrawString_EN(5, 2, "Uploading", &Font16, BLACK, WHITE);
 
+    // "WiFi:" 標籤黑底白字，SSID 值維持白底黑字，跟 AP_CONFIG 畫面同一套
+    // 標籤/數值視覺區隔原則（見 display_status_show_ap_config() 的說明）。
     char line[48];
-    snprintf(line, sizeof(line), "WiFi: %s", ssid != NULL ? ssid : "?");
-    Paint_DrawString_EN(5, 30, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(5, 30, "WiFi:", &Font12, WHITE, BLACK);
+    snprintf(line, sizeof(line), " %s", ssid != NULL ? ssid : "?");
+    Paint_DrawString_EN(5 + 5 * 7, 30, line, &Font12, BLACK, WHITE);
     Paint_DrawString_EN(5, 46, result_text, &Font12, BLACK, WHITE);
 
     end_frame_and_refresh();
@@ -305,7 +366,10 @@ void display_status_show_error(const char *message) {
     s_ble_screen_is_current = false;
     begin_frame();
 
-    Paint_DrawString_EN(5, 2, "ERROR", &Font16, BLACK, WHITE);
+    // 錯誤畫面的標題刻意反色（黑底白字）做出警示感，跟其他畫面標題維持白底
+    // 黑字的原則不同——這是唯一一個「標題本身也要突顯」的畫面，其餘畫面的
+    // 標題已經用 Font16 夠大，不需要再加黑底。
+    Paint_DrawString_EN(5, 2, "ERROR", &Font16, WHITE, BLACK);
     Paint_DrawString_EN(5, 30, message, &Font12, BLACK, WHITE);
 
     end_frame_and_refresh();
@@ -495,6 +559,13 @@ static const vital_type_t MD6_EXTRA_TYPES[] = {
     VITAL_TYPE_HCT, VITAL_TYPE_KETONE, VITAL_TYPE_UA, VITAL_TYPE_CHOL, VITAL_TYPE_HB,
 };
 
+// vital_label() 一律回傳補滿 5 個字元的標籤（例如 "Temp "/"Pulse"），這裡統一
+// 定義「標籤欄」寬度＝5 個 Font12 字元，讓每一行的黑底標籤（見下面
+// draw_reading_row()/draw_md6_extra_row() 的說明）跟後面數值的起始 x 座標
+// 對齊成同一條直線，畫面看起來像一個表格。
+#define BLE_ROW_LABEL_X 5
+#define BLE_ROW_VALUE_X (BLE_ROW_LABEL_X + 5 * 7)
+
 static void draw_md6_extra_row(int y, const ble_snapshot_t *snap) {
     int best = -1;
     for (size_t i = 0; i < sizeof(MD6_EXTRA_TYPES) / sizeof(MD6_EXTRA_TYPES[0]); i++) {
@@ -507,9 +578,13 @@ static void draw_md6_extra_row(int y, const ble_snapshot_t *snap) {
         }
     }
 
+    // 標籤（"MD6  "，補到跟其他行一樣的 5 字元寬）黑底白字，數值維持白底黑字，
+    // 跟 AP_CONFIG 畫面同一套標籤/數值視覺區隔原則。
+    Paint_DrawString_EN(BLE_ROW_LABEL_X, y, "MD6  ", &Font12, WHITE, BLACK);
+
     char line[48];
     if (best < 0) {
-        snprintf(line, sizeof(line), "MD6   -- (never)");
+        snprintf(line, sizeof(line), " -- (never)");
     } else {
         vital_type_t type = MD6_EXTRA_TYPES[best];
         char value_str[16];
@@ -517,13 +592,17 @@ static void draw_md6_extra_row(int y, const ble_snapshot_t *snap) {
         char clock_str[24];
         format_reading_clock(snap->reading_received_at_ms[type], snap->reading_device_measured_key[type],
                               clock_str, sizeof(clock_str));
-        snprintf(line, sizeof(line), "MD6 %s %s%s (%s)", vital_label(type), value_str, vital_unit(type),
+        snprintf(line, sizeof(line), " %s %s%s (%s)", vital_label(type), value_str, vital_unit(type),
                  clock_str);
     }
-    Paint_DrawString_EN(5, y, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(BLE_ROW_VALUE_X, y, line, &Font12, BLACK, WHITE);
 }
 
 static void draw_reading_row(int y, vital_type_t type, const ble_snapshot_t *snap) {
+    // 標籤（"Temp "/"SpO2 "/... 已經是固定 5 字元寬，見 vital_label()）黑底
+    // 白字，數值維持白底黑字，見上面 BLE_ROW_VALUE_X 的說明。
+    Paint_DrawString_EN(BLE_ROW_LABEL_X, y, vital_label(type), &Font12, WHITE, BLACK);
+
     char line[48];
     if (snap->reading_valid[type]) {
         char value_str[16];
@@ -531,22 +610,25 @@ static void draw_reading_row(int y, vital_type_t type, const ble_snapshot_t *sna
         char clock_str[24];
         format_reading_clock(snap->reading_received_at_ms[type], snap->reading_device_measured_key[type],
                               clock_str, sizeof(clock_str));
-        snprintf(line, sizeof(line), "%s %s%s (%s%s)", vital_label(type), value_str, vital_unit(type),
+        snprintf(line, sizeof(line), " %s%s (%s%s)", value_str, vital_unit(type),
                  pulse_source_tag(type, snap->reading_source_kind[type]), clock_str);
     } else {
-        snprintf(line, sizeof(line), "%s -- (never)", vital_label(type));
+        snprintf(line, sizeof(line), " -- (never)");
     }
-    Paint_DrawString_EN(5, y, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(BLE_ROW_VALUE_X, y, line, &Font12, BLACK, WHITE);
 }
 
 static bool render_ble_receive(const ble_snapshot_t *snap) {
     begin_frame();
 
+    // "ID:" 標籤黑底白字，個案編號+狀態文字維持白底黑字。這行不屬於下面
+    // vitals 表格的一部分，標籤不強制補到 5 字元、直接用 "ID:" 本身的寬度。
     char line[48];
-    snprintf(line, sizeof(line), "ID: %s  %s",
+    Paint_DrawString_EN(5, 2, "ID:", &Font12, WHITE, BLACK);
+    snprintf(line, sizeof(line), " %s  %s",
              snap->patient_id_ascii[0] != '\0' ? snap->patient_id_ascii : "(unset)",
              snap->status_text[0] != '\0' ? snap->status_text : "Idle");
-    Paint_DrawString_EN(5, 2, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(5 + 3 * 7, 2, line, &Font12, BLACK, WHITE);
 
     // ID/狀態合併一行、Last upload/Pending 合併一行（各省一行），vitals 區塊
     // 從 y=22 開始、13px 一行；y=100 那行是 FORA MD6 六合一血糖以外 5 項的
@@ -557,17 +639,19 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     draw_reading_row(61, VITAL_TYPE_GLUCOSE, snap);
 
     // 血壓收縮/舒張合成一行顯示；兩者通常同一次量測一起寫入，時間戳取收縮壓的。
+    // "BP   "（補到 5 字元寬，對齊上面 vitals 表格的標籤欄）黑底白字。
+    Paint_DrawString_EN(BLE_ROW_LABEL_X, 74, "BP   ", &Font12, WHITE, BLACK);
     if (snap->reading_valid[VITAL_TYPE_SYSTOLIC] && snap->reading_valid[VITAL_TYPE_DIASTOLIC]) {
         char clock_str[24];
         format_reading_clock(snap->reading_received_at_ms[VITAL_TYPE_SYSTOLIC],
                               snap->reading_device_measured_key[VITAL_TYPE_SYSTOLIC], clock_str, sizeof(clock_str));
-        snprintf(line, sizeof(line), "BP    %d/%d mmHg (%s)",
+        snprintf(line, sizeof(line), " %d/%d mmHg (%s)",
                  (int)(snap->reading_value[VITAL_TYPE_SYSTOLIC] + 0.5f),
                  (int)(snap->reading_value[VITAL_TYPE_DIASTOLIC] + 0.5f), clock_str);
     } else {
-        snprintf(line, sizeof(line), "BP    -- (never)");
+        snprintf(line, sizeof(line), " -- (never)");
     }
-    Paint_DrawString_EN(5, 74, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(BLE_ROW_VALUE_X, 74, line, &Font12, BLACK, WHITE);
 
     char upload_clock_str[24];
     if (snap->last_upload_valid) {
@@ -575,8 +659,19 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     } else {
         snprintf(upload_clock_str, sizeof(upload_clock_str), "never");
     }
-    snprintf(line, sizeof(line), "Last: %s  Pending: %u", upload_clock_str, (unsigned)snap->pending_count);
-    Paint_DrawString_EN(5, 87, line, &Font12, BLACK, WHITE);
+    // 這行有兩個標籤（"Last:"/"Pending:"），數值長度不固定（時間戳/待傳筆數
+    // 位數都會變），沒辦法像上面 vitals 表格那樣用固定欄寬對齊，改成逐段畫、
+    // x 座標依實際畫出來的字元數往右推進。
+    int x = 5;
+    Paint_DrawString_EN(x, 87, "Last:", &Font12, WHITE, BLACK);
+    x += 5 * 7;
+    snprintf(line, sizeof(line), " %s  ", upload_clock_str);
+    Paint_DrawString_EN(x, 87, line, &Font12, BLACK, WHITE);
+    x += (int)strlen(line) * 7;
+    Paint_DrawString_EN(x, 87, "Pending:", &Font12, WHITE, BLACK);
+    x += 8 * 7;
+    snprintf(line, sizeof(line), " %u", (unsigned)snap->pending_count);
+    Paint_DrawString_EN(x, 87, line, &Font12, BLACK, WHITE);
 
     draw_md6_extra_row(100, snap);
 
@@ -624,16 +719,18 @@ void display_status_poll(void) {
 
 #define HISTORY_DISPLAY_MAX_ROWS 7
 
-void display_status_show_upload_history(const vital_record_t *records, size_t count, size_t total_count) {
+void display_status_show_pending_records(const vital_record_t *records, size_t count, size_t total_count,
+                                          size_t page_index, size_t page_count) {
     s_ble_screen_is_current = false;
     begin_frame();
 
     char line[48];
-    snprintf(line, sizeof(line), "Upload History (%u total)", (unsigned)total_count);
+    snprintf(line, sizeof(line), "Pending (%u) page %u/%u", (unsigned)total_count, (unsigned)(page_index + 1),
+             (unsigned)page_count);
     Paint_DrawString_EN(5, 2, line, &Font12, BLACK, WHITE);
 
     if (count == 0) {
-        Paint_DrawString_EN(5, 20, "(none yet)", &Font12, BLACK, WHITE);
+        Paint_DrawString_EN(5, 20, "(none pending)", &Font12, BLACK, WHITE);
     } else {
         int y = 18;
         size_t rows = count < HISTORY_DISPLAY_MAX_ROWS ? count : HISTORY_DISPLAY_MAX_ROWS;
@@ -643,7 +740,8 @@ void display_status_show_upload_history(const vital_record_t *records, size_t co
             char clock_str[24];
             format_reading_clock(records[i].received_at_ms, records[i].device_measured_key,
                                   clock_str, sizeof(clock_str));
-            snprintf(line, sizeof(line), "%s %s%s (%s)", vital_label(records[i].type), value_str,
+            char marker = records[i].status == UPLOAD_STATUS_FAILED ? '!' : '.';
+            snprintf(line, sizeof(line), "%c %s %s%s (%s)", marker, vital_label(records[i].type), value_str,
                      vital_unit(records[i].type), clock_str);
             Paint_DrawString_EN(5, y, line, &Font12, BLACK, WHITE);
             y += 13;

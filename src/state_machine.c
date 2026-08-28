@@ -3,7 +3,6 @@
 #include "led_status.h"
 #include "mode_ap_config.h"
 #include "mode_ble_receive.h"
-#include "mode_boot_select.h"
 #include "mode_upload.h"
 
 #include "btstack.h"
@@ -11,7 +10,13 @@
 
 #include <stdio.h>
 
-#define BOOT_CONFIG_WINDOW_MS      4000
+// 開機後第一次進 AP_CONFIG 給的時間上限（2026-08-28 取代原本的 BOOTSEL 開機
+// 視窗判斷）：過了這段時間都沒人送出設定表單、也沒按 KEY0 取消，就自動當作
+// 「這次開機沒有人要設定」，放行到正常的 BLE_RECEIVE 監測模式，熱點不會無限
+// 期擋住 24/7 監測。KEY0 長按手動重新進入這個模式（mode_ble_receive.c 的
+// MODE_BLE_RECEIVE_EXIT_ENTER_CONFIG）不套用這個逾時，使用者主動要求設定就
+// 讓他填完，沿用原本「按住 KEY0 取消」的唯一離開方式。
+#define AP_CONFIG_BOOT_TIMEOUT_MS  180000
 #define BLE_IDLE_UPLOAD_TRIGGER_MS 5000
 
 typedef enum {
@@ -33,17 +38,20 @@ static void radio_switch_to_wifi(void) {
 }
 
 void state_machine_run(void) {
-    bool enter_config = mode_boot_select_check(BOOT_CONFIG_WINDOW_MS);
-    gateway_state_t state = enter_config ? STATE_AP_CONFIG : STATE_BLE_RECEIVE;
-    printf("[FSM] boot select window done, enter_config=%d\n", enter_config);
+    // 每次通電一律先進 AP_CONFIG（含設定頁面），不再需要按住 BOOTSEL/KEY0
+    // 才能進入；給 AP_CONFIG_BOOT_TIMEOUT_MS 的時間上限，逾時自動放行到
+    // BLE_RECEIVE（見上面常數說明）。
+    gateway_state_t state = STATE_AP_CONFIG;
+    uint32_t ap_config_timeout_ms = AP_CONFIG_BOOT_TIMEOUT_MS;
 
     for (;;) {
         switch (state) {
             case STATE_AP_CONFIG:
-                printf("[FSM] -> AP_CONFIG\n");
+                printf("[FSM] -> AP_CONFIG (timeout_ms=%u)\n", ap_config_timeout_ms);
                 radio_switch_to_wifi();
                 led_status_set(LED_SOLID_ON);
-                mode_ap_config_run(); // 阻塞直到設定完成並儲存
+                mode_ap_config_run(ap_config_timeout_ms); // 阻塞直到設定完成/取消/逾時
+                ap_config_timeout_ms = 0; // 之後的重新進入（KEY0 長按）不設逾時
                 state = STATE_BLE_RECEIVE;
                 break;
 

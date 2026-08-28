@@ -48,19 +48,19 @@ Just Works；BTstack 的配對金鑰儲存不會被韌體重新燒錄清掉，�
 
 **已完成、已實機驗證：**
 
-- 環境、骨架（狀態機、BOOTSEL 開機視窗、LED 燈號、flash 儲存）。
+- 環境、骨架（狀態機、開機自動進 AP_CONFIG＋3 分鐘逾時、LED 燈號、flash 儲存，見第 2.2 節）。
 - 熱點設定模式（AP_CONFIG）：手機連上熱點自動跳出設定頁（captive portal），可掃描附近 WiFi、填個案資訊，會帶入既有設定值；KEY0 按住取消退出（不儲存）。
 - BLE 接收四種讀值（額溫槍、血氧計、血壓計、血糖，同一台 D40 二合一機的血壓/血糖）並正確上傳，見第 6 節協定細節。血糖數值已跟裝置螢幕比對一致，見第 7.2 節第 11 點。
 - WiFi 連線 + HTTPS 上傳，含失敗自動重試（佇列持久化在 flash，斷電不遺失）、NTP 校時、KEY1 強制重新校時。
 - 電子紙顯示器（Waveshare Pico-ePaper-2.9）Phase 1+2：四種模式的畫面都燒錄驗證過，見第 12 節。
-- 板載按鍵 KEY0（長按進 AP_CONFIG／按住取消）、KEY1（手動觸發完整 WiFi 動作+強制 NTP 校時）、KEY2（已上傳歷史畫面）（2026-08-06 燒錄後實機驗證，見第 2.2/12.8 節）。
+- 板載按鍵 KEY0（長按進 AP_CONFIG／按住取消）、KEY1（手動觸發完整 WiFi 動作+強制 NTP 校時）、KEY2（未上傳紀錄畫面，可翻頁，2026-08-28 改版，見第 12.8 節）（2026-08-06 燒錄後實機驗證的是改版前的已上傳歷史版本，見第 2.2 節）。
 - 每台裝置唯一衍生的 AP 熱點 SSID（2026-08-06 實機確認畫面顯示的 SSID 跟手機實際掃到的一致；密碼後來改成所有裝置固定同一組，見第 8 節第 39 點）。
 
 **已寫完程式碼、編譯過關，但還沒燒錄/實機測試：**
 
 - 血壓計時鐘合理性檢查（跟 NTP 比對，不合理就退回用 Pico 收到時間，容許誤差 7 天**待確認**，見第 7.3 節）。
 - 上傳伺服器網址／認證金鑰改成可透過 AP_CONFIG 設定、TLS 憑證驗證框架（等正式後端網址才能真的填憑證/收緊驗證）。
-- 已上傳紀錄保留機制（主持人要求，保留最近 200 筆，數字**待確認**，見第 5/7.3 節）——KEY2 畫面已經可以看到，但保留筆數上限/機制本身還沒有長時間運作驗證過。
+- 已上傳紀錄保留機制（主持人要求，保留最近 200 筆，數字**待確認**，見第 5/7.3 節）——保留筆數上限/機制本身還沒有長時間運作驗證過；**2026-08-28 起 KEY2 畫面預設改成顯示未上傳紀錄**（見第 12.8 節），已上傳歷史目前沒有專屬畫面可以看，只留在 flash 裡（`storage_get_upload_history()` 等函式還在，但沒有呼叫端）。
 - Flash 持久化改用 littlefs，解決 wear-leveling 問題（一次性、不相容的格式改動，見第 5.1/8.5 節第 28 點）——這次燒錄測試期間看起來運作正常（設定/待傳/歷史都有正確存取），但還沒驗證重開機後資料是否正確持久化。
 - 修復無螢幕版本（不接電子紙板）開機後極可能卡死的問題（見第 12.9/8 節第 33 點）——這次測試機器有接面板，還沒拿無螢幕機器驗證過。
 - NTP 一直沒校時成功時每 5 分鐘自動重試（見第 2.4 節）——這次測試很快就校時成功，沒機會驗證這個計時器本身。
@@ -112,13 +112,13 @@ Pico W 使用的 CYW43439 是 WiFi + 藍牙合一晶片，共用同一根天線�
 
 ### 2.2 模式切換輸入
 
-Pico W 本身沒有板載使用者按鈕，只有 BOOTSEL。**決策：只在開機後的短時間視窗（約 4 秒）輪詢 BOOTSEL，過了視窗之後在正常 24/7 運作期間完全不再輪詢**（讀取 BOOTSEL 需要暫時切換 QSPI_SS 腳位並關閉中斷，正常運作期間執行有當機風險）。使用者要進入熱點設定模式時，重新插拔電源並在開機瞬間按住 BOOTSEL；如果有接第 12.1 節的電子紙板，也可以改成「按住 BOOTSEL 同時按一下板上的 RUN 鍵」，效果相同但不用真的動電源線。這條路徑**沒有被拿掉**，任何機器（不管有沒有接電子紙板）都可以用。
+**（2026-08-28 改版）** 開機不再需要按任何按鍵：`state_machine_run()` 每次通電一律先進 `STATE_AP_CONFIG`（開熱點+設定頁），給 `AP_CONFIG_BOOT_TIMEOUT_MS`（3 分鐘，`state_machine.c`）的時間上限，逾時都沒人送出表單/按 KEY0 取消就自動放行到 BLE_RECEIVE。原本輪詢 BOOTSEL 決定要不要進 AP_CONFIG 的 `mode_boot_select.c/.h`（技巧：暫時切換 QSPI_SS 腳位讀電位，需要在 BLE/WiFi/core1 都還沒啟動前執行，正常運作期間執行有當機風險，見下方歷史記錄）已整個移除，`CMakeLists.txt` 也拿掉了這個編譯項目。
 
-**重要區分（測試時常搞混）**：
-- **BOOTSEL 開機瞬間按住** → 韌體正常開機、`mode_boot_select_check()` 偵測到、進入 AP_CONFIG 熱點設定模式。這是軟體邏輯。
-- **RP2040 boot ROM 層級的 BOOTSEL**（開機那一刻電源腳位供電前就按住/插入電源時按住不放） → 裝置完全不會執行任何韌體，變成 `RPI-RP2` USB 隨身碟（燒錄模式）。這是晶片硬體行為，跟上面那個完全無關。
+**改版動機**：field 部署時要求「插電就能立刻掃碼設定」，不希望還要教使用者「開機瞬間按住 BOOTSEL」這個對非工程背景的人來說不直覺的手勢。**已知取捨**：這代表**每一次斷電重開機**（包含非預期的電源不穩/重開）現在都會先卡在 AP_CONFIG 最多 3 分鐘才恢復 BLE 監測，比改版前「預設直接進監測模式」多了一段固定的監測空窗；3 分鐘這個數字是配合這次需求給的預設值，不是使用者逐項確認過的精算值，如果實測發現空窗期造成困擾（例如部署現場電源不穩、常常重開機），可以調小 `AP_CONFIG_BOOT_TIMEOUT_MS` 或者改回需要動作才進入。
 
-**（2026-08-06 加做，尚未實機測試）** 手上實際裝的電子紙是 Waveshare **Pico-CapTouch-ePaper-2.9**（觸控版，見第 12.1 節更正），板上帶 KEY0/KEY1/KEY2 三顆按鍵（不是 4 顆，也不是觸控本身，另一顆是接硬體 RESET 的 RUN 鍵）。加了新的按鍵觸發點（`src/button_input.c/.h`），跟 BOOTSEL 路徑並存、互不影響：
+**KEY0 長按 3 秒**（`mode_ble_receive.c` 主迴圈期間，見下方）**仍然是進入 AP_CONFIG 的手動路徑**，不受這次改版影響，讓使用者不用等下次斷電重開機就能隨時重新設定；這條路徑進去**不會**套用 3 分鐘逾時（`mode_ap_config_run(0)`），沿用改版前「等到送出表單或按 KEY0 取消為止」的行為，因為這是使用者主動要求設定，不應該被時間打斷。
+
+**（2026-08-06 加做，尚未實機測試）** 手上實際裝的電子紙是 Waveshare **Pico-CapTouch-ePaper-2.9**（觸控版，見第 12.1 節更正），板上帶 KEY0/KEY1/KEY2 三顆按鍵（不是 4 顆，也不是觸控本身，另一顆是接硬體 RESET 的 RUN 鍵）。加了新的按鍵觸發點（`src/button_input.c/.h`）：
 - **KEY0 長按 3 秒**：在 BLE_RECEIVE 模式期間隨時可以觸發，不用重開機，直接切去 AP_CONFIG（見 `mode_ble_receive_run()` 的 `MODE_BLE_RECEIVE_EXIT_ENTER_CONFIG`）。**在 AP_CONFIG 畫面裡改成短按住 1 秒**（`AP_CONFIG_CANCEL_HOLD_MS`，跟進入用的 3 秒是同一個實體按鍵、同一個 `button_input_key0_long_press()` 函式、分別傳不同的 `hold_ms`）：不想改設定的話不用真的把網頁表單送出來，按住 KEY0 一下就能取消、退回 BLE_RECEIVE、不會儲存。取消的門檻刻意比進入低但不是瞬間單擊——連著的手機可能正在填表單，瞬間誤觸會讓熱點斷線、表單內容全部消失，需要一點保護但又不用像進入那麼久。
 - **KEY1 按一下**：不管待傳佇列是否為空都會觸發完整一次 WiFi 動作（連線→強制重新 NTP 校時→上傳，見 `mode_upload.c`），跳過 idle timeout 等待——就算沒有資料要傳，使用者也可能只是想手動確認一次網路時間校得準不準。
 
@@ -140,13 +140,12 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
 開機
   │
   ▼
-[BOOT_SELECT]  開機視窗約 4 秒，LED 快閃，偵測 BOOTSEL 是否按住
-  ├─ 按住 → [AP_CONFIG]
-  └─ 未按住 → [BLE_RECEIVE]
-
 [AP_CONFIG]   熱點設定模式，LED 常亮，畫面顯示目前已存的設定（沒改過就是舊值）
+  （2026-08-28 改版）每次通電一律先進這個狀態，不再需要按 BOOTSEL；給 3 分鐘
+  （AP_CONFIG_BOOT_TIMEOUT_MS）時間上限
   設定完成並儲存（網頁表單送出）→ [BLE_RECEIVE]
   KEY0 按住 1 秒（不想改，直接離開，不儲存）→ [BLE_RECEIVE]
+  逾時 3 分鐘都沒送出/沒取消 → [BLE_RECEIVE]（跟 KEY0 取消一樣不儲存）
 
 [BLE_RECEIVE] 藍芽接收模式（預設常駐狀態）
   掃描/重連中 → LED 慢閃
@@ -157,7 +156,8 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
   （在收到任何資料之前不會倒數；判重把資料濾掉、佇列仍是空的話也不會切換，
    避免血壓計那種要 30~45 秒才會推播一次的裝置被提早打斷，也避免白跑一趟
    WiFi 只為了確認「沒有東西要傳」）
-  KEY0 長按 3 秒 → [AP_CONFIG]（見第 2.2 節，隨時可觸發，不用重開機）
+  KEY0 長按 3 秒 → [AP_CONFIG]（見第 2.2 節，隨時可觸發，不用重開機；這條路徑
+    進去不套用 3 分鐘逾時，等到送出表單或 KEY0 取消為止）
   KEY1 按一下 → [UPLOAD]（不管待傳佇列是否為空都觸發，跳過 idle timeout 等待，
     是完整的一次 WiFi 連線+強制重新 NTP 校時+上傳動作）
   還沒校時成功、且距離上次嘗試超過 5 分鐘 → [UPLOAD]（不用等收到裝置讀值，
@@ -189,8 +189,7 @@ Pico W 的 LED 接在 CYW43 晶片的 GPIO0，只能透過 `cyw43_arch_gpio_put(
 
 | 狀態 | 燈號 | 時序 |
 |---|---|---|
-| 開機 BOOTSEL 偵測視窗 | 快閃 | 100ms on / 100ms off |
-| 熱點設定模式 | 常亮 | — |
+| 熱點設定模式（開機自動進入或 KEY0 觸發） | 常亮 | — |
 | BLE 接收－掃描/重連中 | 慢閃 | 1000ms on / 1000ms off |
 | BLE 接收－已連線、正常接收 | 心跳短閃 | 每 2000ms 閃 50ms |
 | 上傳模式 | 快閃 | 150ms on / 150ms off |
@@ -551,7 +550,12 @@ ilspycmd -p -o <輸出資料夾> "$env:APPDATA\FORA Health Care Management Syste
 38. **裝置一直收不到任何 BLE 讀值的話，永遠沒有機會嘗試 NTP 校時**（2026-08-06 使用者提出後調整，見第 2.4 節完整說明）：`wall_clock_sync()` 只有在 `mode_upload_run()` 被呼叫時才會執行，而觸發 UPLOAD 的條件原本是「收到裝置讀值後才開始倒數 idle timeout」，如果裝置一直沒收到任何讀值就永遠不會主動切去 UPLOAD。**修法**：`mode_ble_receive.c` 新增獨立計時器，不依賴有沒有收到過讀值，只要還沒校時成功、且距離上次嘗試超過 5 分鐘（使用者確認的值，固定頻率不做失敗退避）就主動觸發一次 UPLOAD 嘗試校時。
 39. **無螢幕版本使用者拿不到每台裝置唯一衍生的熱點密碼**（2026-08-06 使用者實測反饋後調整）：AP 熱點密碼原本是從 RP2040 board ID 衍生的每台裝置唯一值（見第 24 點），但無螢幕版本沒有任何管道能讓使用者知道衍生出來的密碼是什麼。**修法**：`generate_ap_password()` 改成回傳固定值 `02750963`（所有裝置都一樣，可以事先印在文件/貼紙上）；SSID 仍然維持每台裝置唯一衍生（`generate_ap_ssid()` 不變，只是前綴從 `"PicoGateway-Setup-"` 縮短成 `"GATEWAY-"`，用來分辨機台）。`pico_get_unique_board_id()`／`pico/unique_id.h`／`CMakeLists.txt` 的 `pico_unique_id` 連結都一併移除（不再需要衍生密碼）。
 40. **AP_CONFIG 設定網頁加簡約手機版 CSS 時踩到 printf 格式化字串的坑，一度讓設定頁面打不開/captive portal 偵測失敗**（2026-08-06 使用者實機測試抓到）：`html_append()` 內部用 `vsnprintf()` 實作，所有傳進去的字串都會被當成 printf 格式化字串解析。新加的 CSS 內容 `"width:100%;..."` 裡的 `%` 沒有跳脫成 `%%`，`%;` 不是合法的格式化指定字元，屬於未定義行為，導致設定網頁一度打不開、captive portal 也偵測不到。雖然當下就找到並修好了這個特定問題（`%%` 逃脫），但使用者測試時又發現手機出現「無法連上網路」的提示（之前的版本不會），為了不在測試現場冒風險，**最終決定整個復原成加 CSS/`<label>` 結構之前的版面**，只保留「拿掉 WiFi 訊號強度 dBm 顯示」這一項改動（純文字內容變動，不涉及 CSS，沒有格式化字串風險）。**教訓**：這個檔案裡任何要傳給 `html_append()`/`append()` 的字串（包含 CSS、使用者輸入以外的固定字串），只要包含字面上的 `%` 字元，都必須寫成 `%%`，之後如果再嘗試加 CSS／其他包含 `%` 的內容務必注意這點。電子紙 AP_CONFIG 畫面的 SSID/密碼改用 Font8 顯示（見第 22.5 節、`display_status.c`）不受這次事件影響，維持不變。
-41. **KEY2 歷史畫面只看得到已上傳成功的紀錄，使用者反應不夠用**（2026-08-26 使用者反應後調整，尚未實機測試）：見第 34 點，原本的 `storage_get_recent_upload_history()`／`display_status_show_upload_history()` 只顯示已經上傳成功、進到環狀緩衝（`s_upload_history[]`）的紀錄，還在待傳佇列裡（`PENDING`/`FAILED`）的紀錄完全看不到。**修法**：`storage.c` 新增 `storage_get_recent_records()`，把待傳佇列跟已上傳歷史兩份資料一起按 `received_at_ms` 排序、取最新 max_count 筆（用小型插入排序暫存陣列取代一次性容納全部紀錄的大陣列，避免 Pico 堆疊塞不下最多 128+200 筆的合併陣列）；`display_status.c` 的 `display_status_show_upload_history()` 改名為 `display_status_show_history()`，每一行前面依紀錄自己的 `status` 欄位（`common.h` 的 `upload_status_t`）加一個單字元狀態標記（`+` 已上傳、`!` 上傳失敗、`.` 待傳中）；`mode_ble_receive.c` 的 KEY2 分支跟著改用新函式，`total_count` 也改成待傳筆數＋已上傳歷史筆數的合計。原本的 `storage_get_recent_upload_history()` 已無其他呼叫端，直接移除。
+41. **KEY2 歷史畫面只看得到已上傳成功的紀錄，使用者反應不夠用**（2026-08-26 使用者反應後調整，尚未實機測試）：見第 34 點，原本的 `storage_get_recent_upload_history()`／`display_status_show_upload_history()` 只顯示已經上傳成功、進到環狀緩衝（`s_upload_history[]`）的紀錄，還在待傳佇列裡（`PENDING`/`FAILED`）的紀錄完全看不到。**修法**：`storage.c` 新增 `storage_get_recent_records()`，把待傳佇列跟已上傳歷史兩份資料一起按 `received_at_ms` 排序、取最新 max_count 筆（用小型插入排序暫存陣列取代一次性容納全部紀錄的大陣列，避免 Pico 堆疊塞不下最多 128+200 筆的合併陣列）；`display_status.c` 的 `display_status_show_upload_history()` 改名為 `display_status_show_history()`，每一行前面依紀錄自己的 `status` 欄位（`common.h` 的 `upload_status_t`）加一個單字元狀態標記（`+` 已上傳、`!` 上傳失敗、`.` 待傳中）；`mode_ble_receive.c` 的 KEY2 分支跟著改用新函式，`total_count` 也改成待傳筆數＋已上傳歷史筆數的合計。原本的 `storage_get_recent_upload_history()` 已無其他呼叫端，直接移除。**（2026-08-28 訂正）** 跟程式碼核對後發現這一點描述的修法從來沒有真的落地——`storage_get_recent_records()`／`display_status_show_history()` 這兩個符號在 `storage.c`/`display_status.c` 都找不到，這則筆記是規劃過但沒有實作完成的版本。KEY2 畫面實際上一路維持只顯示已上傳歷史，直到 2026-08-28 才真正改版（見下面第 42 點），改法也不一樣：不是合併顯示，而是反過來預設顯示未上傳、用 KEY2 翻頁。
+42. **KEY2 改成預設顯示未上傳紀錄+可翻頁**（2026-08-28，見上一點的訂正說明、`FIRMWARE_FILES.md`「板載按鍵」章節，尚未實機測試）：新增 `storage_pending_records_page(out, max_count, skip)`，`display_status_show_upload_history()` 改名為 `display_status_show_pending_records()`（加 `page_index`/`page_count` 參數），`mode_ble_receive.c` 新增 `s_history_page`：畫面還顯示著時再按一次 KEY2 翻到下一頁，逾時換回即時畫面後再按則從第 0 頁重新開始。
+43. **AP_CONFIG 設定頁 HTTP server 「單一連線」設計沒有真的強制執行，導致 logo 圖檔顯示不出來/直接開瀏覽器打網址卡住空白頁**（2026-08-28，實機照片回報後追出來，改過兩版才真正解決）：`http_accept_cb()` 原本不管三七二十一，每次新連線進來就直接 `memset()` 蓋掉唯一一份共用的 `http_conn_state_t state`。手機連上熱點後，除了使用者自己開的分頁，iOS 的 Captive Network Assistant 本身也會在背景定期送連通性檢測請求，這些請求另外開連線，容易跟使用者當下的請求（例如 HTML 回應後緊接著另一個連線去要 `/itri_logo.png`）重疊，重疊時後到的連線一 `memset()` 就把前一個連線正在累積的請求資料沖掉。**第一版修法（實測不夠）**：加一個指標擋掉重疊進來的第二個連線（`tcp_abort()` 拒絕）——重新測試後直接開瀏覽器卡住的問題解決了，但 logo 依然顯示不出來：瀏覽器解析到 `<img>` 標籤幾乎立刻另開連線要圖片，這個時間點常常跟第一個連線的 TCP 關閉握手重疊，「擋掉重疊連線」會讓這個圖片請求被拒絕，瀏覽器對子資源載入失敗通常不會重試。**第二版修法**：改成真的支援小量並發——固定大小（`HTTP_MAX_CONCURRENT_CONN` 3 個）的連線池，每個連線各自獨立的 buffer（`alloc_conn_state()`/`free_conn_state()` 管理），連線池用滿才拒絕新連線；`http_err_cb()`（`tcp_err()` 註冊）確保連線異常結束時也會歸還對應的 slot。**這版燒錄後接序列埠看 log 確認**：`GET /itri_logo.png` 有送達、`is_logo_path()` 有正確比對到、印出 `-> serving logo png (8476 bytes)`——連線收發沒問題，問題在更後面。**第三版修法**：這行 log 是在 `tcp_write()` **之前**印的，只代表「準備要送」，`tcp_write()` 回傳值從來沒被檢查過。`lwipopts.h` 的 `MEM_SIZE`（32768）就是 2026-08-26 因為同一種原因（`tcp_write(..., TCP_WRITE_FLAG_COPY)` 資料太大、`MEM_SIZE` 不夠用，直接回傳 `ERR_MEM` 什麼都沒送出去）調高過一次的（見第 40 點）——logo 圖檔（8476 bytes）獨立成路徑後變成單一最大的一筆 `tcp_write()`，連線池讓同時可能有 3 個連線各自送回應，更容易撞上 `MEM_SIZE`。改成 `tcp_write(..., 0)`（不加 `TCP_WRITE_FLAG_COPY`，`ITRI_LOGO_PNG` 是 flash 常駐 `const` 陣列不需要複製），順便補上回傳值檢查。**燒錄後接序列埠確認**：`GET /itri_logo.png` 這次兩個 `tcp_write()` 都成功、沒有出現失敗 log——但手機那邊還是沒看到 logo，代表問題不在傳輸層。第 43 點這三版修法本身都是真實存在的 bug 也真的修好了（連線互相干擾、記憶體不足），只是都不是 logo 顯示不出來的根因。
+
+44. **logo 圖檔顯示不出來的真正根因：原始碼裡的 PNG bytes 陣列本身已經損壞**（2026-08-28，接續第 43 點，跟程式碼比對三版網路層修法都測過之後才找到）：把 `mode_ap_config.c` 的 `ITRI_LOGO_PNG[]` 陣列還原成實際 PNG 檔案、逐一走過每個 chunk 驗證 CRC，發現 PNG 結構完整（簽章/chunk 長度/IEND 都對），但存畫素資料的 `IDAT` chunk CRC 校驗失敗，`zlib` 解壓縮直接報錯 `invalid distance too far back`——壓縮資料流整個壞掉，無法從這份資料還原正確圖片，跟第 43 點修的網路層 bug 完全無關：就算資料完整送達，手機收到的也是張壞圖，瀏覽器本來就顯示不出來。原始素材 `itri_CEL_A.png` 在這個 repo 裡完全找不到，無法還原，改用使用者提供的 `itri_CEL_C.png`（723x168, 7605 bytes，驗證過結構+CRC 全部正確）重新轉成 C 陣列換掉整個 `ITRI_LOGO_PNG[]`，`ITRI_LOGO_PNG_LEN` 巨集同步改成 7605（目前沒有任何地方真的用到這個巨集，`sizeof(ITRI_LOGO_PNG)` 才是實際算長度用的值，純粹保持數字正確不誤導）。**尚未重新實機驗證**：只確認 `cmake --build` 成功。
+45. **表單送出成功頁改成跟設定表單頁統一風格，實機測試後又復原**（2026-08-28，使用者要求）：`SAVED_RESPONSE_HTML` 原本是無樣式的陽春 HTML，先改成套用同一套 logo bar/page-header/card 版面。使用者另外問過要不要改成「送出後彈談窗不跳頁」——評估後維持現在的伺服器端整頁回應（跳頁），因為談窗需要 JS 攔截表單改用 AJAX，這個專案網頁目前完全沒有 JS，且這個表單頁本身 2026-08-06 就曾經因為加 CSS+JS 在實機測試出過問題（見第 40 點），沒有理由現在重新引入。**但加了 CSS 的版本實機測試後使用者回報手機一直出現「無法加入網路」**，跟第 40 點是同一種症狀根因：這個熱點沒有真正的網際網路，作業系統靠連上熱點後對固定探測 URL 的回應內容/大小判斷網路能不能用，任何在連著熱點期間會被請求到的頁面只要加了 CSS/圖片這類會明顯改變回應大小/型態的內容，都可能干擾這個判斷。**已復原成純文字版面**——目前已知這類頁面（表單頁、送出成功頁）不能加豐富樣式，踩過兩次了。
 
 ## 9. 已知限制 / 正式上線前必須處理
 
@@ -580,7 +584,7 @@ pico-vitals-gateway/
 │   ├── GUI_Paint.c/.h       # 畫面 framebuffer + 繪圖/文字 API
 │   ├── Debug.h
 │   └── Fonts/               # 只保留 ASCII 字型（font8/12/16/20/24），沒帶簡體中文字型
-├── qrcode/                  # Nayuki QR-Code-generator，AP_CONFIG 的 WiFi QR code 用，見第 12.7 節
+├── qrcode/                  # Nayuki QR-Code-generator，AP_CONFIG 的 WiFi/設定頁 QR code 用，見第 12.7 節
 │   ├── qrcodegen.c
 │   └── qrcodegen.h
 ├── littlefs/                # Vendored littlefs v2.11.3（BSD-3-Clause），見第 5.1 節
@@ -592,7 +596,6 @@ pico-vitals-gateway/
     ├── main.c
     ├── common.h             # 共用資料型別（device_config_t / vital_record_t / vital_type_t），見第 5 節
     ├── state_machine.c/.h
-    ├── mode_boot_select.c/.h
     ├── mode_ap_config.c/.h
     ├── mode_ble_receive.c/.h
     ├── fora_protocol.c/.h   # 三種 FORA 裝置的協定解析，見第 6 節
@@ -626,7 +629,7 @@ pico-vitals-gateway/
 - 這個型號額外帶的硬體（目前程式碼只用了按鍵，觸控完全沒用到）：
   - **電容觸控**（5 點，觸控 IC 走 **I2C1**：SDA→GP6、SCL→GP7、RST→GP16、INT→GP17，I2C 位址 0x48）。**目前完全沒有實作**，見第 12.8 節未來可能的擴充方向。
   - **KEY0/KEY1/KEY2 三顆板載按鍵**（GP2/GP3/GP15，內建上拉、按下接地）。**目前只用了 KEY0/KEY1**，見第 2.2 節、`src/button_input.c/.h`；KEY2（GP15）保留未用。
-  - **另有一顆 RUN 按鍵**（2026-08-06 實機照片確認，板子上一排總共 4 顆按鍵：RUN/KEY2/KEY1/KEY0），這顆接的是 RP2040 的 **RUN/RESET 腳位**，不是一般 GPIO——按下去等同重置整顆晶片（效果跟拔插電源一樣），韌體完全無法感知、也不需要寫任何程式碼處理。實務上可以「按住 BOOTSEL 同時按一下 RUN」取代「拔插電源＋按住 BOOTSEL」進入 AP_CONFIG，操作更方便，見第 2.2 節。
+  - **另有一顆 RUN 按鍵**（2026-08-06 實機照片確認，板子上一排總共 4 顆按鍵：RUN/KEY2/KEY1/KEY0），這顆接的是 RP2040 的 **RUN/RESET 腳位**，不是一般 GPIO——按下去等同重置整顆晶片（效果跟拔插電源一樣），韌體完全無法感知、也不需要寫任何程式碼處理。**（2026-08-28 更新）** 按一下 RUN 就會重開機、自動進 AP_CONFIG（見第 2.2 節），不再需要搭配按住 BOOTSEL——這條組合鍵是改版前用來取代「拔插電源＋按住 BOOTSEL」的做法，現在拔插電源／按 RUN 效果相同，都可以直接用。
 - 因為現場可能有沒接這片電子紙的「無螢幕版本」（純 Pico W），按鍵/觸控相關程式碼都設計成硬體不存在時安全無害（讀到的一律是預設值，不會誤觸發），見第 2.2 節的說明。
 
 ### 12.2 驅動來源
@@ -695,7 +698,7 @@ Waveshare 資料手冊列了幾點面板保護要求，**其中「不能長時�
 
 | 模式 | 畫面內容 | 對應函式 |
 |---|---|---|
-| AP_CONFIG 熱點設定 | 熱點 SSID/密碼文字、目前已存的個案編號（ASCII 過濾過，沒設定過就顯示 `(unset)`）、操作提示、WiFi QR code（見 12.7 節） | `display_status_show_ap_config()` |
+| AP_CONFIG 熱點設定 | 熱點 SSID/密碼文字、目前已存的個案編號（ASCII 過濾過，沒設定過就顯示 `(unset)`）、操作提示、**兩個並排 QR code**（WiFi 帳密 + 設定頁網址，各自標註用途，見 12.7 節） | `display_status_show_ap_config()` |
 | BLE_RECEIVE | 個案編號（方案 A）、目前狀態（`Scanning (MM/DD HH:MM)`，見下方心跳說明）、體溫/血氧/脈搏/**血糖（協定已實作，見 6.4 節，沒量過的話顯示 `-- (never)`）**/血壓各自最後一筆數值＋時間戳（已校時顯示 `MM/DD HH:MM` 絕對時間，血壓計顯示的是**裝置自己的量測時間**而非 Pico 收到時間，見第 6.3 節；未校時且無裝置時間戳顯示 `unsynced,+Nm`）、**MD6 六合一血糖以外 5 項合併列**（HCT/Ketone/UA/Chol/HB，見下方說明）、**最後一次成功上傳時間**、待上傳筆數 | `display_status_set_ble_receive()` + `display_status_poll()` |
 
 （2026-08-13 版面優化，**已 build 成功，還沒燒錄/肉眼驗證實際排版**：ID 跟狀態文字合併成一行、Last upload 跟 Pending 合併成一行，各省一行螢幕空間；體溫/血氧/脈搏/血糖/血壓五行往上移到 y=22~74，省下來的空間留給 FORA MD6 六合一新增的項目用，見第 6.5 節。）
@@ -708,7 +711,7 @@ Waveshare 資料手冊列了幾點面板保護要求，**其中「不能長時�
 
 局部刷新排程（減少全刷閃爍/縮短刷新時間）曾經做過又移除了，見上面 12.5 節——沒有實測觀察到的具體場景真的需要它，決定維持只用全刷。
 
-### 12.7 AP_CONFIG 的 WiFi QR code（原規劃 Phase 4 提前）
+### 12.7 AP_CONFIG 的 QR code（原規劃 Phase 4 提前；2026-08-28 加了第二個 QR code）
 
 - 手機相機掃到 `WIFI:T:WPA;S:<ssid>;P:<password>;;` 這個特定前綴的字串會自動跳出系統內建的「加入 WiFi」提示——這是業界慣例（源自 ZXing），**QR code 本身沒有什麼特殊格式/模式**，跟顯示純文字/網址的 QR code 用的是同一套編碼方式，差別只在字串內容。SSID/密碼裡如果出現 `\`、`;`、`,`、`:`、`"` 這幾個字元，依慣例要加反斜線跳脫（`display_status.c` 的 `append_escaped_wifi_field()`）——`AP_SSID` 是寫死字串、`generate_ap_password()` 衍生出的密碼固定是 `pico-` 加 8 位十六進位字元，兩者都不會出現這些字元，但當初先做完整這件事現在證實是對的：密碼後來（見第 8.5 節第 24 點）真的從寫死字串改成動態產生了，這個跳脫邏輯不用跟著改。
 - 這個 QR code 編碼的是**熱點本身**的 SSID/密碼（讓手機能連上 Pico 的設定用熱點），**不是**個案要接的目標 WiFi（`device_config_t.wifi_ssid`/`wifi_password`，那組帳密是使用者在熱點頁面的表單裡填的，不會出現在任何 QR code 上）。**2026-08-26 校正（跟 `mode_ap_config.c` 核對後更新）**：熱點 SSID 仍是 `generate_ap_ssid()` 衍生的每台裝置專屬值（`GATEWAY-XXXX`，見第 8.5 節第 24 點）；但密碼**不再是**動態衍生值——見第 8.5 節第 39 點，因為無螢幕版本沒有任何管道能讓使用者知道衍生出來的密碼，密碼已改回固定值 `02750963`（所有裝置共用同一組），QR code 編的就是這個固定密碼加上該台裝置的 SSID。
@@ -716,14 +719,26 @@ Waveshare 資料手冊列了幾點面板保護要求，**其中「不能長時�
 - 畫在 AP_CONFIG 畫面右側（`draw_qr_code()`，把 QR 的每個 module 依比例放大成好幾個實際像素畫上去，四周留白靠 `Paint_Clear(WHITE)` 清出來的背景自然滿足，不用額外處理），文字（SSID/密碼/個案編號/操作提示）留在左側，兩者之間留了足夠間距。
 - ✅ **2026-08-06 已實機掃碼驗證**，見第 7.2 節第 8 點。
 
+**（2026-08-28 加做，尚未實機測試）第二個 QR code——設定頁網址**：使用者反應只有 WiFi QR code 不夠直覺——手機加入熱點後理論上會自動跳出 captive portal，但不同系統/設定有時候不會跳（尤其部分手機的「智慧網路切換」或使用者手動關掉了彈跳頁提示），這種情況下使用者不知道要自己開瀏覽器打 `192.168.4.1`。加了第二個 QR code，編碼 `http://192.168.4.1/`（`display_status.c` 的 `AP_CONFIG_SETUP_URL` 常數，跟 `mode_ap_config.c` 的 `dhcp_server_init()` 用的 gw IP 是同一個值——這兩處沒有共用同一個常數，一個是 lwIP 的 `ip4_addr_t`、一個是給人看/掃的字串，之後如果改 gw IP 要記得兩邊一起改），手機相機掃到會直接跳出開網址的提示，不需要先加入熱點再自己找網址。
+- 兩個 QR code 並排畫在畫面右側：WiFi 帳密在左、設定頁網址在右，各自上方都印一行文字標註是做什麼用的（"Join WiFi:" / "Setup page:"），避免使用者搞不清楚要掃哪一個、掃了會發生什麼事；網址那個下方另外印一行純文字 `192.168.4.1`，QR 掃不了（相機權限、光線不好等）還能用手打。
+- `draw_qr_code()` 同時改成把實際畫出來的 QR 內容置中在傳入的方框裡（原本固定貼齊左上角，方框比實際內容大時右下角會留白）——兩個方框並排時，內容置中看起來才會對齊。
+
+**（2026-08-28 第二版版面調整，使用者實機看過畫面後要求）**：
+1. 標題從 "WiFi Setup" 改短成 "Setup"。
+2. 除了標題以外全部文字統一字級（Font12）——原本 SSID/密碼/兩個 QR 的說明文字是比較窄的 Font8、個案編號是 Font12，粗細大小不一致；改完只有標題（Font16）比其他文字大。
+3. SSID/密碼/個案編號原本是「標籤: 值」同一行，Font12 比 Font8 寬，同一行常常放不下（尤其 SSID 帶了 MAC 衍生字尾），改成標籤跟值統一各佔一行。
+4. 拿掉左側文字欄下方原本的 "Scan QR below ->" 提示行——兩個 QR 自己上方已經有說明文字，這行變多餘。
+5. 兩個 QR code 改成**同樣大小**的方框（`AP_CONFIG_QR_BOX_PX`，88x88px，之前是 96x96/64x64 不一樣大）——WiFi 帳密字串比較長，編出來的 QR 版本（module 數）比較多，同一個方框裡 `draw_qr_code()` 照樣會自動縮小到剛好塞得下，不用個別調整方框大小；缺點是兩個 QR 實際畫出來的清晰度（每個 module 對應的實際像素數）會不一樣——網址短、module 少，同樣的方框裡每個 module 能分到比較多像素，比 WiFi 那個更清楚。
+- **尚未實機測試**：只驗證過 `cmake --build` 成功，還沒有肉眼確認電子紙螢幕上的實際排版、也沒有拿手機實際掃過這個新的網址 QR code。
+
 ### 12.8 板載按鍵（2026-08-06 加做，尚未實機測試）
 
 見第 2.2 節完整說明。實際硬體是 Pico-CapTouch-ePaper-2.9（見 12.1 節），帶 KEY0/KEY1/KEY2 三顆按鍵跟一組電容觸控 IC。`src/button_input.c/.h` 負責讀取，`mode_ble_receive.c` 的主迴圈輪詢：
 - **KEY0**：長按 3 秒進 AP_CONFIG，回傳新增的 `mode_ble_receive_exit_t` 列舉值告知 `state_machine.c` 該切去哪個模式。
 - **KEY1**：按一下手動觸發上傳，跳過 idle timeout 等待；同時呼叫 `wall_clock_request_resync()`（2026-08-06 加做，尚未實機測試）強制這次上傳前重新查詢 NTP，不管距離上次成功校時是否還沒超過 `NTP_RESYNC_INTERVAL_MS`（6 小時，見 `wall_clock.c`）——手動觸發時使用者通常也想確認時間校得準不準，不要被例行的省電/省網路節流擋下來。
-- **KEY2（2026-08-06 加做，尚未實機測試）**：顯示已上傳歷史摘要畫面（`display_status_show_upload_history()`，最多 7 筆，見 `storage_get_recent_upload_history()`），顯示 8 秒後自動換回 BLE_RECEIVE 即時畫面。這是先前討論觸控方案時評估後選的低成本替代方案——不用碰觸控 IC、不用重新引入局部刷新，直接複用現有全刷機制解決「看不到已上傳歷史」的缺口。顯示期間 `mode_ble_receive_run()` 主迴圈會暫停呼叫 `display_status_poll()`（不然畫面會馬上被即時內容蓋掉），逾時後恢復輪詢；BLE 掃描/連線本身不受影響，暫停的只有畫面刷新。
+- **KEY2（2026-08-06 加做；2026-08-28 改成顯示未上傳紀錄+可翻頁）**：顯示未上傳（`PENDING`/`FAILED`）紀錄畫面（`display_status_show_pending_records()`，一次一頁、每頁最多 7 筆，見 `storage_pending_records_page()`），顯示 8 秒後自動換回 BLE_RECEIVE 即時畫面。這是先前討論觸控方案時評估後選的低成本替代方案——不用碰觸控 IC、不用重新引入局部刷新，直接複用現有全刷機制。原本（2026-08-06）顯示的是已上傳歷史（`display_status_show_upload_history()`／`storage_get_recent_upload_history()`），使用者反應看不到還在待傳/上傳失敗的東西不夠用，改成反過來：預設顯示未上傳，畫面還顯示著的時候再按一次 KEY2 會翻到下一頁（`s_history_page`，翻完最後一頁繞回第 0 頁），逾時換回即時畫面之後再按則從第 0 頁重新開始；每筆記錄前面標一個字元區分狀態（`.` 待傳中、`!` 上傳失敗過）。顯示期間 `mode_ble_receive_run()` 主迴圈會暫停呼叫 `display_status_poll()`（不然畫面會馬上被即時內容蓋掉），逾時後恢復輪詢；BLE 掃描/連線本身不受影響，暫停的只有畫面刷新。**尚未實機測試**：只驗證過 `cmake --build` 成功。
 
-**設計上刻意不影響任何現有機制**：BOOTSEL 開機視窗（第 2.2 節）、idle timeout 自動上傳（第 3 節）都原封不動保留，KEY0/KEY1/KEY2 只是新增的觸發路徑，跟原本的路徑並存。GPIO 用軟體內建上拉讀取，沒有接這片電子紙的「無螢幕版本」永遠讀到「沒按下」，不需要任何編譯選項區分兩種硬體。
+**設計上刻意不影響 idle timeout 自動上傳（第 3 節）**：KEY0/KEY1/KEY2 只是新增的觸發路徑，跟原本的路徑並存。GPIO 用軟體內建上拉讀取，沒有接這片電子紙的「無螢幕版本」永遠讀到「沒按下」，不需要任何編譯選項區分兩種硬體。**（2026-08-28 更新）** 原本這裡還提到「BOOTSEL 開機視窗原封不動保留」——這條路徑跟對應的 `mode_boot_select.c/.h` 已經整個移除（見第 2.2 節），開機不再需要按任何按鍵，一律直接進 AP_CONFIG。
 
 **觸控（5 點電容觸控，I2C1 走 GP6/GP7/GP16/GP17，見 12.1 節）目前完全沒有實作，也沒有計畫做**：評估後認為觸控+局部刷新的完整方案（新驅動、新 UI、重新引入局刷）工作量/風險不小，KEY2 陽春文字畫面已經解決核心需求（看得到歷史），觸控維持只是預留的擴充空間。
 

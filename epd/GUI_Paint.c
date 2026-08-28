@@ -580,7 +580,16 @@ void Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString,
             Xpoint = Xstart;
             Ypoint = Ystart;
         }
-        Paint_DrawChar(Xpoint, Ypoint, * pString, Font, Color_Background, Color_Foreground);
+        // 2026-08-28 本地修正：Waveshare 原版這裡把 Color_Foreground/Color_Background
+        // 傳反了（呼叫 Paint_DrawChar() 時兩個參數對調），導致每個字元都變成
+        // 「字元格背景畫成前景色、筆畫畫成背景色」——這個專案的呼叫端一律傳
+        // (BLACK, WHITE) 期望白底黑字，中招後變成每個字元自己一個黑底白字的
+        // 小方塊（實機照片確認：SSID/Setup/ID 等文字都是黑底白字，QR code
+        // 不受影響，因為 QR 是直接呼叫 Paint_SetPixel() 畫的，沒有經過這個函式）。
+        // 下面 Paint_DrawNum() 呼叫這個函式時也對調了参數，是用來抵銷這裡的錯誤
+        // （兩次對調互相抵銷、Paint_DrawNum() 本身沒有這個問題）——這裡修正後，
+        // Paint_DrawNum() 那邊的對調也要一併拿掉，不然會變成它自己中招。
+        Paint_DrawChar(Xpoint, Ypoint, * pString, Font, Color_Foreground, Color_Background);
 
         //The next character of the address
         pString ++;
@@ -726,7 +735,10 @@ void Paint_DrawNum(UWORD Xpoint, UWORD Ypoint, int32_t Nummber,
     }
 
     //show
-    Paint_DrawString_EN(Xpoint, Ypoint, (const char*)pStr, Font, Color_Background, Color_Foreground);
+    // 2026-08-28 本地修正：原本這裡對調參數是用來抵銷 Paint_DrawString_EN()
+    // 內部的反色 bug（見該函式的說明），那個 bug 已經修正，這裡的對調要跟著
+    // 拿掉，不然會變成這個函式自己反色。
+    Paint_DrawString_EN(Xpoint, Ypoint, (const char*)pStr, Font, Color_Foreground, Color_Background);
 }
 
 /******************************************************************************
@@ -746,15 +758,18 @@ void Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font,
 
     UWORD Dx = Font->Width;
 
+    // 2026-08-28 本地修正：這幾個呼叫原本也是 Color_Foreground/Color_Background
+    // 對調（跟 Paint_DrawString_EN() 內部同樣的 bug，見該函式的說明），這個函式
+    // 目前這個專案沒有呼叫，但既然是同一個檔案裡同樣的錯誤，一併修正。
     //Write data into the cache
-    Paint_DrawChar(Xstart                           , Ystart, value[pTime->Hour / 10], Font, Color_Background, Color_Foreground);
-    Paint_DrawChar(Xstart + Dx                      , Ystart, value[pTime->Hour % 10], Font, Color_Background, Color_Foreground);
-    Paint_DrawChar(Xstart + Dx  + Dx / 4 + Dx / 2   , Ystart, ':'                    , Font, Color_Background, Color_Foreground);
-    Paint_DrawChar(Xstart + Dx * 2 + Dx / 2         , Ystart, value[pTime->Min / 10] , Font, Color_Background, Color_Foreground);
-    Paint_DrawChar(Xstart + Dx * 3 + Dx / 2         , Ystart, value[pTime->Min % 10] , Font, Color_Background, Color_Foreground);
-    Paint_DrawChar(Xstart + Dx * 4 + Dx / 2 - Dx / 4, Ystart, ':'                    , Font, Color_Background, Color_Foreground);
-    Paint_DrawChar(Xstart + Dx * 5                  , Ystart, value[pTime->Sec / 10] , Font, Color_Background, Color_Foreground);
-    Paint_DrawChar(Xstart + Dx * 6                  , Ystart, value[pTime->Sec % 10] , Font, Color_Background, Color_Foreground);
+    Paint_DrawChar(Xstart                           , Ystart, value[pTime->Hour / 10], Font, Color_Foreground, Color_Background);
+    Paint_DrawChar(Xstart + Dx                      , Ystart, value[pTime->Hour % 10], Font, Color_Foreground, Color_Background);
+    Paint_DrawChar(Xstart + Dx  + Dx / 4 + Dx / 2   , Ystart, ':'                    , Font, Color_Foreground, Color_Background);
+    Paint_DrawChar(Xstart + Dx * 2 + Dx / 2         , Ystart, value[pTime->Min / 10] , Font, Color_Foreground, Color_Background);
+    Paint_DrawChar(Xstart + Dx * 3 + Dx / 2         , Ystart, value[pTime->Min % 10] , Font, Color_Foreground, Color_Background);
+    Paint_DrawChar(Xstart + Dx * 4 + Dx / 2 - Dx / 4, Ystart, ':'                    , Font, Color_Foreground, Color_Background);
+    Paint_DrawChar(Xstart + Dx * 5                  , Ystart, value[pTime->Sec / 10] , Font, Color_Foreground, Color_Background);
+    Paint_DrawChar(Xstart + Dx * 6                  , Ystart, value[pTime->Sec % 10] , Font, Color_Foreground, Color_Background);
 }
 
 /******************************************************************************

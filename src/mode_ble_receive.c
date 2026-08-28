@@ -16,10 +16,12 @@
 #include <string.h>
 
 // KEY0 需要連續按住這麼久才會觸發進入熱點設定模式（見 button_input.h），
-// 避免不小心碰到就誤觸發；跟開機時「按住 BOOTSEL」的窗口時間量級一致。
+// 避免不小心碰到就誤觸發。
 #define KEY0_ENTER_CONFIG_HOLD_MS 3000
 
-// KEY2 觸發已上傳歷史畫面，顯示這麼久之後自動換回 BLE_RECEIVE 即時畫面。
+// KEY2 觸發未上傳（PENDING/FAILED）紀錄畫面（見 storage_pending_records_page()），
+// 顯示這麼久沒有再按 KEY2 翻頁就自動換回 BLE_RECEIVE 即時畫面；期間每按一次
+// KEY2 都會重新從這個時間量開始倒數。
 #define KEY2_HISTORY_VIEW_MS 8000
 #define KEY2_HISTORY_DISPLAY_ROWS 7
 
@@ -276,6 +278,11 @@ static absolute_time_t s_last_ntp_retry_at;
 // BLE_RECEIVE 即時內容蓋掉，見主迴圈裡的說明。
 static bool s_showing_history = false;
 static absolute_time_t s_history_view_until;
+// 目前顯示第幾頁（0 起算）：s_showing_history 為 false 時（畫面已經換回
+// BLE_RECEIVE 或是這次開機第一次按 KEY2）按下 KEY2 一律從第 0 頁重新開始；
+// s_showing_history 已經是 true（使用者連續按著在翻頁）才會往下一頁推進，
+// 見主迴圈 KEY2 分支的說明。
+static size_t s_history_page = 0;
 
 // 組出「Scanning (last: HH:MM)」這種帶時間戳的狀態文字並更新畫面
 // （display_status_set_ble_receive() 本身不會馬上刷新面板，實際刷新由
@@ -1367,12 +1374,23 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
             return MODE_BLE_RECEIVE_EXIT_UPLOAD;
         }
 
+        // KEY2：顯示未上傳（PENDING/FAILED）紀錄，一次一頁。第一次按（或畫面
+        // 已經逾時換回 BLE_RECEIVE 之後再按）固定從第 0 頁開始；畫面還顯示著
+        // 的時候再按一次則翻到下一頁，翻完最後一頁繞回第 0 頁。
         if (button_input_key2_pressed()) {
-            vital_record_t history[KEY2_HISTORY_DISPLAY_ROWS];
-            size_t shown = storage_get_recent_upload_history(history, KEY2_HISTORY_DISPLAY_ROWS);
-            size_t total = storage_get_upload_history_count();
-            printf("[BLE] KEY2 pressed, showing upload history (%u/%u).\n", (unsigned)shown, (unsigned)total);
-            display_status_show_upload_history(history, shown, total);
+            size_t total = storage_pending_count();
+            size_t page_count = total == 0 ? 1 : (total + KEY2_HISTORY_DISPLAY_ROWS - 1) / KEY2_HISTORY_DISPLAY_ROWS;
+            if (s_showing_history) {
+                s_history_page = (s_history_page + 1) % page_count;
+            } else {
+                s_history_page = 0;
+            }
+            vital_record_t page_records[KEY2_HISTORY_DISPLAY_ROWS];
+            size_t shown = storage_pending_records_page(page_records, KEY2_HISTORY_DISPLAY_ROWS,
+                                                          s_history_page * KEY2_HISTORY_DISPLAY_ROWS);
+            printf("[BLE] KEY2 pressed, showing pending records page %u/%u (%u shown, %u total).\n",
+                   (unsigned)(s_history_page + 1), (unsigned)page_count, (unsigned)shown, (unsigned)total);
+            display_status_show_pending_records(page_records, shown, total, s_history_page, page_count);
             s_showing_history = true;
             s_history_view_until = make_timeout_time_ms(KEY2_HISTORY_VIEW_MS);
         }
