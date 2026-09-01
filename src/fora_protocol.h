@@ -96,6 +96,16 @@ void fora_protocol_measured_key_to_datetime(
 // （見 common.h 的 LOCAL_UTC_OFFSET_SEC）。
 uint64_t fora_protocol_measured_key_to_epoch_ms(uint32_t key);
 
+// 幫一筆讀值決定「該用哪個時間」，規則跟畫面顯示（display_status.c 的
+// format_reading_clock()）完全一致：裝置自己有回報量測時間戳（device_measured_key
+// 非 0，目前只有 D40/MD6 有）且跟 Pico 已校時的現在時間比對起來合理，就用裝置
+// 的時間；裝置時鐘不合理，或 Pico 根本沒校時過，才退回中繼器收到這筆資料當下
+// 的時間（received_at_boot_ms，boot-relative，會在函式內部換算成 epoch）。
+// 2026-08-31 新增，讓上傳（mode_upload.c/upload_api.c）跟畫面顯示套用同一套
+// 判斷，不會出現「螢幕顯示裝置量測時間，後端卻收到上傳當下時間」這種不一致
+// ——呼叫前不需要先檢查 wall_clock_is_synced()，這個函式自己會處理。
+uint64_t fora_protocol_resolve_epoch_ms(uint64_t received_at_boot_ms, uint32_t device_measured_key);
+
 // 手上目前有的三種 FORA OEM 裝置，都走同一套 Nordic LED/Button Service
 // 自訂 pipe，只有封包格式不同；血壓計這個 kind 同時涵蓋血壓跟血糖兩種資料
 // （見上方協定說明），血糖不是獨立的 kind，因為裝置廣播/連線階段無法分辨，

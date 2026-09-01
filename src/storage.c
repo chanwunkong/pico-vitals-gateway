@@ -22,7 +22,16 @@
 // 之後新增裝置種類就要改 flash 格式。
 #define MAX_BACKFILL_ANCHOR_KINDS 8
 
-#define MAX_PENDING_RECORDS 128
+// 2026-08-31 從 128 調高到 640（5 倍，不是原本要求的 10 倍）：10 倍會讓
+// .bss 從 264KB SRAM 的 66.7% 推到 83.8%，只剩約 43KB 給 heap/stack（WiFi
+// cyw43+lwIP、藍牙 BTstack 動態配置都在這裡跑，雖然兩者不會同時開，見專案
+// 「單一無線擁有者」原則，但個別高峰用量都可能不小）；5 倍只多吃約 20KB，
+// 剩餘 heap/stack 空間跟改之前差距不大。另外 persist_pending_records() 是
+// 「整份待傳清單覆寫回 flash」，寫入量＝目前實際筆數×sizeof(vital_record_t)，
+// 佇列快滿時（長時間離線累積大量待傳資料，也就是這次調大容量原本要解決的
+// 情境）單次 flash 寫入量會跟著逼近上限，5 倍下最壞情況約 25.6KB，比 10 倍
+// 的 51KB 對 BLE 連線時序的干擾風險小很多。
+#define MAX_PENDING_RECORDS 640
 
 // 上傳成功後紀錄不會立刻消失，保留最近 MAX_UPLOAD_HISTORY 筆已上傳的紀錄
 // （環狀緩衝，滿了覆蓋最舊的一筆），見 storage_get_upload_history()。

@@ -76,21 +76,25 @@
 // 一定要先送過一次 index=0 的查詢，才能送 index>0 的查詢，不然裝置會回
 // 「incorrect or unexpected data」（文件原文）。
 //
-// 這個「裝置自己記書籤」的設計代表我們不需要像 FORA MD6/D40 backfill 那樣
-// 自己在 flash 存一份「上次同步到哪」的定位點（storage.c 的
-// storage_get_backfill_anchor()／storage_set_backfill_anchor()）——每次連線
-// 只要讀 index=0 拿到 last_transmission_index，從 +1 開始往上讀到
-// total_count，讀過的 index 會被裝置自動記住，下次連線的 last_transmission_
-// index 自然就是上次讀到的地方，不會重複讀到已經讀過的記錄。前提是這個書籤
-// 是裝置端全域狀態、不是每個藍牙連線各自獨立——協定文件沒有明講這點，是從
-// 「App 應該從 4th record 開始讀」這種跨 session 接續的範例推斷出來的，
-// 2026-08-28 還沒有實機測試驗證過（見 PROJECT_PLAN.md）。
+// 原本規劃「裝置自己記書籤」可以省掉像 FORA MD6/D40 backfill 那樣自己在
+// flash 存一份「上次同步到哪」的定位點——但 2026-09-01 實機測試推翻了這個
+// 假設：同一台裝置前後兩次連線分別讀到 total=2/last=1、total=3/last=3，
+// 第二次的書籤直接追上新的總筆數，即使 Gateway 從來沒有成功送出過一次
+// TYPE 2 讀取——代表 last_transmission_index **不是**「這個 App 上次同步到
+// 哪」的可信賴書籤（協定文件本來就沒明講這點是不是全域/跨連線持久狀態，
+// 2026-08-28 加這段說明時就已經標記還沒驗證過，見 PROJECT_PLAN.md）。
+// mode_ble_receive.c 現在改成不管這個欄位顯示什麼，每次連線都固定重讀
+// index=1..total_count，交給 storage_append_record() 的去重邏輯擋掉重複，
+// 這裡的欄位保留純粹是印 log 參考用，不再用來決定要不要讀。
 #define RIGHTEST_CMD_READ_RECORD    0x61
 #define RIGHTEST_RETURN_READ_RECORD 0x9E
 
 // TYPE 1（index=0）回應：0x4F 0x9E 0x00 0x00 total_lo total_hi max_lo max_hi
-// last_lo last_hi CS，共 11 bytes（跟 TYPE 2 的回應長度不同——TYPE 2 多了
-// 10 bytes 的 Reserve 欄位，見協定文件 Read One Record 的兩張表格）。
+// last_lo last_hi [10 bytes reserved] CS，共 21 bytes——**協定文件寫的是
+// 11 bytes（沒有這 10 bytes reserved 尾巴），2026-08-31 實機測試證實文件
+// 寫錯，實際跟 TYPE 2 一樣是 21 bytes**，多出來的 10 bytes reserved 內容
+// 目前不解析，見 rightest_protocol.c rightest_protocol_parse_record_summary()
+// 的說明。
 typedef struct {
     uint16_t total_count;             // 裝置目前存有幾筆記錄
     uint16_t max_capacity;            // 裝置最多能存幾筆（協定文件範例 500）
@@ -105,8 +109,9 @@ size_t rightest_protocol_build_command(uint8_t cmd, const uint8_t *data, uint8_t
 // 驗證一筆已經重組完整的回應 frame：header 是不是 0x4F、checksum 對不對。
 bool rightest_protocol_verify_response(const uint8_t *frame, size_t frame_len);
 
-// 解析 TYPE 1（index=0）回應（frame 至少要 11 bytes，header/return-id/
-// checksum 都要驗證通過），成功回傳 true。
+// 解析 TYPE 1（index=0）回應（frame 要剛好 21 bytes，header/return-id/
+// checksum 都要驗證通過——2026-08-31 實機證實跟文件寫的 11 bytes 不同，
+// 見上面 rightest_record_summary_t 宣告處的說明），成功回傳 true。
 bool rightest_protocol_parse_record_summary(const uint8_t *frame, size_t frame_len, rightest_record_summary_t *out);
 
 // 解析 TYPE 2（index>0）回應成一筆 vital_record_t，成功回傳 true。

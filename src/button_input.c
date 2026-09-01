@@ -45,13 +45,48 @@ bool button_input_key0_long_press(uint32_t hold_ms) {
     return false;
 }
 
+// 短按（放開時判定）、長按（按住達門檻時判定）各自獨立追蹤自己的按下/放開
+// 時間，不共用內部狀態——見 button_input.h 的說明，兩者都是從同一個
+// key_is_pressed(KEY1_PIN) 讀值算起，各自算出來的「這次按下是什麼時候開始
+// 的」自然一致，不需要互相協調。
 static bool s_key1_was_pressed = false;
+static absolute_time_t s_key1_press_started;
 
-bool button_input_key1_pressed(void) {
+bool button_input_key1_pressed(uint32_t long_press_threshold_ms) {
     bool pressed = key_is_pressed(KEY1_PIN);
-    bool edge = pressed && !s_key1_was_pressed;
+    bool fired = false;
+    if (pressed && !s_key1_was_pressed) {
+        s_key1_press_started = get_absolute_time();
+    } else if (!pressed && s_key1_was_pressed) {
+        int64_t held_ms = absolute_time_diff_us(s_key1_press_started, get_absolute_time()) / 1000;
+        if (held_ms < (int64_t)long_press_threshold_ms) {
+            fired = true;
+        }
+    }
     s_key1_was_pressed = pressed;
-    return edge;
+    return fired;
+}
+
+static bool s_key1_long_was_pressed = false;
+static bool s_key1_long_triggered = false;
+static absolute_time_t s_key1_long_press_started;
+
+bool button_input_key1_long_press(uint32_t hold_ms) {
+    bool pressed = key_is_pressed(KEY1_PIN);
+    if (pressed && !s_key1_long_was_pressed) {
+        s_key1_long_press_started = get_absolute_time();
+        s_key1_long_triggered = false;
+    }
+    s_key1_long_was_pressed = pressed;
+
+    if (!pressed || s_key1_long_triggered) {
+        return false;
+    }
+    if (absolute_time_diff_us(s_key1_long_press_started, get_absolute_time()) / 1000 >= (int64_t)hold_ms) {
+        s_key1_long_triggered = true;
+        return true;
+    }
+    return false;
 }
 
 static bool s_key2_was_pressed = false;

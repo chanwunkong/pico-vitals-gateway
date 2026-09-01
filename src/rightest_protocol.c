@@ -32,9 +32,16 @@ bool rightest_protocol_verify_response(const uint8_t *frame, size_t frame_len) {
 }
 
 bool rightest_protocol_parse_record_summary(const uint8_t *frame, size_t frame_len, rightest_record_summary_t *out) {
-    // TYPE 1 回應固定 11 bytes：0x4F 0x9E 0x00 0x00 DA_0..DA_5 CS（見
-    // rightest_protocol.h 的說明，跟 TYPE 2 的 21 bytes 不一樣長）。
-    if (frame_len != 11 || !rightest_protocol_verify_response(frame, frame_len)) {
+    // 2026-08-31 實機測試推翻協定文件：文件寫 TYPE 1 回應固定 11 bytes
+    // （0x4F 0x9E 0x00 0x00 total/max/last CS），但實機重組後拿到的是完整
+    // 21 bytes，跟 TYPE 2 一樣長，多出來的 10 bytes 接在 last_transmission_
+    // index 後面（frame[10..19]，checksum 在 frame[20]）——checksum 驗證
+    // 通過、total_count=2/max_capacity=500/last_transmission_index=1 這組
+    // 數字完全合理（max_capacity 500 還跟文件範例數字一致），確定不是雜訊，
+    // 是文件沒寫準的地方。這 10 bytes reserved 內容目前不解析（frame[10..19]
+    // 那次實測樣本剛好像是裝置序號字串尾端 "987(C)" 加兩個位元組，猜測跟
+    // TYPE 2 的 reserved 欄位是同一種用途，不確定，見 PROJECT_PLAN.md）。
+    if (frame_len != 21 || !rightest_protocol_verify_response(frame, frame_len)) {
         return false;
     }
     if (frame[1] != RIGHTEST_RETURN_READ_RECORD || frame[2] != 0x00 || frame[3] != 0x00) {

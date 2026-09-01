@@ -1,4 +1,5 @@
 #include "fora_protocol.h"
+#include "wall_clock.h"
 
 #include "btstack.h"
 
@@ -71,6 +72,17 @@ uint64_t fora_protocol_measured_key_to_epoch_ms(uint32_t key) {
     int64_t local_sec = days * 86400 + (int64_t)hour * 3600 + (int64_t)minute * 60;
     int64_t utc_sec = local_sec - LOCAL_UTC_OFFSET_SEC;
     return (uint64_t)(utc_sec * 1000);
+}
+
+uint64_t fora_protocol_resolve_epoch_ms(uint64_t received_at_boot_ms, uint32_t device_measured_key) {
+    if (device_measured_key != 0) {
+        uint64_t device_epoch_ms = fora_protocol_measured_key_to_epoch_ms(device_measured_key);
+        if (!wall_clock_is_synced() ||
+            wall_clock_epoch_is_plausible(device_epoch_ms, DEVICE_CLOCK_SANITY_WINDOW_MS)) {
+            return device_epoch_ms;
+        }
+    }
+    return wall_clock_to_epoch_ms(received_at_boot_ms);
 }
 
 bool fora_protocol_matches_advertisement(

@@ -16,11 +16,21 @@ void button_input_init(void);
 // AP_CONFIG 裡取消用 1 秒），追蹤的是同一個實體按鍵的連續按住時間，不會互相干擾。
 bool button_input_key0_long_press(uint32_t hold_ms);
 
-// KEY1 邊緣觸發：偵測到「這一次輪詢按下、上一次輪詢沒按下」才回傳 true，
-// 放開再重新按一次才會再觸發一次。
-bool button_input_key1_pressed(void);
+// KEY1 短按：跟下面的 button_input_key1_long_press() 共用同一顆實體按鍵，
+// 用按住時間長短分流成兩種動作（2026-09-01 起，之前只有短按一種手勢）。
+// 在「放開的那一刻」才判定，且只有按住時間小於 long_press_threshold_ms
+// 才算數——按住超過門檻的話，那次放開不會觸發短按（因為已經被長按那邊在
+// 按住期間搶先觸發過了），呼叫端要傳跟 button_input_key1_long_press() 同一個
+// hold_ms，兩邊門檻才會一致。
+bool button_input_key1_pressed(uint32_t long_press_threshold_ms);
 
-// KEY2 邊緣觸發，用法同 button_input_key1_pressed()。
+// KEY1 長按：用法同 button_input_key0_long_press()，按住達 hold_ms 才回傳一次
+// true，放開後重新計時。跟上面 button_input_key1_pressed() 各自獨立追蹤按下/
+// 放開時間，不共用內部狀態，但呼叫端要傳相同的 hold_ms 值，語意才會一致
+// （短按＝放開時按住時間 < hold_ms，長按＝按住時間達到 hold_ms）。
+bool button_input_key1_long_press(uint32_t hold_ms);
+
+// KEY2 邊緣觸發，用法同 button_input_key1_pressed() 的短按版本（沒有長按）。
 bool button_input_key2_pressed(void);
 
 // KEY2 這一刻是不是正被按住——跟上面的邊緣觸發版本是分開的即時讀值，開機時

@@ -14,9 +14,33 @@
 
 #include <stdio.h>
 
-// 30 秒是留給 DHCP 重試＋認證本身的餘裕。
-#define WIFI_CONNECT_TIMEOUT_MS 30000
+// 2026-09-01 使用者要求把「怎麼重試都不會成功」情況下卡在連線嘗試的時間壓到
+// 1 分鐘以內：5 種認證模式 × 12 秒＝最壞 60 秒，比原本 30 秒/種（最壞 150
+// 秒）快很多。合法網路通常第一個對的認證模式幾秒內就會連上（成功是看
+// link/IP 狀態，不是等滿這個逾時），這個常數只影響「注定連不上」的失敗路徑
+// 要多久才放棄，不影響正常連線的速度。
+#define WIFI_CONNECT_TIMEOUT_MS 12000
 #define MAX_BATCH_SIZE 32
+
+// WiFi 連線失敗後的退避冷卻期。如果 WiFi 密碼/SSID 設錯這種「怎麼重試都不會
+// 成功」的情況完全沒有退避機制，mode_ble_receive.c 的自動觸發條件（NTP 還沒
+// 校時成功的定期重試、待傳佇列閒置逾時）會一直把裝置拉回來做這個注定失敗的
+// 連線嘗試，掃描 BLE 裝置的時間被壓縮，使用者觀感上就像「卡在 WiFi 連線失敗
+// 畫面回不去」。2026-09-01 使用者要求從 5 分鐘拉長到約 1 小時，換取密碼設錯
+// 期間裝置能把絕大部分時間留給正常的 BLE 掃描/量測，不要一直做白工的連線
+// 嘗試——代價是密碼設錯之後最長要等 1 小時才會再自動重試一次（KEY1 手動觸發
+// 不受這個限制，見 mode_ble_receive.c KEY1 分支的說明，想立刻重試可以直接按
+// 中鍵）。NTP 重試（mode_ble_receive.c 的 NTP_UNSYNCED_RETRY_MS，5 分鐘）跟
+// 這個常數不再刻意對齊——NTP 重試的計時器一樣每 5 分鐘到期，但只要
+// mode_upload_in_backoff() 回傳 true 就會被擋下，實際觸發間隔由這裡決定。
+#define WIFI_FAILURE_BACKOFF_MS (60 * 60 * 1000)
+
+static absolute_time_t s_backoff_until;
+static bool s_in_backoff = false;
+
+bool mode_upload_in_backoff(void) {
+    return s_in_backoff && !time_reached(s_backoff_until);
+}
 
 // 認證模式不寫死——分享器種類很多，依常見程度排序嘗試，直到成功或全部試完。
 static const uint32_t WIFI_AUTH_MODES_TO_TRY[] = {
@@ -99,12 +123,18 @@ void mode_upload_run(void) {
 
     if (connect_result != 0) {
         printf("[UPLOAD] WiFi connect failed after trying all auth modes (rc=%d)\n", connect_result);
+        s_backoff_until = make_timeout_time_ms(WIFI_FAILURE_BACKOFF_MS);
+        s_in_backoff = true;
         led_status_set(LED_ERROR_BURST);
         display_status_show_error("WiFi connect failed, will retry");
         sleep_ms(1000);
         cyw43_arch_disable_sta_mode();
         return;
     }
+
+    // 連線成功了，之前累積的退避狀態（如果有）不用再等，清掉讓下一次失敗
+    // 重新起算冷卻期。
+    s_in_backoff = false;
 
     vital_record_t batch[MAX_BATCH_SIZE];
     size_t count = storage_pending_records(batch, MAX_BATCH_SIZE);
@@ -127,10 +157,14 @@ void mode_upload_run(void) {
         // 好幾次測試各自的血糖值），細分後才會各自送一次上傳請求，不會像
         // 以前那樣同一個 type 好幾筆值被硬塞進同一個 JSON、只有最後一筆送得
         // 出去（見 PROJECT_PLAN.md 第 6.5 節的說明）。
-        // uploadTime 是「上傳當下」的真實世界時間，不是個別讀值的量測時間——
-        // 校時失敗的話 wall_clock_is_synced() 是 false，upload_api_post_batch()
-        // 會整個省略 uploadTime 欄位，不會謊報一個假的時間戳。
-        uint64_t upload_time_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
+        // uploadTime 欄位以前是「上傳當下」的真實世界時間，不是個別讀值的量測
+        // 時間——2026-08-31 改成每一組各自呼叫 fora_protocol_resolve_epoch_ms()
+        // 算出「這組該用的時間」，規則跟畫面顯示完全一樣：D40/MD6 有裝置自己的
+        // 量測時間就優先用那個，額溫槍/血氧計沒有裝置時間戳，退回中繼器收到這組
+        // 資料當下的時間——不再是「上傳當下」，改掉「出門在外量測、晚上回家才
+        // 連線，記錄卻變成晚上的時間」這個問題。校時失敗的話 wall_clock_is_synced()
+        // 是 false，upload_api_post_batch() 會整個省略 uploadTime 欄位，不會謊報
+        // 一個假的時間戳，這點行為不變。
         bool synced = wall_clock_is_synced();
 
         size_t groups_sent = 0;
@@ -166,9 +200,15 @@ void mode_upload_run(void) {
                     }
                 }
                 groups_sent++;
+                // 同一組裡的紀錄 source_kind/device_measured_key 都相同（分組依據），
+                // 用第一筆的 received_at_ms 代表整組即可；synced 為 false 時這個值
+                // 不會被用到（upload_api_post_batch() 看 synced 決定要不要送出欄位）。
+                uint64_t group_epoch_ms = synced
+                    ? fora_protocol_resolve_epoch_ms(group[0].received_at_ms, group[0].device_measured_key)
+                    : 0;
                 bool ok = upload_api_post_batch(config.patient_id, config.upload_server_host,
                                                  config.upload_api_key, group, group_count,
-                                                 upload_time_ms, synced, (uint8_t)kind);
+                                                 group_epoch_ms, synced, (uint8_t)kind);
                 printf("[UPLOAD] upload_api_post_batch() kind=%d measured_key=%u (%u record(s)) -> %s\n",
                        kind, (unsigned)seen_keys[sk], (unsigned)group_count, ok ? "success" : "failed");
                 // 依（裝置種類＋時間點）分開標記結果——storage_mark_uploaded_for_group()

@@ -703,10 +703,13 @@ static void scan_nearby_wifi(void) {
 // ——extract_field() 找不到欄位就回傳 false，值維持 memset 的空字串，接著
 // 既有的「留空＝沿用目前設定值」那段邏輯就會把 s_current_config 裡的舊值
 // 原封不動地繼續存回去，不用另外寫程式碼去「保留」它們，也不會被這個表單
-// 覆蓋成空白)。同時使用者要求「欄位裡面也不要預填任何東西」——WiFi 名稱
-// 下拉選單不會預先選到目前的網路、身分證字號欄位也不會帶入舊值（身分證字號
-// 因此改成每次都要求使用者重新輸入＋驗證檢查碼，不再有「留空＝沿用舊值」
-// 這條路，比較符合「這欄位本來就該每次明確確認」的臨床意義）。
+// 覆蓋成空白)。
+//
+// 2026-08-31 使用者改要求「自動帶入顯示目前設定」——WiFi 名稱、WiFi 密碼、
+// 個案身分證字號都改成預填目前值（推翻上面 2026-08-26 那次「故意都不預填」
+// 的決定，含身分證字號「每次重新輸入」那條臨床考量）。三個欄位都只是把
+// value 預先填上，表單本身照樣可以整個覆蓋掉重打，不影響既有的送出/儲存
+// 邏輯。
 static void render_config_form_response(void) {
     char *buf = s_config_form_response;
     size_t size = sizeof(s_config_form_response);
@@ -787,42 +790,64 @@ static void render_config_form_response(void) {
         "Wi-Fi \xE7\xB6\xB2\xE8\xB7\xAF</span>"
         // 不依賴 JavaScript 也能動作：下拉選單本身就是 ssid 欄位，手動輸入是
         // 另一個獨立的覆寫欄位。手機連上熱點後自動彈出的「登入頁」瀏覽器有
-        // 些不支援/限制 JavaScript。故意不預先選到目前設定的網路（見上面
-        // 函式開頭的說明）。
+        // 些不支援/限制 JavaScript。目前設定的網路如果有出現在掃描結果裡，
+        // 預先選到那個 <option>（見下面迴圈）。
         "<select id='ssid' name='ssid'>"
         "<option value=''>\xE8\xAB\x8B\xE9\x81\xB8\xE6\x93\x87 Wi-Fi</option>");
 
+    bool ssid_in_scan_list = false;
     for (int i = 0; i < s_scanned_count; i++) {
+        const bool is_current = has_cfg && strcmp(s_scanned[i].ssid, s_current_config.wifi_ssid) == 0;
+        if (is_current) {
+            ssid_in_scan_list = true;
+        }
         html_append(body, sizeof(body), &body_len, "<option value='");
         html_append_escaped(body, sizeof(body), &body_len, s_scanned[i].ssid);
-        html_append(body, sizeof(body), &body_len, "'>");
+        html_append(body, sizeof(body), &body_len, "'");
+        if (is_current) {
+            html_append(body, sizeof(body), &body_len, " selected");
+        }
+        html_append(body, sizeof(body), &body_len, ">");
         html_append_escaped(body, sizeof(body), &body_len, s_scanned[i].ssid);
         html_append(body, sizeof(body), &body_len, "</option>");
     }
 
-    html_append(body, sizeof(body), &body_len,
-        "</select>"
+    html_append(body, sizeof(body), &body_len, "</select>"
         "<div class='field wifi-manual'>"
         "<label for='ssid_manual'>\xE6\x89\xBE\xE4\xB8\x8D\xE5\x88\xB0\xE8\xA6\x81\xE9\x80\xA3\xE7\xB7\x9A"
         "\xE7\x9A\x84 Wi-Fi\xEF\xBC\x9F</label>"
-        "<input id='ssid_manual' name='ssid_manual' value='' autocomplete='off' "
+        "<input id='ssid_manual' name='ssid_manual' value='");
+    // 目前設定的網路不在掃描結果裡時（例如訊號暫時收不到），改預填到手動
+    // 輸入欄位，讓使用者一樣看得到目前設定值。
+    if (has_cfg && !ssid_in_scan_list) {
+        html_append_escaped(body, sizeof(body), &body_len, s_current_config.wifi_ssid);
+    }
+    html_append(body, sizeof(body), &body_len,
+        "' autocomplete='off' "
         "placeholder='\xE8\xAB\x8B\xE8\xBC\xB8\xE5\x85\xA5 Wi-Fi \xE5\x90\x8D\xE7\xA8\xB1'>"
         "</div></div>");
 
     html_append(body, sizeof(body), &body_len,
         "<div class='field'>"
         "<label for='pass'><span class='required'>\xEF\xBC\x8A</span>Wi-Fi \xE5\xAF\x86\xE7\xA2\xBC</label>"
-        "<input id='pass' name='pass' type='password' autocomplete='new-password' placeholder='%s'>"
-        "</div>",
-        has_cfg ? "\xE7\x95\x99\xE7\xA9\xBA = \xE4\xB8\x8D\xE8\xAE\x8A\xE6\x9B\xB4\xE7\x9B\xAE\xE5\x89\x8D\xE5\xAF\x86\xE7\xA2\xBC" : "");
+        "<input id='pass' name='pass' type='password' autocomplete='new-password' value='");
+    if (has_cfg) {
+        html_append_escaped(body, sizeof(body), &body_len, s_current_config.wifi_password);
+    }
+    html_append(body, sizeof(body), &body_len, "'></div>");
 
-    // 身分證字號：故意不帶入舊值（見上面函式開頭的說明），每次都要求重新
-    // 輸入並通過檢查碼驗證。
+    // 個案身分證字號：預填目前設定值（2026-08-31 改為自動帶入，見上面函式
+    // 開頭的說明）。
     html_append(body, sizeof(body), &body_len,
         "<div class='field'>"
         "<label for='pid'><span class='required'>\xEF\xBC\x8A</span>\xE5\x80\x8B\xE6\xA1\x88\xE8\xBA\xAB\xE4\xBB\xBD"
         "\xE8\xAD\x89\xE5\xAD\x97\xE8\x99\x9F</label>"
-        "<input id='pid' name='pid' value='' maxlength='10' autocapitalize='characters' "
+        "<input id='pid' name='pid' value='");
+    if (has_cfg) {
+        html_append_escaped(body, sizeof(body), &body_len, s_current_config.patient_id);
+    }
+    html_append(body, sizeof(body), &body_len,
+        "' maxlength='10' autocapitalize='characters' "
         "spellcheck='false' placeholder='\xE4\xBE\x8B\xEF\xBC\x9AA123456789'>"
         "</div>");
 

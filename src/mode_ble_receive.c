@@ -5,6 +5,7 @@
 #include "display_status.h"
 #include "fora_protocol.h"
 #include "led_status.h"
+#include "mode_upload.h"
 #include "rightest_protocol.h"
 #include "storage.h"
 #include "wall_clock.h"
@@ -92,10 +93,15 @@ static const uint32_t DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_KIND_COUNT] = {
     // 同一次測試 session 其餘項目也抓完（見下面 record_backfill_state_t 的
     // 說明），冷卻時間跟這段翻頁無關。
     [FORA_DEVICE_MD6] = 10 * 1000,
-    // GM700SB 沒有官方休眠門檻可以參考（不是 FORA 裝置，見 fora_protocol.h
-    // FORA_DEVICE_RIGHTEST_GM700SB 的說明），比照 MD6 抓一個短一點的猜測值，
-    // 方便使用者連續測試/確認結果，2026-08-28 還沒實機驗證過是否合適。
-    [FORA_DEVICE_RIGHTEST_GM700SB] = 10 * 1000,
+    // 2026-08-31 使用者實機測試後決定改長：GM700SB 的藍牙晶片是持續廣播的
+    // （不像其他裝置量測完才有動靜，見 handle_advertising_report() 的說明），
+    // 原本比照 MD6 抓 10 秒方便連續測試，但實機測試發現這代表 Gateway 幾乎
+    // 不間斷地重複連線/喚醒裝置，使用者希望比照其他裝置「量測完才連線」的
+    // 觀感，改成跟額溫槍一樣的 60 秒；同時見下面 HCI_EVENT_DISCONNECTION_
+    // COMPLETE 的處理，這個冷卻時間現在不管連線結果如何（成功讀到新資料、
+    // 確認沒有新資料、解析失敗、逾時斷線）都會套用，不是只有
+    // finish_rightest_session() 那幾個「乾淨結束」的路徑才有。
+    [FORA_DEVICE_RIGHTEST_GM700SB] = 60 * 1000,
 };
 static absolute_time_t s_kind_cooldown_until[FORA_DEVICE_KIND_COUNT];
 
@@ -246,13 +252,50 @@ typedef enum {
     RIGHTEST_SESSION_PCL_ON_PENDING,  // 已送 PCL 開啟指令，等它自己的 ATT 回應（不是等 Notify）；
                                        // 這段期間如果意外收到 Notify，直接忽略，不觸發任何寫入
                                        // （見 handle_rightest_notification() 的 case，不落入 default）
+    // 2026-08-31 實機測試：拿掉型號查詢、改成 PCL 開啟 ATT 回應一到就立刻送
+    // TYPE 1（index=0）之後，症狀原封不動地搬到了 TYPE 1 身上——ATT 層寫入
+    // 一樣永遠成功確認，裝置一樣從沒回過任何 Notify，最後連線在 link layer
+    // 逾時斷線（reason=0x08）。懷疑 ATT 層「寫入成功」只代表協定棧收到位元
+    // 組，不保證裝置韌體的應用層已經真的處理完「切換進 PCL 模式」這個動作
+    // （可能牽涉螢幕畫面切換、內部狀態機），加一段短暫延遲讓裝置有時間先
+    // 穩定下來，再送 TYPE 1，見 RIGHTEST_PCL_SETTLE_MS。**這個延遲本身還沒
+    // 實機驗證過是否真的是根因**，見 PROJECT_PLAN.md。
+    RIGHTEST_SESSION_PCL_SETTLE,      // PCL 開啟 ATT 回應已到，等一段緩衝時間才送 TYPE 1；
+                                       // 這段期間如果意外收到 Notify，比照 PCL_ON_PENDING 直接忽略
     RIGHTEST_SESSION_WAIT_SUMMARY,    // 已送 TYPE 1 查詢（index=0），等總筆數/書籤
     RIGHTEST_SESSION_WAIT_RECORD,     // 已送 TYPE 2 查詢，等這一筆記錄內容
 } rightest_session_state_t;
+// 2026-08-31：PCL 開啟 ATT 回應到了之後，不立刻送 TYPE 1，先等這麼久，見
+// RIGHTEST_SESSION_PCL_SETTLE 的說明。憑經驗抓的值，沒有資料支撐，如果這次
+// 測試發現還是收不到 Notify，可以先排除「純粹時序太快」這個假設。
+#define RIGHTEST_PCL_SETTLE_MS 500
 static rightest_session_state_t s_rightest_session_state = RIGHTEST_SESSION_IDLE;
+static absolute_time_t s_rightest_pcl_settle_until;
 static rightest_record_summary_t s_rightest_summary;
 static uint16_t s_rightest_next_index;
 static uint16_t s_rightest_target_count; // 這次連線打算讀到第幾個 index（含）
+
+// 2026-09-01 使用者決定：GM700SB 的藍牙晶片持續廣播、廣播內容也證實看不出
+// 有沒有新資料（實機比對過量測前後的 raw_adv 完全一樣），拉長冷卻時間只能
+// 降低頻率、無法真正做到「量完才連線」，使用者要的是完全不被動掃描——GM700SB
+// 改成純手動觸發（原本 KEY1 長按，2026-09-02 手勢互換成 KEY1 短按，見
+// mode_ble_receive_run() 主迴圈的說明），handle_advertising_report() 平常
+// 掃描到 GM700SB 的廣播一律忽略、不連線，只有 s_rightest_manual_sync_active
+// 是 true 的這段期間才會比對/連線。FORA 系列裝置（額溫槍/血氧計/血壓計/
+// MD6）完全不受影響，維持原本自動連線。
+//
+// KEY1_LONG_PRESS_HOLD_MS 同時是「短按觸發 GM700SB 同步」跟「長按觸發 WiFi/
+// 上傳」（見 mode_ble_receive_run() 主迴圈）的分界門檻——放開時按住時間小於
+// 這個值算短按，達到這個值算長按。2026-09-02 使用者決定跟 KEY0 進 AP_CONFIG
+// 的長按門檻（KEY0_ENTER_CONFIG_HOLD_MS）統一成 3 秒，避免同一台裝置上不同
+// 按鍵的「長按」判定標準不一致，容易誤觸或搞混。
+#define KEY1_LONG_PRESS_HOLD_MS 3000
+// 按了 KEY1 長按之後，最多等這麼久沒掃到 GM700SB 就自動放棄、恢復忽略
+// GM700SB 廣播——避免使用者按一次之後裝置不在附近，這個「可以連線」的視窗
+// 卻無限期留著，之後裝置隨便什麼時候出現都會被自動連上，變相又回到全自動。
+#define RIGHTEST_MANUAL_SYNC_WINDOW_MS (30 * 1000)
+static bool s_rightest_manual_sync_active = false;
+static absolute_time_t s_rightest_manual_sync_until;
 
 static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
@@ -485,13 +528,23 @@ static const char *measurement_mode_debug_name(uint8_t mode) {
 // 的說明），只有視窗到了、真的採信某一筆的那一刻才會呼叫，這樣血氧計的手指
 // 沒拿開、一直有動靜也不會讓 idle 計時器一直被重置、卡住其他裝置已經量好、
 // 在待傳佇列裡等待上傳的資料。
-static void commit_records(const vital_record_t *records, size_t record_count) {
+// 2026-09-02：回傳值改成 bool——true 代表這批記錄全部成功存進待傳佇列，
+// false 代表至少一筆被 storage_append_record() 拒絕（佇列滿了，見 storage.c
+// MAX_PENDING_RECORDS 的說明）。GM700SB 讀取流程靠這個回傳值決定要不要推進
+// 自己的同步定位點（見 handle_rightest_notification() RIGHTEST_SESSION_
+// WAIT_RECORD 的說明）——只有真的存進佇列才算「同步過」，不然佇列剛好滿的
+// 那一刻讀到的記錄會被永久跳過、再也不會重試。其餘呼叫端（額溫槍/血氧計/
+// 血壓計/MD6）目前不檢查這個回傳值，維持原本行為不變。
+static bool commit_records(const vital_record_t *records, size_t record_count) {
     uint64_t now_ms = to_ms_since_boot(get_absolute_time());
+    bool all_queued = true;
     for (size_t i = 0; i < record_count; i++) {
         vital_record_t record = records[i];
         record.received_at_ms = now_ms;
         record.status = UPLOAD_STATUS_PENDING;
-        storage_append_record(&record);
+        if (!storage_append_record(&record)) {
+            all_queued = false;
+        }
         // 手動格式化浮點數，避免依賴 newlib-nano 預設未啟用的 printf float 支援；
         // 用四捨五入到小數點後 1 位，不是無條件捨去。
         int tenths = (int)(record.value * 10.0f + (record.value >= 0.0f ? 0.5f : -0.5f));
@@ -507,18 +560,27 @@ static void commit_records(const vital_record_t *records, size_t record_count) {
     s_last_reading_at = get_absolute_time();
     s_got_any_reading_this_session = true;
     led_status_set(LED_HEARTBEAT);
+    return all_queued;
 }
 
 // 結束這次 GM700SB 連線（不管是正常讀完、身份核對失敗、還是解析出錯）：
 // 一律先嘗試關閉 PCL 模式再斷線，避免裝置停留在鎖定畫面（見
-// rightest_protocol.h FEE1 的說明）。**這裡送出關閉指令後沒有等待它真的
-// 送出就馬上呼叫 gap_disconnect()，這個時序假設 2026-08-28 還沒有實機驗證
-// 過**——如果之後發現裝置常常沒有真的收到這個關閉指令、卡在 PCL 畫面，
-// 這裡要改成等 GATT_EVENT_QUERY_COMPLETE 確認寫入完成後才斷線。
+// rightest_protocol.h FEE1 的說明）。這裡送出關閉指令後不等待它真的完成就
+// 馬上呼叫 gap_disconnect()——2026-08-28 加這段時還沒實機驗證過，2026-09-02
+// 已經重複驗證多次（每次都看到這個關閉寫入的 ATT 回應是 att_status=0x1f，
+// 代表沒有正常收到「寫入成功」的確認，但螢幕實測正常顯示時間、不是卡在
+// PCL 鎖定畫面，且後續每次重新連線裝置都正常回應），目前判斷這個指令本身
+// 有送達、只是斷線時序讓我們這端看不到成功的 ATT 回應，不影響裝置實際解鎖
+// ——先不改成等待確認，如果之後真的遇到裝置卡在 PCL 畫面再回頭處理。
 static void finish_rightest_session(void) {
     s_rightest_session_state = RIGHTEST_SESSION_IDLE;
     s_kind_cooldown_until[FORA_DEVICE_RIGHTEST_GM700SB] =
         make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_RIGHTEST_GM700SB]);
+    // 2026-09-01：這次手動觸發的同步視窗已經用掉了（不管結果是讀到新資料、
+    // 確認沒有新資料、還是解析失敗），關掉閘門、恢復平常忽略 GM700SB 廣播，
+    // 見 s_rightest_manual_sync_active 宣告處的說明。只是設一個 bool，不影響
+    // 這個函式原本的斷線時序。
+    s_rightest_manual_sync_active = false;
     printf("[BLE] rightest: closing PCL mode and disconnecting...\n");
     send_rightest_pcl_mode(RIGHTEST_PCL_MODE_OFF);
     gap_disconnect(s_connection_handle);
@@ -562,6 +624,16 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             rightest_reassembly_reset(&s_rightest_reassembly);
             break;
 
+        case RIGHTEST_SESSION_PCL_SETTLE:
+            // 比照 PCL_ON_PENDING：這段緩衝等待期間正常不該收到 Notify，
+            // 保守起見單純忽略，不呼叫 finish_rightest_session()、不觸發
+            // 提前送出 TYPE 1（那個動作要等 mode_ble_receive_run() 主迴圈
+            // 的 time_reached() 判斷成立才會做），見 RIGHTEST_PCL_SETTLE_MS
+            // 的說明。
+            printf("[BLE] rightest: unexpected notification during PCL settle delay, ignoring.\n");
+            rightest_reassembly_reset(&s_rightest_reassembly);
+            break;
+
         case RIGHTEST_SESSION_WAIT_SUMMARY: {
             bool parsed = rightest_protocol_parse_record_summary(frame, frame_len, &s_rightest_summary);
             rightest_reassembly_reset(&s_rightest_reassembly);
@@ -573,17 +645,46 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             printf("[BLE] rightest: total=%u max_capacity=%u last_transmission_index=%u\n",
                    s_rightest_summary.total_count, s_rightest_summary.max_capacity,
                    s_rightest_summary.last_transmission_index);
-            if (s_rightest_summary.last_transmission_index >= s_rightest_summary.total_count) {
-                // 裝置自己的書籤已經追上目前總筆數，沒有新記錄，見
-                // rightest_protocol.h RIGHTEST_CMD_READ_RECORD 的說明。
+            // 2026-09-01 實機測試推翻了「last_transmission_index 是可信賴的
+            // 跨連線同步書籤」這個從一開始就沒驗證過的假設（見
+            // rightest_protocol.h RIGHTEST_CMD_READ_RECORD 的說明）：同一台
+            // 裝置前後兩次連線分別讀到 total=2/last=1（1 筆待讀）跟
+            // total=3/last=3（書籤直接追上新的總筆數，代表「沒有新資料」），
+            // 但這整個對話過程中 Gateway 從來沒有成功送出過一次 TYPE 2 讀取、
+            // 也就是那台裝置上一筆使用者實測的血糖值完全沒有被讀到就已經被
+            // 判定成「同步過」，資料就這樣漏掉了。
+            //
+            // 2026-09-02 進一步發現：改成「每次都固定重讀 index=1..
+            // total_count、交給 storage_append_record() 判重」這個第一版
+            // 修法本身也有問題——storage_append_record() 的判重只跟「上一筆
+            // 同類型/來源裝置」比對（見 storage.c 的說明），不是跟「已經上傳
+            // 成功的歷史」比對；同一次連線內依序 commit 好幾筆不同時間點的
+            // 記錄時，每一筆都會跟「上一筆剛 commit 的」不一樣，全部被當成
+            // 新資料重新塞進待傳佇列——代表下次總筆數變多、再重讀 1..
+            // total_count 時，前幾筆已經上傳成功的舊記錄會被原封不動再上傳
+            // 一次，變成每次同步的筆數都是累加、重複上傳。改成 Gateway 自己
+            // 記一份「同步到第幾個 index」的定位點（借用 MD6/D40 backfill
+            // 用的同一個 storage_get_backfill_anchor()/storage_set_backfill_
+            // anchor() flash 儲存格，用 source_kind=GM700SB 當 key，anchor
+            // buffer 前 2 bytes 存 16-bit 小端 index，不是裝置的書籤、也不
+            // 需要裝置端行為可信賴），每讀完一筆（不管解析成功還是被判定
+            // QC/Hi-flag 跳過）就立刻更新這個定位點，下次連線只讀真正沒讀過
+            // 的 index，不會重複上傳。
+            uint8_t rightest_sync_anchor[8] = { 0 };
+            storage_get_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, rightest_sync_anchor);
+            uint16_t gateway_synced_index =
+                (uint16_t)rightest_sync_anchor[0] | ((uint16_t)rightest_sync_anchor[1] << 8);
+            printf("[BLE] rightest: gateway last synced index=%u\n", gateway_synced_index);
+            if (s_rightest_summary.total_count == 0 ||
+                gateway_synced_index >= s_rightest_summary.total_count) {
                 printf("[BLE] rightest: no new records since last sync.\n");
                 finish_rightest_session();
                 return;
             }
-            s_rightest_next_index = (uint16_t)(s_rightest_summary.last_transmission_index + 1);
-            uint16_t remaining = (uint16_t)(s_rightest_summary.total_count - s_rightest_summary.last_transmission_index);
+            s_rightest_next_index = (uint16_t)(gateway_synced_index + 1);
+            uint16_t remaining = (uint16_t)(s_rightest_summary.total_count - gateway_synced_index);
             uint16_t capped = remaining > RECORD_BACKFILL_SAFETY_CAP ? RECORD_BACKFILL_SAFETY_CAP : remaining;
-            s_rightest_target_count = (uint16_t)(s_rightest_summary.last_transmission_index + capped);
+            s_rightest_target_count = (uint16_t)(gateway_synced_index + capped);
             printf("[BLE] rightest: reading records index=%u..%u...\n",
                    s_rightest_next_index, s_rightest_target_count);
             s_rightest_session_state = RIGHTEST_SESSION_WAIT_RECORD;
@@ -597,11 +698,30 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             vital_record_t record;
             bool parsed = rightest_protocol_parse_record(frame, frame_len, &record);
             rightest_reassembly_reset(&s_rightest_reassembly);
+            // 這個 index 的同步定位點要不要前進，看這筆記錄有沒有真的「處理
+            // 完」：解析失敗（checksum/Hi-flag/QC，不是病人數值）算處理完，
+            // 以後都不用再理它；解析成功但 commit_records() 回傳 false（待傳
+            // 佇列剛好滿了，見 storage.c MAX_PENDING_RECORDS 的說明）代表這筆
+            // 資料還沒真的存進系統，**不能**前進，不然下次同步不會再重試、
+            // 資料就永久漏掉了——2026-09-02 使用者要求要保證「藍牙收資料不會
+            // 漏」才加這個判斷。
+            bool handled = true;
             if (parsed) {
-                commit_records(&record, 1);
+                handled = commit_records(&record, 1);
+                if (!handled) {
+                    printf("[BLE] rightest: index=%u parsed but pending queue is full, "
+                           "not advancing sync anchor (will retry next sync).\n",
+                           s_rightest_next_index);
+                }
             } else {
                 printf("[BLE] rightest: index=%u did not parse as a valid reading "
                        "(checksum/Hi-flag/QC), skipping.\n", s_rightest_next_index);
+            }
+            if (handled) {
+                uint8_t rightest_sync_anchor[8] = { 0 };
+                rightest_sync_anchor[0] = (uint8_t)(s_rightest_next_index & 0xFF);
+                rightest_sync_anchor[1] = (uint8_t)(s_rightest_next_index >> 8);
+                storage_set_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, rightest_sync_anchor);
             }
             s_rightest_next_index++;
             if (s_rightest_next_index > s_rightest_target_count) {
@@ -837,13 +957,25 @@ static void debug_print_advertisement(uint8_t *packet, const uint8_t *adv_data, 
 
     printf("[BLE scan] addr=%s rssi=%d name=\"%s\" mfg_data=", bd_addr_to_str(addr), rssi, name);
     if (mfg_data == NULL) {
-        printf("(none)\n");
+        printf("(none)");
     } else {
         for (uint8_t i = 0; i < mfg_len; i++) {
             printf("%02x ", mfg_data[i]);
         }
-        printf("\n");
     }
+    if (is_rightest) {
+        // 2026-08-31 除錯用：完整印出這個裝置的原始廣播封包（不是只挑幾個
+        // 我們認得的欄位），用來比對「剛量完血糖」跟「閒置中」兩種狀態下的
+        // 廣播內容是不是真的不一樣——如果不一樣（哪怕只是某個 flag 或
+        // service data 欄位變化），就有機會不連線也能分辨有沒有新資料；如果
+        // 完全一樣，就代表只能靠連線進去讀 total_count/last_transmission_
+        // index 才知道，見跟使用者討論的說明。只對 GM700SB 開，避免洗版。
+        printf(" raw_adv(%u bytes)=", (unsigned)adv_len);
+        for (uint8_t i = 0; i < adv_len; i++) {
+            printf("%02x", adv_data[i]);
+        }
+    }
+    printf("\n");
 }
 
 static void handle_advertising_report(uint8_t *packet) {
@@ -858,7 +990,8 @@ static void handle_advertising_report(uint8_t *packet) {
 
     fora_device_kind_t kind = FORA_DEVICE_UNKNOWN;
     bool matched = fora_protocol_matches_advertisement(adv_data, adv_len, &kind);
-    if (!matched && rightest_protocol_matches_advertisement(adv_data, adv_len)) {
+    if (!matched && s_rightest_manual_sync_active &&
+        rightest_protocol_matches_advertisement(adv_data, adv_len)) {
         // 只是初步粗篩（Service UUID 0xFEE0，廣播名稱是序號比對不出型號，
         // 見 rightest_protocol.h 的說明）。原本規劃連線配對後再送型號查詢
         // 二次核對身份，但 2026-08-28 實機測試發現裝置不會回應這個查詢
@@ -866,6 +999,9 @@ static void handle_advertising_report(uint8_t *packet) {
         // 資料同步流程圖，官方流程本來就不包含這一步），已經拿掉，目前
         // 這個 Service UUID 粗篩是唯一的身份確認機制，見
         // PROJECT_PLAN.md 第 6.6 節。
+        // 2026-09-01：加上 s_rightest_manual_sync_active 這個閘門——GM700SB
+        // 廣播是持續性的，平常掃描到就直接忽略，只有使用者長按 KEY1 觸發
+        // 手動同步的那段時間窗口內才會真的比對/連線，見上面宣告處的說明。
         kind = FORA_DEVICE_RIGHTEST_GM700SB;
         matched = true;
     }
@@ -1019,10 +1155,14 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                     // 走，跳過型號查詢；掃描階段的 Service UUID 0xFEE0 粗篩
                     // 是目前唯一的身份確認機制，沒有型號字串二次核對這道
                     // 保險，見 PROJECT_PLAN.md 第 6.6 節。
-                    printf("[BLE] rightest: PCL mode enabled, querying record summary...\n");
-                    s_rightest_session_state = RIGHTEST_SESSION_WAIT_SUMMARY;
-                    uint8_t index_zero[2] = { 0x00, 0x00 };
-                    send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_zero, sizeof(index_zero));
+                    // 2026-08-31：不立刻送 TYPE 1，先進入 PCL_SETTLE 等一段
+                    // 緩衝時間（見 RIGHTEST_PCL_SETTLE_MS 的說明），真正送出
+                    // 的動作在 mode_ble_receive_run() 主迴圈的 time_reached()
+                    // 判斷之後才觸發。
+                    printf("[BLE] rightest: PCL mode enabled, waiting %ums before querying "
+                           "record summary...\n", (unsigned)RIGHTEST_PCL_SETTLE_MS);
+                    s_rightest_session_state = RIGHTEST_SESSION_PCL_SETTLE;
+                    s_rightest_pcl_settle_until = make_timeout_time_ms(RIGHTEST_PCL_SETTLE_MS);
                 } else {
                     // 2026-08-28 除錯用：型號查詢完全收不到回應，這裡印出來
                     // 確認「寫入這一步本身的 ATT 回應」到底有沒有收到——這個
@@ -1287,6 +1427,25 @@ static void handle_hci_event(uint8_t packet_type, uint16_t channel, uint8_t *pac
     if (event_type == HCI_EVENT_DISCONNECTION_COMPLETE) {
         uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
         printf("[BLE] disconnected (reason=0x%02x), resuming scan.\n", reason);
+        // 2026-08-31：GM700SB 逾時斷線（reason=0x08，讀取記錄卡住等到 link
+        // layer 逾時）或連線建立失敗（探索/訂閱途中的其他斷線）原本完全沒有
+        // 套用冷卻時間，只有 finish_rightest_session() 那幾個「乾淨結束」的
+        // 路徑才會設。GM700SB 廣播是持續性的，斷線後立刻恢復掃描等於立刻又
+        // 連上，不間斷地重試——實機測試連續 6 次都在這個狀態下連線後完全
+        // 收不到 Notify、逾時斷線，懷疑高頻率重連沒有給裝置的藍牙協定棧喘息
+        // /回收上次連線資源的時間。這裡不管斷線原因、也不管當下是不是真的在
+        // 跑 rightest session，只要目前種類是 GM700SB 就套用同一個冷卻時間
+        // （跟 finish_rightest_session() 重複設也沒關係，是 idempotent 操作）。
+        if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
+            s_kind_cooldown_until[FORA_DEVICE_RIGHTEST_GM700SB] =
+                make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_RIGHTEST_GM700SB]);
+            // 2026-09-01：逾時斷線走的是這條路，不會經過 finish_rightest_
+            // session()，手動同步視窗也要在這裡一併關掉，不然逾時斷線之後
+            // 閘門還開著、緊接著掃到的下一個廣播還是會自動連上去，等於沒有
+            // 真的做到手動觸發，見 s_rightest_manual_sync_active 宣告處的
+            // 說明。
+            s_rightest_manual_sync_active = false;
+        }
         s_connected_and_ready = false;
         s_connection_handle = HCI_CON_HANDLE_INVALID;
         start_scan();
@@ -1334,6 +1493,20 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
     while (true) {
         led_status_poll();
 
+        // GM700SB PCL 開啟的 ATT 回應到了之後，先緩衝 RIGHTEST_PCL_SETTLE_MS
+        // 才送 TYPE 1（讀總筆數/書籤），見 rightest_session_state_t 宣告處
+        // RIGHTEST_SESSION_PCL_SETTLE 的說明。放在主迴圈輪詢、不是收到 ATT
+        // 回應當下就送，是為了不阻塞 BTstack 的事件處理（這裡不能直接
+        // sleep_ms() 等待）。
+        if (s_ble_state == BLE_STATE_RIGHTEST_SESSION &&
+            s_rightest_session_state == RIGHTEST_SESSION_PCL_SETTLE &&
+            time_reached(s_rightest_pcl_settle_until)) {
+            printf("[BLE] rightest: settle delay elapsed, querying record summary...\n");
+            s_rightest_session_state = RIGHTEST_SESSION_WAIT_SUMMARY;
+            uint8_t index_zero[2] = { 0x00, 0x00 };
+            send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_zero, sizeof(index_zero));
+        }
+
         // KEY2 顯示歷史畫面期間暫停呼叫 display_status_poll()，不然畫面會
         // 馬上被 BLE_RECEIVE 即時內容蓋掉；逾時後恢復正常輪詢，poll() 會因為
         // s_ble_screen_is_current 已經被 show_upload_history() 清成 false
@@ -1364,12 +1537,37 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
             return MODE_BLE_RECEIVE_EXIT_ENTER_CONFIG;
         }
 
-        // KEY1：手動要求做一次完整的 WiFi 動作（連線→強制重新 NTP 校時→
+        // KEY1 短按：手動觸發 GM700SB 同步（見 s_rightest_manual_sync_active
+        // 宣告處的說明——GM700SB 平常完全不主動連線，只有這段視窗期間掃描到
+        // 才會連）。2026-09-02 使用者決定跟下面 WiFi/上傳那個動作互換手勢
+        // （原本短按=WiFi、長按=GM700SB，改成短按=GM700SB、長按=WiFi）——
+        // GM700SB 同步是比較常用的日常動作，短按比長按輕鬆，兩個
+        // button_input_key1_*() 函式各自獨立追蹤按下/放開時間，這裡呼叫順序
+        // 不影響判定結果，純粹是程式碼閱讀順序上先寫短按。
+        if (button_input_key1_pressed(KEY1_LONG_PRESS_HOLD_MS)) {
+            printf("[BLE] KEY1 pressed, listening for GM700SB for the next %us...\n",
+                   (unsigned)(RIGHTEST_MANUAL_SYNC_WINDOW_MS / 1000));
+            s_rightest_manual_sync_active = true;
+            s_rightest_manual_sync_until = make_timeout_time_ms(RIGHTEST_MANUAL_SYNC_WINDOW_MS);
+        }
+        // 手動同步視窗逾時還沒掃到 GM700SB（裝置不在範圍內、或使用者按完
+        // 忘記靠近）——自動關閉閘門，避免視窗無限期留著、之後裝置隨便什麼
+        // 時候出現都會被自動連上，變相又回到全自動。真的連上的話閘門會在
+        // finish_rightest_session()/逾時斷線處理提早關掉，這裡不會生效
+        // （s_rightest_manual_sync_active 那時已經是 false，time_reached()
+        // 判斷再成立也沒差，不會有副作用）。
+        if (s_rightest_manual_sync_active && time_reached(s_rightest_manual_sync_until)) {
+            printf("[BLE] rightest: manual sync window expired without finding the device.\n");
+            s_rightest_manual_sync_active = false;
+        }
+
+        // KEY1 長按：手動要求做一次完整的 WiFi 動作（連線→強制重新 NTP 校時→
         // 上傳，見 mode_upload.c），跳過 idle timeout 的等待。不像 idle
         // timeout 那條路徑要求待傳佇列非空——就算沒有資料要傳，也要能連線
-        // 確認一次網路時間校得準不準。
-        if (button_input_key1_pressed()) {
-            printf("[BLE] KEY1 pressed, manually triggering WiFi action + NTP resync.\n");
+        // 確認一次網路時間校得準不準。2026-09-02 改成長按（原本是短按，見
+        // 上面 GM700SB 同步那段的說明）。
+        if (button_input_key1_long_press(KEY1_LONG_PRESS_HOLD_MS)) {
+            printf("[BLE] KEY1 long-press detected, manually triggering WiFi action + NTP resync.\n");
             wall_clock_request_resync();
             return MODE_BLE_RECEIVE_EXIT_UPLOAD;
         }
@@ -1398,8 +1596,11 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
         // 還沒校時成功的話，不用等收到裝置讀值才有機會嘗試 NTP——每隔
         // NTP_UNSYNCED_RETRY_MS 就主動連一次 WiFi 重試，避免裝置一直收不到
         // 任何生理訊號時永遠沒有機會校時。校時成功後 wall_clock_is_synced()
-        // 變 true，這個分支就不會再觸發。
-        if (!wall_clock_is_synced() &&
+        // 變 true，這個分支就不會再觸發。mode_upload_in_backoff() 為 true時
+        // （WiFi 剛失敗過，見 mode_upload.c 的說明）先跳過、也不更新
+        // s_last_ntp_retry_at，讓冷卻期一過就能立刻重試，不用再等一次完整的
+        // NTP_UNSYNCED_RETRY_MS。
+        if (!wall_clock_is_synced() && !mode_upload_in_backoff() &&
             absolute_time_diff_us(s_last_ntp_retry_at, get_absolute_time()) / 1000 >= NTP_UNSYNCED_RETRY_MS) {
             printf("[BLE] wall clock still unsynced, triggering WiFi to retry NTP.\n");
             s_last_ntp_retry_at = get_absolute_time();
@@ -1415,14 +1616,25 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
             int64_t idle_ms = absolute_time_diff_us(s_last_reading_at, get_absolute_time()) / 1000;
             if (idle_ms >= (int64_t)s_idle_timeout_ms) {
                 if (storage_pending_count() > 0) {
-                    return MODE_BLE_RECEIVE_EXIT_UPLOAD;
+                    // WiFi 剛失敗過、還在冷卻期的話先不切去 UPLOAD（見
+                    // mode_upload.c WIFI_FAILURE_BACKOFF_MS 的說明）——資料
+                    // 已經安全存在待傳佇列的 flash 裡，不急著這次就傳，讓
+                    // BLE_RECEIVE 能繼續掃描收資料，不用犧牲掃描時間去做一次
+                    // 大概率還是會失敗的連線嘗試。故意不重置
+                    // s_got_any_reading_this_session，冷卻期一過下一輪迴圈
+                    // 就會立刻再檢查一次，不用等下一筆新讀值。
+                    if (!mode_upload_in_backoff()) {
+                        return MODE_BLE_RECEIVE_EXIT_UPLOAD;
+                    }
+                } else {
+                    // 收到的都是重複量測、被 storage_append_record() 判重擋掉，
+                    // 待傳佇列其實是空的——沒有東西要傳，不需要為了「切去
+                    // UPLOAD 確認看看」特地連一次 WiFi（見 PROJECT_PLAN.md 第
+                    // 6.3 節重複上傳的討論）。重置這一輪的旗標，等下一筆真正
+                    // 的新讀值再重新倒數；不重置的話這個 if 每輪迴圈都會成立，
+                    // 等於忙迴圈。
+                    s_got_any_reading_this_session = false;
                 }
-                // 收到的都是重複量測、被 storage_append_record() 判重擋掉，待傳
-                // 佇列其實是空的——沒有東西要傳，不需要為了「切去 UPLOAD 確認看
-                // 看」特地連一次 WiFi（見 PROJECT_PLAN.md 第 6.3 節重複上傳的
-                // 討論）。重置這一輪的旗標，等下一筆真正的新讀值再重新倒數；
-                // 不重置的話這個 if 每輪迴圈都會成立，等於忙迴圈。
-                s_got_any_reading_this_session = false;
             }
         }
 

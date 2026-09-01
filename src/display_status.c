@@ -534,19 +534,31 @@ static void format_reading_clock(uint64_t received_at_ms, uint32_t device_measur
     display_status_format_clock(received_at_ms, out, out_size);
 }
 
-// VITAL_TYPE_PULSE_RATE 是目前唯一會同時由兩種裝置回報的類型（血壓計/血氧計，
-// 見 fora_protocol.c 的 fora_protocol_parse_reading()），畫面上只有一行
-// 「Pulse」、只顯示最新一筆（見 storage_get_last_reading() 的說明），所以加
-// 這個來源標籤讓使用者能分辨這筆數值是哪台裝置量到的，不需要為此多佔一整行
-// 螢幕空間。其他類型只有單一來源，不需要標籤。
-static const char *pulse_source_tag(vital_type_t type, uint8_t source_kind) {
-    if (type != VITAL_TYPE_PULSE_RATE) {
-        return "";
-    }
-    switch ((fora_device_kind_t)source_kind) {
-        case FORA_DEVICE_BLOOD_PRESSURE: return "BP ";
-        case FORA_DEVICE_OXIMETER:       return "O2 ";
-        default:                         return "";
+// VITAL_TYPE_PULSE_RATE（血壓計/血氧計，見 fora_protocol.c 的
+// fora_protocol_parse_reading()）跟 VITAL_TYPE_GLUCOSE（FORA D40 血壓血糖
+// 二合一機/MD6 六合一測試儀/Bionime Rightest GM700SB 血糖機，三種裝置都會
+// 回報血糖，見 fora_protocol_parse_reading() FORA_DEVICE_BLOOD_PRESSURE 分支
+// 裡「這台裝置是血壓血糖二合一」的說明）目前是會同時由多種裝置回報同一種
+// 讀值的類型，畫面上只有一行、只顯示最新一筆（見 storage_get_last_reading()
+// 的說明），所以加這個來源標籤讓使用者能分辨這筆數值是哪台裝置量到的，
+// 不需要為此多佔一整行螢幕空間。其他類型只有單一來源，不需要標籤。
+static const char *reading_source_tag(vital_type_t type, uint8_t source_kind) {
+    switch (type) {
+        case VITAL_TYPE_PULSE_RATE:
+            switch ((fora_device_kind_t)source_kind) {
+                case FORA_DEVICE_BLOOD_PRESSURE: return "BP ";
+                case FORA_DEVICE_OXIMETER:       return "O2 ";
+                default:                         return "";
+            }
+        case VITAL_TYPE_GLUCOSE:
+            switch ((fora_device_kind_t)source_kind) {
+                case FORA_DEVICE_BLOOD_PRESSURE:   return "D40 ";
+                case FORA_DEVICE_MD6:              return "MD6 ";
+                case FORA_DEVICE_RIGHTEST_GM700SB: return "GM ";
+                default:                            return "";
+            }
+        default:
+            return "";
     }
 }
 
@@ -611,7 +623,7 @@ static void draw_reading_row(int y, vital_type_t type, const ble_snapshot_t *sna
         format_reading_clock(snap->reading_received_at_ms[type], snap->reading_device_measured_key[type],
                               clock_str, sizeof(clock_str));
         snprintf(line, sizeof(line), " %s%s (%s%s)", value_str, vital_unit(type),
-                 pulse_source_tag(type, snap->reading_source_kind[type]), clock_str);
+                 reading_source_tag(type, snap->reading_source_kind[type]), clock_str);
     } else {
         snprintf(line, sizeof(line), " -- (never)");
     }
@@ -631,8 +643,10 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     Paint_DrawString_EN(5 + 3 * 7, 2, line, &Font12, BLACK, WHITE);
 
     // ID/狀態合併一行、Last upload/Pending 合併一行（各省一行），vitals 區塊
-    // 從 y=22 開始、13px 一行；y=100 那行是 FORA MD6 六合一血糖以外 5 項的
+    // 從 y=22 開始、13px 一行；y=87 那行是 FORA MD6 六合一血糖以外 5 項的
     // 合併列（見 draw_md6_extra_row() 的說明），血糖本身沿用上面的 Gluc 行。
+    // MD6 那列排在 BP 後面、Last/Pending 前面（對應說明簡報「日常量測」頁
+    // 1-8 的順序，2026-08-31 使用者要求把它從最後一列移到第 7 列）。
     draw_reading_row(22, VITAL_TYPE_TEMPERATURE, snap);
     draw_reading_row(35, VITAL_TYPE_SPO2, snap);
     draw_reading_row(48, VITAL_TYPE_PULSE_RATE, snap);
@@ -653,6 +667,8 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     }
     Paint_DrawString_EN(BLE_ROW_VALUE_X, 74, line, &Font12, BLACK, WHITE);
 
+    draw_md6_extra_row(87, snap);
+
     char upload_clock_str[24];
     if (snap->last_upload_valid) {
         display_status_format_clock(snap->last_upload_at_ms, upload_clock_str, sizeof(upload_clock_str));
@@ -663,17 +679,15 @@ static bool render_ble_receive(const ble_snapshot_t *snap) {
     // 位數都會變），沒辦法像上面 vitals 表格那樣用固定欄寬對齊，改成逐段畫、
     // x 座標依實際畫出來的字元數往右推進。
     int x = 5;
-    Paint_DrawString_EN(x, 87, "Last:", &Font12, WHITE, BLACK);
+    Paint_DrawString_EN(x, 100, "Last:", &Font12, WHITE, BLACK);
     x += 5 * 7;
     snprintf(line, sizeof(line), " %s  ", upload_clock_str);
-    Paint_DrawString_EN(x, 87, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(x, 100, line, &Font12, BLACK, WHITE);
     x += (int)strlen(line) * 7;
-    Paint_DrawString_EN(x, 87, "Pending:", &Font12, WHITE, BLACK);
+    Paint_DrawString_EN(x, 100, "Pending:", &Font12, WHITE, BLACK);
     x += 8 * 7;
     snprintf(line, sizeof(line), " %u", (unsigned)snap->pending_count);
-    Paint_DrawString_EN(x, 87, line, &Font12, BLACK, WHITE);
-
-    draw_md6_extra_row(100, snap);
+    Paint_DrawString_EN(x, 100, line, &Font12, BLACK, WHITE);
 
     return end_frame_and_refresh();
 }
