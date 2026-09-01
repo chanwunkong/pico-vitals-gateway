@@ -13,9 +13,16 @@
 // 開機後第一次進 AP_CONFIG 給的時間上限（2026-08-28 取代原本的 BOOTSEL 開機
 // 視窗判斷）：過了這段時間都沒人送出設定表單、也沒按 KEY0 取消，就自動當作
 // 「這次開機沒有人要設定」，放行到正常的 BLE_RECEIVE 監測模式，熱點不會無限
-// 期擋住 24/7 監測。KEY0 長按手動重新進入這個模式（mode_ble_receive.c 的
-// MODE_BLE_RECEIVE_EXIT_ENTER_CONFIG）不套用這個逾時，使用者主動要求設定就
-// 讓他填完，沿用原本「按住 KEY0 取消」的唯一離開方式。
+// 期擋住 24/7 監測。
+//
+// 2026-09-02 使用者要求 KEY0 長按手動重新進入這個模式（mode_ble_receive.c 的
+// MODE_BLE_RECEIVE_EXIT_ENTER_CONFIG）也要套用同一個逾時——原本的設計是「使用
+// 者主動要求設定就讓他填完，不設時間限制」，但這代表萬一 KEY0 被誤觸（例如
+// 放置位置容易被碰到），裝置會無限期停留在設定模式、完全不會回到 BLE_RECEIVE
+// 監測狀態，中間這段時間所有生理量測裝置的資料都不會被收到，而且不會有任何
+// 提示——比起「讓使用者填表單填久一點」，這個monitoring 空窗期的風險更高，
+// 所以改成手動重新進入也套用跟開機時一樣的 3 分鐘上限，逾時一樣自動退回
+// BLE_RECEIVE（沿用「按住 KEY0 取消」這個更快的離開方式，不受影響）。
 #define AP_CONFIG_BOOT_TIMEOUT_MS  180000
 #define BLE_IDLE_UPLOAD_TRIGGER_MS 5000
 
@@ -51,7 +58,9 @@ void state_machine_run(void) {
                 radio_switch_to_wifi();
                 led_status_set(LED_SOLID_ON);
                 mode_ap_config_run(ap_config_timeout_ms); // 阻塞直到設定完成/取消/逾時
-                ap_config_timeout_ms = 0; // 之後的重新進入（KEY0 長按）不設逾時
+                // 2026-09-02 起，之後的重新進入（KEY0 長按）沿用同一個
+                // AP_CONFIG_BOOT_TIMEOUT_MS，不再歸零成無限期等待，見上面
+                // 常數宣告處的說明。
                 state = STATE_BLE_RECEIVE;
                 break;
 
