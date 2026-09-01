@@ -26,6 +26,10 @@
 #define KEY2_HISTORY_VIEW_MS 8000
 #define KEY2_HISTORY_DISPLAY_ROWS 7
 
+// KEY2 短按判定用的短/長分界（見 button_input_key2_pressed() 的說明），跟
+// KEY0/KEY1 統一成同一個 3000ms，目前執行期間沒有對應的 KEY2 長按動作。
+#define KEY2_LONG_PRESS_HOLD_MS 3000
+
 // 還沒校時成功時，每隔這麼久主動連一次 WiFi 重試 NTP，不等待收到裝置讀值
 // 才觸發（見主迴圈裡的說明）。校時成功後這個計時器就不會再觸發。
 #define NTP_UNSYNCED_RETRY_MS (5 * 60 * 1000)
@@ -59,6 +63,12 @@ static gatt_client_characteristic_t s_fora_characteristic;
 static gatt_client_notification_t s_notification_listener;
 
 static ble_receive_state_t s_ble_state = BLE_STATE_IDLE;
+// GM700SB 反應式配對成功後要從哪一步重試——原本唯一的觸發點是
+// BLE_STATE_ENABLE_NOTIFY 訂閱失敗，2026-09-02 加了 BLE_STATE_DISCOVER_
+// SERVICE 這個新的觸發點（見 GATT_EVENT_QUERY_COMPLETE 的說明），兩者重試
+// 時要呼叫的函式不一樣，用這個變數記住觸發當下是哪一步，見 SM_EVENT_
+// PAIRING_COMPLETE 的說明。
+static ble_receive_state_t s_rightest_pairing_resume_state = BLE_STATE_IDLE;
 static volatile bool s_connected_and_ready = false;
 static absolute_time_t s_last_reading_at;
 static uint32_t s_idle_timeout_ms;
@@ -275,14 +285,16 @@ static rightest_record_summary_t s_rightest_summary;
 static uint16_t s_rightest_next_index;
 static uint16_t s_rightest_target_count; // 這次連線打算讀到第幾個 index（含）
 
-// 2026-09-01 使用者決定：GM700SB 的藍牙晶片持續廣播、廣播內容也證實看不出
-// 有沒有新資料（實機比對過量測前後的 raw_adv 完全一樣），拉長冷卻時間只能
-// 降低頻率、無法真正做到「量完才連線」，使用者要的是完全不被動掃描——GM700SB
-// 改成純手動觸發（原本 KEY1 長按，2026-09-02 手勢互換成 KEY1 短按，見
-// mode_ble_receive_run() 主迴圈的說明），handle_advertising_report() 平常
-// 掃描到 GM700SB 的廣播一律忽略、不連線，只有 s_rightest_manual_sync_active
-// 是 true 的這段期間才會比對/連線。FORA 系列裝置（額溫槍/血氧計/血壓計/
-// MD6）完全不受影響，維持原本自動連線。
+// 2026-09-01 曾經改成純手動觸發，2026-09-02 一度改成跟 FORA 系列一樣的
+// 自動連線＋冷卻模式（見 git 歷史/PROJECT_PLAN.md §6.6），但實機測試發現
+// GM700SB 連線嘗試本身會讓裝置發出提示音——FORA 系列裝置只有量測完那段
+// 時間才廣播，自動連線自然稀疏；GM700SB 不管有沒有人在用都持續廣播，改成
+// 自動連線等於每次冷卻一到就再嘗試一次、再響一次，病患會持續被打擾。
+// **最終定案**：GM700SB 不做背景自動連線，只有兩種觸發來源會真的去比對/
+// 連線，見 s_rightest_manual_sync_active 宣告處的說明：
+//   1. KEY1 短按——護理人員臨時要用時手動觸發。
+//   2. 每天固定時間自動觸發一次——見 RIGHTEST_AUTO_SYNC_HOUR，一天最多讓
+//      裝置被連線嘗試/響一次，不是每次冷卻到期就響。
 //
 // KEY1_LONG_PRESS_HOLD_MS 同時是「短按觸發 GM700SB 同步」跟「長按觸發 WiFi/
 // 上傳」（見 mode_ble_receive_run() 主迴圈）的分界門檻——放開時按住時間小於
@@ -290,12 +302,24 @@ static uint16_t s_rightest_target_count; // 這次連線打算讀到第幾個 in
 // 的長按門檻（KEY0_ENTER_CONFIG_HOLD_MS）統一成 3 秒，避免同一台裝置上不同
 // 按鍵的「長按」判定標準不一致，容易誤觸或搞混。
 #define KEY1_LONG_PRESS_HOLD_MS 3000
-// 按了 KEY1 長按之後，最多等這麼久沒掃到 GM700SB 就自動放棄、恢復忽略
-// GM700SB 廣播——避免使用者按一次之後裝置不在附近，這個「可以連線」的視窗
-// 卻無限期留著，之後裝置隨便什麼時候出現都會被自動連上，變相又回到全自動。
+// 按了 KEY1 或每天定時觸發之後，最多等這麼久沒掃到 GM700SB 就自動放棄、
+// 恢復忽略 GM700SB 廣播——避免視窗無限期留著，之後裝置隨便什麼時候出現
+// 都會被自動連上、變相又回到全自動背景連線（就是要避免的提示音打擾）。
 #define RIGHTEST_MANUAL_SYNC_WINDOW_MS (30 * 1000)
 static bool s_rightest_manual_sync_active = false;
 static absolute_time_t s_rightest_manual_sync_until;
+
+// 每天固定時間自動打開一次跟 KEY1 短按完全相同的同步視窗（等同軟體幫使用者
+// 按一次 KEY1），給居家照護情境用——個案端裝置留在家中跟 PICO 同一個空間，
+// 不用等每週訪視護理人員來才手動同步，且一天只觸發一次，不會像背景自動
+// 連線那樣持續讓裝置發出提示音。時間點使用者選定 22:00。用「距離上次校時
+// 過的本地日期是否已經觸發過」判斷，不是固定間隔計時器，避免裝置中途重
+// 開機/模式切換造成同一天觸發兩次以上——但重開機後這個判斷本身也會重置
+// （下方宣告是一般 static，不落 flash），頂多造成同一天多觸發一次，不是
+// 正確性問題。必須等 wall_clock_is_synced() 為 true 才會生效，沒校時成功
+// 時 Pico 不知道現在是幾點，無從判斷（這段期間只有 KEY1 手動觸發能用）。
+#define RIGHTEST_AUTO_SYNC_HOUR 22
+static int64_t s_rightest_auto_sync_last_local_day = -1;
 
 static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
@@ -576,10 +600,9 @@ static void finish_rightest_session(void) {
     s_rightest_session_state = RIGHTEST_SESSION_IDLE;
     s_kind_cooldown_until[FORA_DEVICE_RIGHTEST_GM700SB] =
         make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_RIGHTEST_GM700SB]);
-    // 2026-09-01：這次手動觸發的同步視窗已經用掉了（不管結果是讀到新資料、
-    // 確認沒有新資料、還是解析失敗），關掉閘門、恢復平常忽略 GM700SB 廣播，
-    // 見 s_rightest_manual_sync_active 宣告處的說明。只是設一個 bool，不影響
-    // 這個函式原本的斷線時序。
+    // 這次手動觸發的同步視窗已經用掉了（不管結果是讀到新資料、確認沒有
+    // 新資料、還是解析失敗），關掉閘門、恢復平常忽略 GM700SB 廣播，見
+    // s_rightest_manual_sync_active 宣告處的說明。
     s_rightest_manual_sync_active = false;
     printf("[BLE] rightest: closing PCL mode and disconnecting...\n");
     send_rightest_pcl_mode(RIGHTEST_PCL_MODE_OFF);
@@ -998,10 +1021,12 @@ static void handle_advertising_report(uint8_t *packet) {
         // （ATT 層寫入永遠成功，但沒有 Notify 回應——回頭看協定文件附錄的
         // 資料同步流程圖，官方流程本來就不包含這一步），已經拿掉，目前
         // 這個 Service UUID 粗篩是唯一的身份確認機制，見
-        // PROJECT_PLAN.md 第 6.6 節。
-        // 2026-09-01：加上 s_rightest_manual_sync_active 這個閘門——GM700SB
-        // 廣播是持續性的，平常掃描到就直接忽略，只有使用者長按 KEY1 觸發
-        // 手動同步的那段時間窗口內才會真的比對/連線，見上面宣告處的說明。
+        // PROJECT_PLAN.md 第 6.6 節（誤配對到其他 0xFEE0 裝置的風險見那裡）。
+        // GM700SB 廣播是持續性的，平常掃描到就直接忽略，只有
+        // s_rightest_manual_sync_active 是 true 的這段期間（KEY1 短按或
+        // 每天定時觸發）才會真的比對/連線——刻意不比照 FORA 系列掃到就連，
+        // 因為連線嘗試本身會讓 GM700SB 發出提示音，背景持續自動連線會一直
+        // 打擾病患，見上面宣告處的說明。
         kind = FORA_DEVICE_RIGHTEST_GM700SB;
         matched = true;
     }
@@ -1077,16 +1102,32 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                 // handle_hci_event() 連線完成分支殘留的說明，已經證實走不通）
                 // ——這其實是藍牙標準裡「中央端該主動配對」的訊號：收到這個
                 // ATT 錯誤才呼叫 sm_request_pairing()，配對成功後重試剛剛
-                // 失敗的那個操作。目前只在 BLE_STATE_ENABLE_NOTIFY（訂閱
+                // 失敗的那個操作。原本只在 BLE_STATE_ENABLE_NOTIFY（訂閱
                 // FEE2）這一步實測會走到這裡，其他步驟（服務/characteristic
-                // 探索）不需要加密就能查詢成功。**這個重試邏輯本身還沒實機
-                // 驗證過**，見 PROJECT_PLAN.md 第 6.6 節。
+                // 探索）不需要加密就能查詢成功。
+                //
+                // 2026-09-02 擴大範圍：使用者清空 PICO 的 flash（連同 BTstack
+                // 的配對金鑰）之後、GM700SB 那端還記得舊的配對紀錄，造成兩邊
+                // 配對狀態不對稱——這次連最早的 BLE_STATE_DISCOVER_SERVICE
+                // 都直接失敗，`att_status=0x1f`（不是標準 ATT 錯誤碼，懷疑是
+                // 連線在查詢途中就被裝置那端中斷、BTstack 回報的內部狀態，
+                // 見同一次斷線事件的 `reason=0x3e`）。**這個假設沒有把握**：
+                // 先前實機測試過「PICO 主動在連線當下送配對請求」完全沒有
+                // 收到裝置回應（見 PROJECT_PLAN.md 第 6.6 節 2026-08-28 第二次
+                // 嘗試），跟這裡想做的事一樣是「主動要求配對」，那次沒有用。
+                // 加這段是因為除了請使用者去翻血糖機選單清除配對之外沒有
+                // 其他路可試，值得實機驗證一次；如果還是沒反應，代表這條路
+                // 真的走不通，要嘛回頭找血糖機端清除配對的方法，要嘛這台
+                // 裝置的配對記錄目前沒辦法在不動血糖機的情況下修好。
                 if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB &&
-                    s_ble_state == BLE_STATE_ENABLE_NOTIFY &&
+                    (s_ble_state == BLE_STATE_ENABLE_NOTIFY ||
+                     s_ble_state == BLE_STATE_DISCOVER_SERVICE) &&
                     (att_status == ATT_ERROR_INSUFFICIENT_AUTHENTICATION ||
-                     att_status == ATT_ERROR_INSUFFICIENT_ENCRYPTION)) {
-                    printf("[BLE] rightest: att_status=0x%02x (insufficient auth/encryption), "
-                           "requesting pairing then retrying...\n", att_status);
+                     att_status == ATT_ERROR_INSUFFICIENT_ENCRYPTION ||
+                     att_status == 0x1f)) {
+                    printf("[BLE] rightest: att_status=0x%02x at state=%d, "
+                           "requesting pairing then retrying...\n", att_status, s_ble_state);
+                    s_rightest_pairing_resume_state = s_ble_state;
                     s_ble_state = BLE_STATE_PAIRING;
                     sm_request_pairing(s_connection_handle);
                     break;
@@ -1315,12 +1356,19 @@ static void handle_sm_event(uint8_t packet_type, uint16_t channel, uint8_t *pack
             uint8_t status = sm_event_pairing_complete_get_status(packet);
             if (status == ERROR_CODE_SUCCESS) {
                 if (s_current_kind == FORA_DEVICE_RIGHTEST_GM700SB) {
-                    // GM700SB 是收到 ATT_ERROR_INSUFFICIENT_AUTHENTICATION
-                    // 才反應式呼叫 sm_request_pairing()（見上面 GATT_EVENT_
-                    // QUERY_COMPLETE 的說明），目前唯一會走到這條路的觸發點
-                    // 是訂閱 FEE2 Notify 失敗，配對成功後重試那一步。
-                    printf("[BLE] rightest: pairing complete, retrying notify subscription...\n");
-                    enable_rightest_notify();
+                    // GM700SB 是收到 ATT 錯誤才反應式呼叫 sm_request_pairing()
+                    // （見上面 GATT_EVENT_QUERY_COMPLETE 的說明），觸發點可能
+                    // 是訂閱 FEE2 Notify 失敗、也可能是服務探索本身失敗
+                    // （2026-09-02 新增，PICO 清空過配對金鑰、GM700SB 那端
+                    // 還記得舊紀錄的情境），兩者重試要呼叫的函式不一樣，靠
+                    // s_rightest_pairing_resume_state 記住的觸發點分流。
+                    if (s_rightest_pairing_resume_state == BLE_STATE_DISCOVER_SERVICE) {
+                        printf("[BLE] rightest: pairing complete, retrying service discovery...\n");
+                        discover_rightest_service();
+                    } else {
+                        printf("[BLE] rightest: pairing complete, retrying notify subscription...\n");
+                        enable_rightest_notify();
+                    }
                 } else {
                     printf("[BLE] pairing complete, proceeding...\n");
                     proceed_after_pairing();
@@ -1446,6 +1494,15 @@ static void handle_hci_event(uint8_t packet_type, uint16_t channel, uint8_t *pac
             // 說明。
             s_rightest_manual_sync_active = false;
         }
+        // 2026-09-02 修好一個 bug：s_current_kind 是「這個模式期間最後一次
+        // 成功匹配到的裝置種類」，不會在每次連線結束後自動重置，只有換一種
+        // 別的裝置匹配到才會被覆蓋。之前只在 mode_ble_receive_run() 開頭重置
+        // 一次，導致「這次斷線其實跟 GM700SB 無關（例如是別的 0xFEE0 裝置、
+        // 或這次連線嘗試根本不是 GM700SB）」時，上面的判斷還是會被舊值誤觸發
+        // ——實機測試觀察到，KEY1 剛開窗、緊接著一個完全無關的斷線事件就把
+        // 剛開的視窗關掉，使用者等於白按。這裡統一重置，確保下一輪連線嘗試
+        // 開始前 s_current_kind 一定是這次真正匹配到的種類，不會殘留舊值。
+        s_current_kind = FORA_DEVICE_UNKNOWN;
         s_connected_and_ready = false;
         s_connection_handle = HCI_CON_HANDLE_INVALID;
         start_scan();
@@ -1538,12 +1595,8 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
         }
 
         // KEY1 短按：手動觸發 GM700SB 同步（見 s_rightest_manual_sync_active
-        // 宣告處的說明——GM700SB 平常完全不主動連線，只有這段視窗期間掃描到
-        // 才會連）。2026-09-02 使用者決定跟下面 WiFi/上傳那個動作互換手勢
-        // （原本短按=WiFi、長按=GM700SB，改成短按=GM700SB、長按=WiFi）——
-        // GM700SB 同步是比較常用的日常動作，短按比長按輕鬆，兩個
-        // button_input_key1_*() 函式各自獨立追蹤按下/放開時間，這裡呼叫順序
-        // 不影響判定結果，純粹是程式碼閱讀順序上先寫短按。
+        // 宣告處的說明——連線嘗試本身會讓 GM700SB 發出提示音，2026-09-02
+        // 最終決定不做背景自動連線，只有這段視窗期間掃描到才會連）。
         if (button_input_key1_pressed(KEY1_LONG_PRESS_HOLD_MS)) {
             printf("[BLE] KEY1 pressed, listening for GM700SB for the next %us...\n",
                    (unsigned)(RIGHTEST_MANUAL_SYNC_WINDOW_MS / 1000));
@@ -1552,13 +1605,29 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
         }
         // 手動同步視窗逾時還沒掃到 GM700SB（裝置不在範圍內、或使用者按完
         // 忘記靠近）——自動關閉閘門，避免視窗無限期留著、之後裝置隨便什麼
-        // 時候出現都會被自動連上，變相又回到全自動。真的連上的話閘門會在
-        // finish_rightest_session()/逾時斷線處理提早關掉，這裡不會生效
-        // （s_rightest_manual_sync_active 那時已經是 false，time_reached()
+        // 時候出現都會被自動連上，變相又回到全自動背景連線。真的連上的話
+        // 閘門會在 finish_rightest_session()/逾時斷線處理提早關掉，這裡不會
+        // 生效（s_rightest_manual_sync_active 那時已經是 false，time_reached()
         // 判斷再成立也沒差，不會有副作用）。
         if (s_rightest_manual_sync_active && time_reached(s_rightest_manual_sync_until)) {
             printf("[BLE] rightest: manual sync window expired without finding the device.\n");
             s_rightest_manual_sync_active = false;
+        }
+
+        // 每天 RIGHTEST_AUTO_SYNC_HOUR 點自動打開一次同步視窗，等同軟體幫
+        // 使用者按一次 KEY1——只在還沒有視窗開著時才判斷，避免把使用者剛
+        // 手動觸發的視窗覆蓋掉（覆蓋本身無害，但會讓 log 意圖不清楚）。
+        if (wall_clock_is_synced() && !s_rightest_manual_sync_active) {
+            uint64_t epoch_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
+            int64_t local_sec = (int64_t)(epoch_ms / 1000) + LOCAL_UTC_OFFSET_SEC;
+            int64_t local_day = local_sec / 86400;
+            unsigned local_hour = (unsigned)((local_sec % 86400) / 3600);
+            if (local_hour >= RIGHTEST_AUTO_SYNC_HOUR && s_rightest_auto_sync_last_local_day != local_day) {
+                printf("[BLE] rightest: daily auto-sync window opening (local hour %u)...\n", local_hour);
+                s_rightest_auto_sync_last_local_day = local_day;
+                s_rightest_manual_sync_active = true;
+                s_rightest_manual_sync_until = make_timeout_time_ms(RIGHTEST_MANUAL_SYNC_WINDOW_MS);
+            }
         }
 
         // KEY1 長按：手動要求做一次完整的 WiFi 動作（連線→強制重新 NTP 校時→
@@ -1575,7 +1644,7 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
         // KEY2：顯示未上傳（PENDING/FAILED）紀錄，一次一頁。第一次按（或畫面
         // 已經逾時換回 BLE_RECEIVE 之後再按）固定從第 0 頁開始；畫面還顯示著
         // 的時候再按一次則翻到下一頁，翻完最後一頁繞回第 0 頁。
-        if (button_input_key2_pressed()) {
+        if (button_input_key2_pressed(KEY2_LONG_PRESS_HOLD_MS)) {
             size_t total = storage_pending_count();
             size_t page_count = total == 0 ? 1 : (total + KEY2_HISTORY_DISPLAY_ROWS - 1) / KEY2_HISTORY_DISPLAY_ROWS;
             if (s_showing_history) {

@@ -198,18 +198,16 @@ static void append_escaped_wifi_field(char *out, size_t out_size, size_t *len, c
     out[*len] = '\0';
 }
 
-static void build_wifi_qr_text(char *out, size_t out_size, const char *ssid, const char *password) {
+// 2026-09-02 熱點改成開放式（見 mode_ap_config.c AP_PASSWORD_FIXED 拿掉處的
+// 說明），QR code 內容跟著改成 "WIFI:T:nopass;S:...;;"——沒有 P 欄位，T 值
+// 用業界慣例的 "nopass" 表示這是開放網路，手機掃到一樣會自動跳出「加入
+// WiFi」的系統提示，不需要輸入密碼。
+static void build_wifi_qr_text(char *out, size_t out_size, const char *ssid) {
     size_t len = 0;
     out[0] = '\0';
-    snprintf(out, out_size, "WIFI:T:WPA;S:");
+    snprintf(out, out_size, "WIFI:T:nopass;S:");
     len = strlen(out);
     append_escaped_wifi_field(out, out_size, &len, ssid);
-    if (len + 3 < out_size) {
-        memcpy(out + len, ";P:", 3);
-        len += 3;
-        out[len] = '\0';
-    }
-    append_escaped_wifi_field(out, out_size, &len, password);
     if (len + 2 < out_size) {
         memcpy(out + len, ";;", 2);
         len += 2;
@@ -257,21 +255,22 @@ static void draw_qr_code(const uint8_t *qr, int x0, int y0, int target_size_px) 
 // 之後如果改 gw IP 要記得兩邊一起改。
 #define AP_CONFIG_SETUP_URL "http://192.168.4.1/"
 
-void display_status_show_ap_config(const char *ap_ssid, const char *ap_password,
+void display_status_show_ap_config(const char *ap_ssid,
                                     const device_config_t *existing_config) {
     s_ble_screen_is_current = false;
     begin_frame();
 
-    // 版面（296x128，橫向，2026-08-28 第二版調整）：左側窄文字欄 + 右側並排
-    // 兩個「同樣大小」的方框各畫一個 QR code（WiFi 帳密 / 設定頁網址），標題
-    // 之外全部統一用 Font12——標題（"Setup"）用 Font16 特別大一點，其餘文字
-    // （SSID/密碼/個案編號/QR 說明）大小都一致。
+    // 版面（296x128，橫向，2026-08-28 第二版調整；2026-09-02 熱點改成開放式，
+    // 拿掉 Pass 那一行，SSID/ID 兩行往上移，下面多出來的空間先留白不用）：
+    // 左側窄文字欄 + 右側並排兩個「同樣大小」的方框各畫一個 QR code（WiFi /
+    // 設定頁網址），標題之外全部統一用 Font12——標題（"Setup"）用 Font16
+    // 特別大一點，其餘文字（SSID/個案編號/QR 說明）大小都一致。
     Paint_DrawString_EN(4, 1, "Setup", &Font16, BLACK, WHITE);
 
-    // SSID/密碼/個案編號都是「標籤」+「值」各佔一行：Font12 比先前拿掉的 Font8
+    // SSID/個案編號都是「標籤」+「值」各佔一行：Font12 比先前拿掉的 Font8
     // 寬，SSID 帶了 MAC 衍生字尾（例如 "GATEWAY-DC15"）跟標籤同一行放不下，
-    // 乾脆全部統一換行，視覺上也比較一致。標籤（"SSID:"/"Pass:"/"ID:"）故意
-    // 用反色（白字黑底——Paint_DrawString_EN(fg, bg) 把前景/背景對調成
+    // 乾脆全部統一換行，視覺上也比較一致。標籤（"SSID:"/"ID:"）故意用反色
+    // （白字黑底——Paint_DrawString_EN(fg, bg) 把前景/背景對調成
     // (WHITE, BLACK)）畫成一個小色塊，跟下面的實際數值（維持黑字白底，方便
     // 使用者看/抄）拉出視覺區隔，一眼就能分辨「這是欄位名稱」還是「這是要
     // 抄下來的值」。2026-08-28：這個反色效果原本是 GUI_Paint.c 的 bug（見
@@ -282,19 +281,15 @@ void display_status_show_ap_config(const char *ap_ssid, const char *ap_password,
     snprintf(line, sizeof(line), "%s", ap_ssid);
     Paint_DrawString_EN(4, 32, line, &Font12, BLACK, WHITE);
 
-    Paint_DrawString_EN(4, 45, "Pass:", &Font12, WHITE, BLACK);
-    snprintf(line, sizeof(line), "%s", ap_password);
-    Paint_DrawString_EN(4, 58, line, &Font12, BLACK, WHITE);
-
     char patient_id_ascii[PATIENT_ID_MAX_LEN];
     if (existing_config != NULL && existing_config->valid) {
         sanitize_ascii(existing_config->patient_id, patient_id_ascii, sizeof(patient_id_ascii));
     } else {
         patient_id_ascii[0] = '\0';
     }
-    Paint_DrawString_EN(4, 71, "ID:", &Font12, WHITE, BLACK);
+    Paint_DrawString_EN(4, 45, "ID:", &Font12, WHITE, BLACK);
     snprintf(line, sizeof(line), "%s", patient_id_ascii[0] != '\0' ? patient_id_ascii : "(unset)");
-    Paint_DrawString_EN(4, 84, line, &Font12, BLACK, WHITE);
+    Paint_DrawString_EN(4, 58, line, &Font12, BLACK, WHITE);
 
     // 兩個 QR code 共用同一對靜態 buffer（version 10 綽綽有餘，兩個字串都遠小
     // 於這個上限），畫完第一個馬上編碼畫第二個，不需要同時保留兩份。
@@ -313,7 +308,7 @@ void display_status_show_ap_config(const char *ap_ssid, const char *ap_password,
     // 用黑底白字，見上面的說明）。
     Paint_DrawString_EN(AP_CONFIG_QR1_X, 1, "1. Join WiFi", &Font12, WHITE, BLACK);
     char wifi_text[160];
-    build_wifi_qr_text(wifi_text, sizeof(wifi_text), ap_ssid, ap_password);
+    build_wifi_qr_text(wifi_text, sizeof(wifi_text), ap_ssid);
     bool wifi_qr_ok = qrcodegen_encodeText(wifi_text, s_qr_temp, s_qr_code, qrcodegen_Ecc_MEDIUM,
                                             qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true);
     if (wifi_qr_ok) {

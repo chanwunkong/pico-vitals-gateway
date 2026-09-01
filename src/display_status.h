@@ -21,9 +21,10 @@ void display_status_init(void);
 // main.c 開機時呼叫一次。
 void display_status_show_boot_test(void);
 
-// 熱點設定模式（AP_CONFIG）畫面：熱點 SSID/密碼 + 目前已存的個案編號（沒有
-// 就顯示 "(unset)"）。整個模式期間內容不會變，呼叫一次即可，不需要輪詢。
-void display_status_show_ap_config(const char *ap_ssid, const char *ap_password,
+// 熱點設定模式（AP_CONFIG）畫面：熱點 SSID + 目前已存的個案編號（沒有
+// 就顯示 "(unset)"）。2026-09-02 熱點改成開放式，不再顯示密碼欄位。整個
+// 模式期間內容不會變，呼叫一次即可，不需要輪詢。
+void display_status_show_ap_config(const char *ap_ssid,
                                     const device_config_t *existing_config);
 
 // 上傳模式（UPLOAD）畫面：WiFi SSID + 目前階段/結果文字（例如 "Connecting..."、

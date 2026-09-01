@@ -539,24 +539,37 @@ static const uint8_t ITRI_LOGO_PNG[] = {
 };
 #define ITRI_LOGO_PNG_LEN 7605
 
-// KEY0 需要按住這麼久才會取消 AP_CONFIG，比進入這個模式用的 3 秒短，但比
-// 瞬間單擊要求更多，降低誤觸發風險。
-#define AP_CONFIG_CANCEL_HOLD_MS 1000
+// KEY0 取消 AP_CONFIG 的短/長分界。2026-09-02 曾經一度改成
+// button_input_key0_long_press(3000)（按住途中觸發），這樣「短按」等於
+// 要求使用者先按住整整 3 秒才會動作，跟手冊上「短按＝取消」互相矛盾，
+// 所以先改回獨立的 1 秒 hold-triggered 版本。同一天再往下一步：改用
+// button_input_key0_pressed()（放開時才判定，跟 KEY1 的短按同一種寫法），
+// 這樣「短按」才是真正的「碰一下快速放開就觸發」，不用刻意按住任何時間；
+// 只有按住 >= 這個門檻還沒放開才不算短按（那種情況本來就沒有對應的
+// KEY0 長按動作可以接手，單純變成沒反應）。門檻沿用 3000，三顆鍵的短/長
+// 分界數字統一。
+//
+// 取捨：這個改法讓誤觸發的機率比原本的 1 秒版本略高——連著設定頁的手機
+// 可能正在填表單，如果不小心快速碰到 KEY0 一下就會直接取消、熱點斷線、
+// 表單內容全部消失（見這個常數原本要防的情境）。是使用者在確認過三顆鍵
+// 的完整判定規則後，主動要求統一成這個規則，不是我方誤判。
+#define AP_CONFIG_CANCEL_HOLD_MS 3000
 
 typedef struct {
     char ssid[33];
     int16_t rssi;
 } scanned_network_t;
 
-// 熱點密碼所有裝置固定同一組（2026-08-06 從每台裝置唯一衍生改回固定值）：
-// 無螢幕版本沒有任何管道能讓使用者知道衍生出來的密碼是什麼，固定值可以事先
-// 印在文件/貼紙上，任何一台裝置都適用。SSID 仍然每台裝置唯一（見下方
-// generate_ap_ssid()），用來分辨機台；密碼固定不影響這一點。
-#define AP_PASSWORD_FIXED "02750963"
-
-static void generate_ap_password(char *out, size_t out_size) {
-    snprintf(out, out_size, "%s", AP_PASSWORD_FIXED);
-}
+// 2026-09-02 使用者決定拿掉熱點密碼、改成開放式熱點：這組密碼原本就是全部
+// 裝置共用同一組固定值、印在手冊/螢幕上給人看的，對「看過手冊的人」形同
+// 公開資訊，防不了刻意衝著這台裝置來的人；真正擋到的只是「手機自動掃到
+// 開放網路就想連連看」這種隨機接觸。熱點只在開機後最長 3 分鐘、或使用者
+// 主動長按左鍵重新叫出來時才存在，不是常駐廣播，曝險窗口窄、且通常有人
+// 在場操作，殘餘風險可接受；換來的是拿掉「手動輸入密碼」這條備援路徑的
+// 操作摩擦——QR code 路徑本來就自動帶密碼、使用者無感，唯一會撞到密碼的
+// 是手機 WiFi 清單手動選取＋輸入密碼這條路，拿掉密碼後這條路變成直接連上、
+// 不用找密碼是多少。SSID 仍然每台裝置唯一（見下方 generate_ap_ssid()），
+// 用來分辨機台。
 
 // 熱點名稱也不寫死，同樣的理由：多台裝置部署在同一個場所（例如同一層病房）
 // 時，如果每台都叫一模一樣的名稱，使用者手機的 WiFi 列表會看到好幾個同名
@@ -1292,14 +1305,12 @@ void mode_ap_config_run(uint32_t timeout_ms) {
     scan_nearby_wifi();
     render_config_form_response();
 
-    char ap_password[16];
-    generate_ap_password(ap_password, sizeof(ap_password));
     char ap_ssid[32];
     generate_ap_ssid(ap_ssid, sizeof(ap_ssid));
 
-    printf("[AP_CONFIG] starting hotspot ssid=\"%s\"\n", ap_ssid);
-    cyw43_arch_enable_ap_mode(ap_ssid, ap_password, CYW43_AUTH_WPA2_AES_PSK);
-    display_status_show_ap_config(ap_ssid, ap_password, s_have_current_config ? &s_current_config : NULL);
+    printf("[AP_CONFIG] starting hotspot ssid=\"%s\" (open, no password)\n", ap_ssid);
+    cyw43_arch_enable_ap_mode(ap_ssid, NULL, CYW43_AUTH_OPEN);
+    display_status_show_ap_config(ap_ssid, s_have_current_config ? &s_current_config : NULL);
 
     ip4_addr_t gw, mask;
     IP4_ADDR(&gw, 192, 168, 4, 1);
@@ -1316,18 +1327,16 @@ void mode_ap_config_run(uint32_t timeout_ms) {
     listen_pcb = tcp_listen(listen_pcb);
     tcp_accept(listen_pcb, http_accept_cb);
 
-    // KEY0 短按住取消：不想改設定的話不用真的把表單送出來才能離開，按住
-    // KEY0 一下（AP_CONFIG_CANCEL_HOLD_MS，比進入這個模式用的長按短，但還是
-    // 要求短暫按住而不是碰一下就觸發——連著的手機可能正在填表單，誤觸發會
-    // 讓熱點斷線、表單內容全部消失）就退回 BLE_RECEIVE，不會呼叫
-    // storage_save_config()。timeout_ms > 0 時額外加一個時間上限，逾時一樣
-    // 視同取消（見 mode_ap_config.h 說明）。
+    // KEY0 短按取消：不想改設定的話不用真的把表單送出來才能離開，碰一下
+    // KEY0 快速放開（AP_CONFIG_CANCEL_HOLD_MS，見上面宣告處的說明）就退回
+    // BLE_RECEIVE，不會呼叫 storage_save_config()。timeout_ms > 0 時額外加
+    // 一個時間上限，逾時一樣視同取消（見 mode_ap_config.h 說明）。
     bool cancelled = false;
     absolute_time_t deadline = timeout_ms > 0 ? make_timeout_time_ms(timeout_ms) : nil_time;
     while (!s_config_submitted && !cancelled) {
         led_status_poll();
-        if (button_input_key0_long_press(AP_CONFIG_CANCEL_HOLD_MS)) {
-            printf("[AP_CONFIG] KEY0 held, cancelling without saving.\n");
+        if (button_input_key0_pressed(AP_CONFIG_CANCEL_HOLD_MS)) {
+            printf("[AP_CONFIG] KEY0 pressed, cancelling without saving.\n");
             cancelled = true;
             break;
         }

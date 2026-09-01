@@ -132,6 +132,8 @@ bool rightest_protocol_parse_model_name(const uint8_t *frame, size_t frame_len, 
 }
 
 bool rightest_protocol_matches_advertisement(const uint8_t *adv_data, uint8_t adv_len) {
+    bool has_service_uuid = false;
+    bool has_companion_uuid = false;
     ad_context_t context;
     for (ad_iterator_init(&context, adv_len, adv_data); ad_iterator_has_more(&context);
          ad_iterator_next(&context)) {
@@ -146,11 +148,20 @@ bool rightest_protocol_matches_advertisement(const uint8_t *adv_data, uint8_t ad
         for (uint8_t i = 0; i + 2 <= data_len; i += 2) {
             uint16_t uuid16 = (uint16_t)data[i] | ((uint16_t)data[i + 1] << 8); // little-endian
             if (uuid16 == RIGHTEST_SERVICE_UUID16) {
-                return true;
+                has_service_uuid = true;
+            } else if (uuid16 == RIGHTEST_COMPANION_SERVICE_UUID16) {
+                has_companion_uuid = true;
             }
         }
     }
-    return false;
+    // 2026-09-01 實機測試發現：0xFEE0 是 Bluetooth SIG 分配給小米的官方
+    // UUID，附近的 Mi Band 等小米裝置也會廣播同一個 UUID，光憑 0xFEE0
+    // 會誤連到不相干的裝置（連線後才會被 FEE1/FEE2/FEE3 characteristic
+    // 檢查擋下來，不會讀到錯資料，但白白浪費手動同步視窗的時間）。實機
+    // 觀察到 GM700SB 每次廣播都同時帶 0xFEE0 跟 0xFEF5 這兩個 UUID（原始
+    // 封包內容完全一致，見開發過程的 debug log），要求兩者都出現才通過
+    // 粗篩，濾掉單獨只帶 0xFEE0 的裝置。
+    return has_service_uuid && has_companion_uuid;
 }
 
 void rightest_reassembly_reset(rightest_reassembly_t *state) {

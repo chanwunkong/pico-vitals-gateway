@@ -42,6 +42,10 @@
 //     方式（`gatt_client_write_value_of_characteristic()`），不能像 FORA
 //     那樣用 write-without-response。
 #define RIGHTEST_SERVICE_UUID16               0xFEE0
+// 廣播粗篩用的第二個 UUID，跟 0xFEE0 一起出現才算通過，見
+// rightest_protocol_matches_advertisement() 的說明（濾掉單獨廣播 0xFEE0
+// 的小米裝置）。
+#define RIGHTEST_COMPANION_SERVICE_UUID16     0xFEF5
 #define RIGHTEST_CHARACTERISTIC_PCL_UUID16    0xFEE1
 #define RIGHTEST_CHARACTERISTIC_NOTIFY_UUID16 0xFEE2
 #define RIGHTEST_CHARACTERISTIC_WRITE_UUID16  0xFEE3
