@@ -1,5 +1,8 @@
 # CMake build output
 build/
+# 2026-09 RP2350 (Pico 2 W) 專用的另一個 build 目錄，跟上面的 build/ 分開
+# 是為了不影響原本 RP2040 (pico_w) 的 build/，同樣不進版控。
+build-pico2/
 
 # 編輯器/工具產生的暫存檔
 .vscode/
