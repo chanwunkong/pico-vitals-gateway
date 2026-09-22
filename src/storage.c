@@ -303,10 +303,28 @@ bool storage_append_record(const vital_record_t *record) {
     // 的問題改在 mode_ble_receive.c 用「上次同步到的那一筆原始 8 bytes」擋
     // 在源頭（backfill 一比對到就直接停手，不會走到這裡），不需要這裡再處理。
 
-    // 不論待傳佇列那邊結果如何，畫面顯示用的「最後一筆讀值」一律先更新——就算
-    // 判定是重複量測，時間戳照樣往前推進，這樣畫面上才看得出「裝置剛剛還有
-    // 確認過這個數值仍然是最新的」，不是凍結在很久以前的舊時間。
-    if (record->type < VITAL_TYPE_COUNT) {
+    // 不論待傳佇列那邊結果如何，畫面顯示用的「最後一筆讀值」原則上一律更新
+    // ——就算判定是重複量測，時間戳照樣往前推進，這樣畫面上才看得出「裝置
+    // 剛剛還有確認過這個數值仍然是最新的」，不是凍結在很久以前的舊時間。
+    //
+    // 2026-09-18 用 GM700SB 實機測試抓到一個例外沒考慮到：血壓計/MD6/GM700SB
+    // 的 backfill 流程（見 mode_ble_receive.c 的說明）是照「這次連線裡最新
+    // →最舊」的順序依序呼叫這裡，如果照上面「一律更新」的舊邏輯，backfill
+    // 迴圈跑完後畫面顯示的「最後一筆」會變成這次連線裡最舊的那筆（因為它是
+    // 迴圈裡最後一個呼叫 storage_append_record() 的），不是真正最新的——
+    // 電子紙畫面卡在很舊的日期就是這樣來的。修法：雙方都有裝置認證過的時間
+    // 戳（device_measured_key 都不是 0）時，新記錄的時間戳要不早於目前顯示
+    // 的才更新；沒有裝置時間戳可比對的情況（任一邊是 0）維持原邏輯「一律
+    // 更新」，因為那種情況本來就是靠 Pico 收到的先後順序當前後關係，不會有
+    // backfill 逆序讀取的問題。
+    bool should_update_last_reading = true;
+    if (record->type < VITAL_TYPE_COUNT && s_last_reading_valid[record->type] &&
+        record->source_kind == s_last_reading[record->type].source_kind &&
+        record->device_measured_key != 0 && s_last_reading[record->type].device_measured_key != 0) {
+        should_update_last_reading =
+            record->device_measured_key >= s_last_reading[record->type].device_measured_key;
+    }
+    if (record->type < VITAL_TYPE_COUNT && should_update_last_reading) {
         s_last_reading[record->type] = *record;
         s_last_reading_valid[record->type] = true;
     }

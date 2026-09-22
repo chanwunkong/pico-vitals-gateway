@@ -285,6 +285,20 @@ static rightest_record_summary_t s_rightest_summary;
 static uint16_t s_rightest_next_index;
 static uint16_t s_rightest_target_count; // 這次連線打算讀到第幾個 index（含）
 
+// 2026-09-18 實機測試發現：GM700SB 的 index 是「最新那筆永遠是 index=1，
+// 新記錄插進來時所有舊記錄的 index 全部往後推一位」，不是原本以為的「index
+// 越大越新、可以拿數字當跨連線定位點」——拿 index 數字當定位點（見下方 git
+// 歷史/PROJECT_PLAN.md §6.6 的說明）會導致每次新增量測後，被推到後面的舊
+// 記錄被誤判成新資料重複讀取，而真正被推到 index=1 的新記錄反而永遠讀不到。
+// 改成跟 BP/MD6 backfill（process_reading_payload()）一致的做法：定位點記
+// 「index=1（最新）那筆的原始內容」而不是索引數字，理由跟 storage.h
+// MAX_BACKFILL_ANCHOR_KINDS 的說明一致——裝置時鐘不可信任，比對原始 bytes
+// 才可靠。s_rightest_sync_anchor 是這次連線開始時載入的「舊」定位點（比對
+// 用，整個 backfill 迴圈都不變），跟 storage_set_backfill_anchor() 寫回
+// flash 的「新」定位點是分開的兩份，寫回不會影響這次連線還在進行的比對。
+static uint8_t s_rightest_sync_anchor[8];
+static bool s_rightest_sync_anchor_valid;
+
 // 2026-09-01 曾經改成純手動觸發，2026-09-02 一度改成跟 FORA 系列一樣的
 // 自動連線＋冷卻模式（見 git 歷史/PROJECT_PLAN.md §6.6），但實機測試發現
 // GM700SB 連線嘗試本身會讓裝置發出提示音——FORA 系列裝置只有量測完那段
@@ -685,49 +699,63 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             // 記錄時，每一筆都會跟「上一筆剛 commit 的」不一樣，全部被當成
             // 新資料重新塞進待傳佇列——代表下次總筆數變多、再重讀 1..
             // total_count 時，前幾筆已經上傳成功的舊記錄會被原封不動再上傳
-            // 一次，變成每次同步的筆數都是累加、重複上傳。改成 Gateway 自己
-            // 記一份「同步到第幾個 index」的定位點（借用 MD6/D40 backfill
-            // 用的同一個 storage_get_backfill_anchor()/storage_set_backfill_
-            // anchor() flash 儲存格，用 source_kind=GM700SB 當 key，anchor
-            // buffer 前 2 bytes 存 16-bit 小端 index，不是裝置的書籤、也不
-            // 需要裝置端行為可信賴），每讀完一筆（不管解析成功還是被判定
-            // QC/Hi-flag 跳過）就立刻更新這個定位點，下次連線只讀真正沒讀過
-            // 的 index，不會重複上傳。
-            uint8_t rightest_sync_anchor[8] = { 0 };
-            storage_get_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, rightest_sync_anchor);
-            uint16_t gateway_synced_index =
-                (uint16_t)rightest_sync_anchor[0] | ((uint16_t)rightest_sync_anchor[1] << 8);
-            printf("[BLE] rightest: gateway last synced index=%u\n", gateway_synced_index);
-            if (s_rightest_summary.total_count == 0 ||
-                gateway_synced_index >= s_rightest_summary.total_count) {
-                printf("[BLE] rightest: no new records since last sync.\n");
+            // 一次，變成每次同步的筆數都是累加、重複上傳。第二版改成 Gateway
+            // 自己記一份「同步到第幾個 index」的定位點——**這版也是錯的**，
+            // 2026-09-18 實機測試（用試紙做兩次真實量測後）才發現 GM700SB 的
+            // index 其實是「最新那筆永遠是 index=1，新記錄插進來全部往後推」，
+            // 完全不是「index 越大越新」，拿數字當定位點會導致每次新量測後
+            // 反而讀到被推到後面的舊記錄、真正的新記錄永遠讀不到，見上面
+            // s_rightest_sync_anchor 宣告處的說明——第三版改成跟 BP/MD6
+            // backfill 一致：定位點記「index=1（最新）那筆的原始內容」，
+            // 每次連線一律從 index=1 開始往舊的方向讀，讀到跟舊定位點完全
+            // 相同的內容就代表後面全部都同步過了，停手斷線。
+            s_rightest_sync_anchor_valid =
+                storage_get_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, s_rightest_sync_anchor);
+            if (s_rightest_summary.total_count == 0) {
+                printf("[BLE] rightest: device reports no records.\n");
                 finish_rightest_session();
                 return;
             }
-            s_rightest_next_index = (uint16_t)(gateway_synced_index + 1);
-            uint16_t remaining = (uint16_t)(s_rightest_summary.total_count - gateway_synced_index);
-            uint16_t capped = remaining > RECORD_BACKFILL_SAFETY_CAP ? RECORD_BACKFILL_SAFETY_CAP : remaining;
-            s_rightest_target_count = (uint16_t)(gateway_synced_index + capped);
-            printf("[BLE] rightest: reading records index=%u..%u...\n",
-                   s_rightest_next_index, s_rightest_target_count);
+            s_rightest_next_index = 1;
+            s_rightest_target_count = s_rightest_summary.total_count > RECORD_BACKFILL_SAFETY_CAP
+                ? RECORD_BACKFILL_SAFETY_CAP : s_rightest_summary.total_count;
+            printf("[BLE] rightest: reading records index=1..%u (newest first)...\n",
+                   s_rightest_target_count);
             s_rightest_session_state = RIGHTEST_SESSION_WAIT_RECORD;
-            uint8_t index_bytes[2] = {
-                (uint8_t)(s_rightest_next_index & 0xFF), (uint8_t)(s_rightest_next_index >> 8) };
+            uint8_t index_bytes[2] = { 1, 0 };
             send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_bytes, sizeof(index_bytes));
             break;
         }
 
         case RIGHTEST_SESSION_WAIT_RECORD: {
+            // DA0..DA5（frame[4..9]，6 bytes）是這筆記錄真正的內容識別（日期
+            // 時間/血糖值/旗標），刻意不含 index——見上面 s_rightest_sync_
+            // anchor 宣告處的說明，index 每次連線會因為新記錄插入整體位移，
+            // 不能拿來判斷「是不是同一筆」。
+            bool frame_ok = frame_len == 21 && rightest_protocol_verify_response(frame, frame_len);
+            uint8_t record_identity[8] = { 0 };
+            if (frame_ok) {
+                memcpy(record_identity, &frame[4], 6);
+            }
+            if (frame_ok && s_rightest_sync_anchor_valid &&
+                memcmp(record_identity, s_rightest_sync_anchor, sizeof(record_identity)) == 0) {
+                printf("[BLE] rightest: index=%u matches last-synced anchor, "
+                       "older records already synced, stopping.\n", s_rightest_next_index);
+                rightest_reassembly_reset(&s_rightest_reassembly);
+                finish_rightest_session();
+                return;
+            }
+
             vital_record_t record;
             bool parsed = rightest_protocol_parse_record(frame, frame_len, &record);
             rightest_reassembly_reset(&s_rightest_reassembly);
-            // 這個 index 的同步定位點要不要前進，看這筆記錄有沒有真的「處理
-            // 完」：解析失敗（checksum/Hi-flag/QC，不是病人數值）算處理完，
-            // 以後都不用再理它；解析成功但 commit_records() 回傳 false（待傳
-            // 佇列剛好滿了，見 storage.c MAX_PENDING_RECORDS 的說明）代表這筆
-            // 資料還沒真的存進系統，**不能**前進，不然下次同步不會再重試、
-            // 資料就永久漏掉了——2026-09-02 使用者要求要保證「藍牙收資料不會
-            // 漏」才加這個判斷。
+            // 這筆記錄有沒有真的「處理完」：解析失敗（checksum/Hi-flag/QC，
+            // 不是病人數值）算處理完，以後都不用再理它；解析成功但
+            // commit_records() 回傳 false（待傳佇列剛好滿了，見 storage.c
+            // MAX_PENDING_RECORDS 的說明）代表這筆資料還沒真的存進系統，
+            // **不能**當成「已同步」，不然下次同步不會再重試、資料就永久
+            // 漏掉了——2026-09-02 使用者要求要保證「藍牙收資料不會漏」才加
+            // 這個判斷。
             bool handled = true;
             if (parsed) {
                 handled = commit_records(&record, 1);
@@ -740,11 +768,12 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
                 printf("[BLE] rightest: index=%u did not parse as a valid reading "
                        "(checksum/Hi-flag/QC), skipping.\n", s_rightest_next_index);
             }
-            if (handled) {
-                uint8_t rightest_sync_anchor[8] = { 0 };
-                rightest_sync_anchor[0] = (uint8_t)(s_rightest_next_index & 0xFF);
-                rightest_sync_anchor[1] = (uint8_t)(s_rightest_next_index >> 8);
-                storage_set_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, rightest_sync_anchor);
+            // 只有 index=1（這次連線裡最新的一筆）真正處理完，才更新定位點——
+            // 定位點的定義就是「最新一筆的內容」，跟 index>1 那些記錄處理的
+            // 結果無關；index=1 沒處理完（待傳佇列滿了）就不能更新，否則下次
+            // 連線會誤判成「已經同步過」，這筆資料就永久遺失了。
+            if (s_rightest_next_index == 1 && handled && frame_ok) {
+                storage_set_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, record_identity);
             }
             s_rightest_next_index++;
             if (s_rightest_next_index > s_rightest_target_count) {
