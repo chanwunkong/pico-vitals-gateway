@@ -24,6 +24,15 @@ void fora_protocol_build_command(uint8_t cmd, uint8_t p1, uint8_t p2, uint8_t p3
     out[7] = (uint8_t)(sum & 0xFF);
 }
 
+void fora_protocol_build_set_date_time_command(
+    unsigned year, unsigned month, unsigned day, unsigned hour, unsigned minute, uint8_t out[8]) {
+    uint8_t p1 = (uint8_t)(((month & 0x07) << 5) | (day & 0x1F));
+    uint8_t p2 = (uint8_t)((((year >= 2000 ? year - 2000 : 0) & 0x7F) << 1) | ((month >> 3) & 0x01));
+    uint8_t p3 = (uint8_t)minute;
+    uint8_t p4 = (uint8_t)hour;
+    fora_protocol_build_command(FORA_CMD_SET_DATE_TIME, p1, p2, p3, p4, out);
+}
+
 uint32_t fora_protocol_decode_measured_key(const uint8_t record[8]) {
     // 欄位佈局見 fora_protocol.h 開頭註解：
     //   byte[0] = day(bits0-4) | month 低 3 bit(bits5-7)

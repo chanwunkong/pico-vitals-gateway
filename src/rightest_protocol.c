@@ -31,6 +31,42 @@ bool rightest_protocol_verify_response(const uint8_t *frame, size_t frame_len) {
     return (uint8_t)(sum & 0xFF) == frame[frame_len - 1];
 }
 
+void rightest_protocol_build_date_time_payload(
+    bool is_set, uint8_t unit, unsigned year, unsigned month, unsigned day, unsigned hour, unsigned minute,
+    uint8_t *out_data) {
+    if (is_set) {
+        // 協定的 YEAR/MONTH/DAY 是「距離基準值的偏移量」，不是直接的西元年/
+        // 月/日，見協定文件範例（Year(0x0D) Set year 2013、Month(0x08) Set
+        // September、Day(0x0C) Set 13'th day）。HOUR/MINUTE 反而是直接數值，
+        // 不用轉換。
+        out_data[0] = (uint8_t)(unit | RIGHTEST_DATETIME_SET_FLAG);
+        out_data[1] = (uint8_t)(year >= 2000 ? year - 2000 : 0);
+        out_data[2] = (uint8_t)(month >= 1 ? month - 1 : 0);
+        out_data[3] = (uint8_t)(day >= 1 ? day - 1 : 0);
+        out_data[4] = (uint8_t)hour;
+        out_data[5] = (uint8_t)minute;
+    } else {
+        memset(out_data, 0, 6);
+        out_data[0] = RIGHTEST_DATETIME_GET;
+    }
+}
+
+bool rightest_protocol_parse_date_time(const uint8_t *frame, size_t frame_len, rightest_date_time_t *out) {
+    if (frame_len != 9 || !rightest_protocol_verify_response(frame, frame_len)) {
+        return false;
+    }
+    if (frame[1] != RIGHTEST_RETURN_SET_DATE_TIME) {
+        return false;
+    }
+    out->unit = frame[2];
+    out->year = 2000u + frame[3];
+    out->month = (unsigned)frame[4] + 1;
+    out->day = (unsigned)frame[5] + 1;
+    out->hour = frame[6];
+    out->minute = frame[7];
+    return true;
+}
+
 bool rightest_protocol_parse_record_summary(const uint8_t *frame, size_t frame_len, rightest_record_summary_t *out) {
     // 2026-08-31 實機測試推翻協定文件：文件寫 TYPE 1 回應固定 11 bytes
     // （0x4F 0x9E 0x00 0x00 total/max/last CS），但實機重組後拿到的是完整

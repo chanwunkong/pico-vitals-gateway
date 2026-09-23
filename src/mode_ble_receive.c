@@ -171,6 +171,14 @@ static fora_handle_cache_t s_handle_cache[FORA_DEVICE_KIND_COUNT];
 static uint8_t s_bp_record_part_a[4];
 static bool s_bp_waiting_for_part_b = false;
 
+// 2026-09-23：比照 GM700SB 的做法，每次連線順便把裝置內部時鐘校成 Pico 目前
+// 已校時過的真實時間（見 fora_protocol.h FORA_CMD_SET_DATE_TIME 的說明）。
+// 這個指令是獨立的、不像 GM700SB 的 UNIT byte 那樣跟其他設定綁在一起，不用
+// 先 Get 再 Set，直接送。true 代表「已經送出校時指令，正在等它的回應」——
+// 收到這則回應之前，GATT_EVENT_NOTIFICATION 要攔截下來，不能誤當成記錄
+// 回應處理，見 send_fora_set_date_time() 呼叫端的說明。
+static bool s_bp_time_sync_pending = false;
+
 // 血壓計（D40）跟 MD6 每次連線抓到「目前這一筆」（index=0）記錄、正式
 // commit 之後，趁裝置還沒斷線，繼續往回翻頁把同一次連線視窗內裝置回報的
 // 其他記錄也抓完——2026-08-26 在 MD6 跟 D40 上都實機驗證過：cmd 0x2B 回應的
@@ -238,7 +246,10 @@ static rightest_reassembly_t s_rightest_reassembly;
 // 比照 fora_protocol.c 的 FORA_TRIGGER_COMMAND 用持久性的緩衝區，見
 // send_rightest_pcl_mode()/send_rightest_command() 的說明。
 static uint8_t s_rightest_pcl_value;
-static uint8_t s_rightest_command_buffer[8]; // 目前最長的指令（讀記錄）是 5 bytes，8 留餘裕
+// 2026-09-23：目前最長的指令改成 Set Date&Time，6 bytes 資料（UNIT+YEAR+
+// MONTH+DAY+HOUR+MINUTE）+ header/cmd/checksum 3 bytes = 9 bytes，原本
+// 「讀記錄 5 bytes，8 留餘裕」的估計已經不夠，改成 12 留餘裕。
+static uint8_t s_rightest_command_buffer[12];
 
 // GM700SB 這一整段流程（開 PCL -> 等自動推播的 meter ID -> 查記錄總數/書籤
 // -> 逐筆讀記錄 -> 關 PCL，型號查詢已拿掉，見下面 enum 的說明）都在
@@ -270,8 +281,16 @@ typedef enum {
     // （可能牽涉螢幕畫面切換、內部狀態機），加一段短暫延遲讓裝置有時間先
     // 穩定下來，再送 TYPE 1，見 RIGHTEST_PCL_SETTLE_MS。**這個延遲本身還沒
     // 實機驗證過是否真的是根因**，見 PROJECT_PLAN.md。
-    RIGHTEST_SESSION_PCL_SETTLE,      // PCL 開啟 ATT 回應已到，等一段緩衝時間才送 TYPE 1；
+    RIGHTEST_SESSION_PCL_SETTLE,      // PCL 開啟 ATT 回應已到，等一段緩衝時間才送下一步；
                                        // 這段期間如果意外收到 Notify，比照 PCL_ON_PENDING 直接忽略
+    // 2026-09-23 使用者要求比照 GM700SB 官方 App 的行為：每次同步順便把血糖機
+    // 時鐘校成 Pico 自己已經 NTP 校時過的現在時間（見說明書「血糖測試儀每次
+    // 與 App 同步時，將同時更新為 App 裝置上面的日期與時間」）。只有
+    // wall_clock_is_synced() 為 true 才會走這兩個狀態，見主迴圈裡
+    // RIGHTEST_SESSION_PCL_SETTLE 逾時之後的分支；沒校時過的話直接跳過這兩步、
+    // 照舊送 TYPE 1，不寫入一個沒意義的假時間。
+    RIGHTEST_SESSION_TIME_GET_PENDING, // 已送 Get Date&Time，等裝置回報目前的蜂鳴器/顯示制式/單位設定
+    RIGHTEST_SESSION_TIME_SET_PENDING, // 已送 Set Date&Time（帶 Pico 目前真實時間+保留的設定位元），等確認回應
     RIGHTEST_SESSION_WAIT_SUMMARY,    // 已送 TYPE 1 查詢（index=0），等總筆數/書籤
     RIGHTEST_SESSION_WAIT_RECORD,     // 已送 TYPE 2 查詢，等這一筆記錄內容
 } rightest_session_state_t;
@@ -281,6 +300,10 @@ typedef enum {
 #define RIGHTEST_PCL_SETTLE_MS 500
 static rightest_session_state_t s_rightest_session_state = RIGHTEST_SESSION_IDLE;
 static absolute_time_t s_rightest_pcl_settle_until;
+// Get Date&Time 回應讀回來、要原樣保留進 Set 的設定位元（蜂鳴器/12-24小時制/
+// 單位），見 RIGHTEST_SESSION_TIME_GET_PENDING 宣告處的說明。RIGHTEST_SESSION_
+// TIME_GET_PENDING 寫入，RIGHTEST_SESSION_TIME_SET_PENDING 之前讀出。
+static uint8_t s_rightest_datetime_unit_preserved;
 static rightest_record_summary_t s_rightest_summary;
 static uint16_t s_rightest_next_index;
 static uint16_t s_rightest_target_count; // 這次連線打算讀到第幾個 index（含）
@@ -518,6 +541,20 @@ static void send_bp_get_record_part_at_index(uint8_t cmd, uint16_t index) {
         s_connection_handle, s_fora_characteristic.value_handle, sizeof(command), command);
 }
 
+// 送出 FORA_CMD_SET_DATE_TIME，把 Pico 已校時的現在時間寫進血壓計/MD6，見
+// s_bp_time_sync_pending 宣告處的說明。呼叫前呼叫端要自行確認
+// wall_clock_is_synced() 為 true，這裡不重複檢查。
+static void send_fora_set_date_time(void) {
+    unsigned year, month, day, hour, minute;
+    wall_clock_to_local_civil(
+        wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time())), &year, &month, &day, &hour, &minute);
+    printf("[BLE] setting device clock to %04u/%02u/%02u %02u:%02u...\n", year, month, day, hour, minute);
+    uint8_t command[8];
+    fora_protocol_build_set_date_time_command(year, month, day, hour, minute, command);
+    gatt_client_write_value_of_characteristic_without_response(
+        s_connection_handle, s_fora_characteristic.value_handle, sizeof(command), command);
+}
+
 // 問裝置目前有幾筆記錄（cmd 0x2B），回應格式見 fora_protocol.h 的協定說明
 // ——p1=使用者編號，沿用跟記錄查詢一樣的 FORA_BP_USER_CURRENT；byte[2]|
 // byte[3]<<8 = 筆數這個假設已經實機驗證過（見 record_backfill_state_t 的
@@ -670,6 +707,46 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             printf("[BLE] rightest: unexpected notification during PCL settle delay, ignoring.\n");
             rightest_reassembly_reset(&s_rightest_reassembly);
             break;
+
+        case RIGHTEST_SESSION_TIME_GET_PENDING: {
+            rightest_date_time_t current;
+            bool parsed = rightest_protocol_parse_date_time(frame, frame_len, &current);
+            rightest_reassembly_reset(&s_rightest_reassembly);
+            if (!parsed) {
+                // 讀不到目前設定就不冒險用全 0 覆蓋蜂鳴器/顯示制式/單位，
+                // 放棄這次時間同步、照舊往下走查總數/書籤，不影響資料同步。
+                printf("[BLE] rightest: failed to parse current date/time & unit, "
+                       "skipping time sync.\n");
+                s_rightest_session_state = RIGHTEST_SESSION_WAIT_SUMMARY;
+                uint8_t index_zero[2] = { 0x00, 0x00 };
+                send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_zero, sizeof(index_zero));
+                return;
+            }
+            s_rightest_datetime_unit_preserved = current.unit & RIGHTEST_DATETIME_UNIT_PRESERVE_MASK;
+            unsigned year, month, day, hour, minute;
+            wall_clock_to_local_civil(
+                wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time())), &year, &month, &day, &hour, &minute);
+            printf("[BLE] rightest: device reports %04u/%02u/%02u %02u:%02u, setting to "
+                   "%04u/%02u/%02u %02u:%02u...\n",
+                   current.year, current.month, current.day, current.hour, current.minute,
+                   year, month, day, hour, minute);
+            s_rightest_session_state = RIGHTEST_SESSION_TIME_SET_PENDING;
+            uint8_t data[6];
+            rightest_protocol_build_date_time_payload(
+                true, s_rightest_datetime_unit_preserved, year, month, day, hour, minute, data);
+            send_rightest_command(RIGHTEST_CMD_SET_DATE_TIME, data, sizeof(data));
+            break;
+        }
+
+        case RIGHTEST_SESSION_TIME_SET_PENDING: {
+            bool ok = rightest_protocol_verify_response(frame, frame_len) && frame[1] == RIGHTEST_RETURN_SET_DATE_TIME;
+            rightest_reassembly_reset(&s_rightest_reassembly);
+            printf("[BLE] rightest: time sync %s, querying record summary...\n", ok ? "confirmed" : "response invalid");
+            s_rightest_session_state = RIGHTEST_SESSION_WAIT_SUMMARY;
+            uint8_t index_zero[2] = { 0x00, 0x00 };
+            send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_zero, sizeof(index_zero));
+            break;
+        }
 
         case RIGHTEST_SESSION_WAIT_SUMMARY: {
             bool parsed = rightest_protocol_parse_record_summary(frame, frame_len, &s_rightest_summary);
@@ -1273,8 +1350,21 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                     // 就被裝置斷線中斷，殘留的非 IDLE 值會讓這次連線的 index=0
                     // 回應被誤判成翻頁回應，見 record_backfill_state_t 的說明。
                     s_record_backfill_state = RECORD_BACKFILL_IDLE;
-                    printf("[BLE] requesting latest record (part A)...\n");
-                    send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_A, 0);
+                    // 每次新連線都重置，理由跟上面兩個一樣——避免上次連線的
+                    // 校時指令送出後裝置就斷線、沒收到回應，殘留的 true 讓這次
+                    // 連線第一筆記錄回應被誤判成校時回應。
+                    s_bp_time_sync_pending = false;
+                    // 校時（見 s_bp_time_sync_pending 的說明）優先於讀記錄，
+                    // 但只有 Pico 自己已經校時過才做，不寫一個沒意義的假時間
+                    // 進裝置；沒校時過就直接跳過，照舊送第一段記錄查詢。
+                    if (wall_clock_is_synced()) {
+                        s_bp_time_sync_pending = true;
+                        send_fora_set_date_time();
+                    } else {
+                        printf("[BLE] wall clock not synced yet, skipping time sync, "
+                               "requesting latest record (part A)...\n");
+                        send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_A, 0);
+                    }
                 } else {
                     printf("[BLE] sending trigger command...\n");
                     send_trigger_command();
@@ -1300,6 +1390,16 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
             if (s_current_kind == FORA_DEVICE_BLOOD_PRESSURE || s_current_kind == FORA_DEVICE_MD6) {
                 if (value_len < 6 || value[0] != 0x51) {
                     printf("[BLE] unexpected BP/MD6 response, ignoring.\n");
+                    break;
+                }
+                if (s_bp_time_sync_pending) {
+                    // 校時指令的回應——不管內容是否如預期（value[1] 應該回
+                    // 傳 FORA_CMD_SET_DATE_TIME），這一步失敗不影響資料同步，
+                    // 記個 log 就繼續往下走，開始讀記錄。
+                    s_bp_time_sync_pending = false;
+                    printf("[BLE] device clock set %s, requesting latest record (part A)...\n",
+                           value[1] == FORA_CMD_SET_DATE_TIME ? "confirmed" : "response unexpected");
+                    send_bp_get_record_part_at_index(FORA_BP_CMD_GET_RECORD_PART_A, 0);
                     break;
                 }
                 // 這個 if 分支本身已經限定 kind 是 BLOOD_PRESSURE 或 MD6（見
@@ -1587,10 +1687,23 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
         if (s_ble_state == BLE_STATE_RIGHTEST_SESSION &&
             s_rightest_session_state == RIGHTEST_SESSION_PCL_SETTLE &&
             time_reached(s_rightest_pcl_settle_until)) {
-            printf("[BLE] rightest: settle delay elapsed, querying record summary...\n");
-            s_rightest_session_state = RIGHTEST_SESSION_WAIT_SUMMARY;
-            uint8_t index_zero[2] = { 0x00, 0x00 };
-            send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_zero, sizeof(index_zero));
+            if (wall_clock_is_synced()) {
+                // 先問裝置目前的蜂鳴器/顯示制式/單位設定，回應到了才知道怎麼
+                // 組 Set 指令，見 RIGHTEST_SESSION_TIME_GET_PENDING 的說明。
+                printf("[BLE] rightest: settle delay elapsed, querying current date/time & unit...\n");
+                s_rightest_session_state = RIGHTEST_SESSION_TIME_GET_PENDING;
+                uint8_t data[6];
+                rightest_protocol_build_date_time_payload(false, 0, 0, 0, 0, 0, 0, data);
+                send_rightest_command(RIGHTEST_CMD_SET_DATE_TIME, data, sizeof(data));
+            } else {
+                // 沒校時過，Pico 自己都不知道現在真實時間，不寫一個沒意義的
+                // 假時間進血糖機，直接跳過時間同步、照舊查總數/書籤。
+                printf("[BLE] rightest: settle delay elapsed, wall clock not synced yet, "
+                       "skipping time sync, querying record summary...\n");
+                s_rightest_session_state = RIGHTEST_SESSION_WAIT_SUMMARY;
+                uint8_t index_zero[2] = { 0x00, 0x00 };
+                send_rightest_command(RIGHTEST_CMD_READ_RECORD, index_zero, sizeof(index_zero));
+            }
         }
 
         // KEY2 顯示歷史畫面期間暫停呼叫 display_status_poll()，不然畫面會

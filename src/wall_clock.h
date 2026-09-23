@@ -48,4 +48,12 @@ uint64_t wall_clock_to_epoch_ms(uint64_t boot_ms);
 // 改另一邊。
 bool wall_clock_epoch_is_plausible(uint64_t epoch_ms, uint64_t window_ms);
 
+// 把 epoch ms 換算成台灣本地時間（UTC+8，見 common.h 的 LOCAL_UTC_OFFSET_SEC）
+// 的西曆年/月/日/時/分——給需要把 Pico 目前的真實時間寫進其他裝置的呼叫端用
+// （目前是 rightest_protocol.c 的 GM700SB 血糖機時鐘同步）。呼叫前必須先確認
+// wall_clock_is_synced() 為 true，否則算出來的時間沒有意義（沒校時過的話
+// epoch_ms 只是 boot-relative 值原樣傳回，見 wall_clock_to_epoch_ms() 的說明）。
+void wall_clock_to_local_civil(
+    uint64_t epoch_ms, unsigned *year, unsigned *month, unsigned *day, unsigned *hour, unsigned *minute);
+
 #endif // WALL_CLOCK_H

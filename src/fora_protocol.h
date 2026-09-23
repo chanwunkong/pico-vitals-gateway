@@ -65,6 +65,24 @@ extern const uint8_t FORA_TRIGGER_COMMAND[8];
 #define FORA_BP_CMD_GET_RECORD_COUNT  0x2B
 #define FORA_BP_USER_CURRENT          0x00
 
+// 校正裝置內部時鐘：cmd=0x33，2026-09-23 反編譯官方
+// `BLE_PCLink_Library.dll` 的 `TaiDoc.BLE_PcLink.Meter.AbstractMeter.
+// SetDateTime()` 找到——D40 用的 `GenBgmAndBpmMeter`、MD6 用的 `GenBgmMeter`
+// 都沒有覆寫這個方法，兩種裝置共用同一份實作，跟 GET_RECORD_PART_A/B 同一套
+// 8-byte 指令格式（見上方協定說明）。官方程式碼原文：
+//   p1 = (month & 7) << 5 | day
+//   p2 = (year - 2000) << 1 | (month >> 3)
+//   p3 = minute
+//   p4 = hour
+// DAY/MONTH/YEAR 的位元佈局跟 fora_protocol_decode_measured_key() 解析記錄
+// 日期時間戳的格式完全一致（同一套底層編碼），這裡只是反方向組出來。
+#define FORA_CMD_SET_DATE_TIME 0x33
+
+// 組出校時指令（含 checksum，見 fora_protocol_build_command()）。year 是完整
+// 西元年（例如 2026），不是協定原始的 2 位數偏移量，這裡負責轉換。
+void fora_protocol_build_set_date_time_command(
+    unsigned year, unsigned month, unsigned day, unsigned hour, unsigned minute, uint8_t out[8]);
+
 // 血糖/MD6 記錄 byte[7] 高 2 bit 的量測情境，數值跟原始 bit pattern 直接對應
 // （0/1/2/3），2026-08-26 反編譯官方 PC 端程式（`BloodGlucose` class）逐行核對
 // 確認：0=一般（官方程式碼還有「運動」子狀態，見 byte[3] bits5-7==4，這個

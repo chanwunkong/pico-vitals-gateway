@@ -105,6 +105,49 @@ typedef struct {
     uint16_t last_transmission_index; // 上次讀到第幾筆的書籤，見上面的說明
 } rightest_record_summary_t;
 
+// Get/Set Date Time & Unit：0xB0 0x06 UNIT YEAR MONTH DAY HOUR MINUTE CS ->
+// 0x4F 0xF9 UNIT YEAR MONTH DAY HOUR MINUTE CS（協定文件同名章節）。官方 App
+// 每次同步都會順便把血糖機的時鐘校成手機當下的時間（使用者從 GM700SB 說明書
+// 上看到的行為），這裡照做——用 Pico 自己 NTP 校時過的現在時間寫進血糖機。
+//
+// UNIT 這個 byte 同時是「Get 還是 Set」開關（bit3）跟裝置既有設定（bit4
+// 蜂鳴器、bit2 12/24 小時制、bit1 mg/dL 或 mmol/L）：**寫入前一定要先送一次
+// Get，把讀回來的這幾個 bits 原樣帶進 Set**，不能自己填 0，不然會把使用者
+// 原本的蜂鳴器/顯示制式/單位設定一起改掉，見 mode_ble_receive.c 呼叫端的說明。
+#define RIGHTEST_CMD_SET_DATE_TIME    0x06
+#define RIGHTEST_RETURN_SET_DATE_TIME 0xF9
+#define RIGHTEST_DATETIME_GET       0x00 // UNIT bit3=0
+#define RIGHTEST_DATETIME_SET_FLAG  0x08 // UNIT bit3=1
+// Set 時要從 Get 回應原樣保留的 bits（bit4 蜂鳴器、bit2 12/24 小時制、bit1
+// 單位）——bit0（單位是否鎖定）協定文件說「only workable during read data;
+// write is unworkable」，寫入不生效，不用保留。
+#define RIGHTEST_DATETIME_UNIT_PRESERVE_MASK 0x16
+
+typedef struct {
+    uint8_t unit;
+    unsigned year;
+    unsigned month;
+    unsigned day;
+    unsigned hour;
+    unsigned minute;
+} rightest_date_time_t;
+
+// 組出 Get/Set Date Time 指令的 6 bytes 資料欄位（UNIT+YEAR+MONTH+DAY+HOUR+
+// MINUTE，不含 header/command-id/checksum——那些由呼叫端的
+// send_rightest_command() 透過 rightest_protocol_build_command() 統一包，
+// 跟其他指令的呼叫慣例一致，見 mode_ble_receive.c）。is_set=false（Get）時
+// 後面 5 個日期欄位會被忽略、送出全 0 的 dummy 值（協定文件範例做法），呼叫端
+// 可以直接傳 0；is_set=true 時 year/month/day/hour/minute 是要寫入裝置的真實
+// 時間（year 是完整西元年，例如 2026，不是協定原始的 2 位數偏移量，這裡負責
+// 轉換），out_data 至少要有 6 bytes 空間。
+void rightest_protocol_build_date_time_payload(
+    bool is_set, uint8_t unit, unsigned year, unsigned month, unsigned day, unsigned hour, unsigned minute,
+    uint8_t *out_data);
+
+// 解析 Get/Set Date Time 回應（Get/Set 共用同一種回應格式，固定 9 bytes：
+// header+return-id+UNIT+YEAR+MONTH+DAY+HOUR+MINUTE+CS）。
+bool rightest_protocol_parse_date_time(const uint8_t *frame, size_t frame_len, rightest_date_time_t *out);
+
 // 把 App 要送出的指令組好（含 checksum）。cmd 是 Command ID，data/data_len
 // 是後面接的資料位元組（可以是 0 個、data 傳 NULL），out 至少要有
 // data_len+3 bytes 空間，回傳組出來的總長度。

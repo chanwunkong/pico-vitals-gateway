@@ -1,5 +1,7 @@
 #include "wall_clock.h"
 
+#include "common.h"
+
 #include "lwip/apps/sntp.h"
 #include "pico/time.h"
 
@@ -119,4 +121,30 @@ bool wall_clock_epoch_is_plausible(uint64_t epoch_ms, uint64_t window_ms) {
     uint64_t now_epoch_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
     uint64_t diff_ms = epoch_ms > now_epoch_ms ? epoch_ms - now_epoch_ms : now_epoch_ms - epoch_ms;
     return diff_ms <= window_ms;
+}
+
+void wall_clock_to_local_civil(
+    uint64_t epoch_ms, unsigned *year, unsigned *month, unsigned *day, unsigned *hour, unsigned *minute) {
+    uint64_t local_sec = epoch_ms / 1000 + LOCAL_UTC_OFFSET_SEC;
+    int64_t days_since_epoch = (int64_t)(local_sec / 86400);
+    uint32_t sec_of_day = (uint32_t)(local_sec % 86400);
+    *hour = sec_of_day / 3600;
+    *minute = (sec_of_day % 3600) / 60;
+
+    // Howard Hinnant 的 civil_from_days（CC0 授權）——跟 display_status.c 的
+    // civil_month_day_from_days() 同一套算法，那邊因為畫面空間不夠、故意只取
+    // 月/日省略年份（見該函式註解），這裡要把完整日期寫進血糖機，多算出年份。
+    int64_t z = days_since_epoch + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);            // [0, 146096]
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);  // [0, 365]
+    unsigned mp = (5 * doy + 2) / 153;                       // [0, 11]
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;               // [1, 31]
+    unsigned m = mp + (mp < 10 ? 3 : -9);                    // [1, 12]
+    int64_t y = (int64_t)yoe + era * 400 + (m <= 2 ? 1 : 0);
+
+    *year = (unsigned)y;
+    *month = m;
+    *day = d;
 }

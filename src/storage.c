@@ -64,8 +64,11 @@ static uint64_t s_last_upload_at_ms;
 static bool s_last_upload_valid = false;
 
 // 沒有裝置量測時間戳可用時（device_measured_key 恆為 0 的裝置）的判重備案：
-// 數值完全相同、且時間間隔在這個視窗內就當作重複。
-#define DUPLICATE_SUPPRESS_WINDOW_MS (10ull * 60 * 1000)
+// 數值完全相同、且時間間隔在這個視窗內就當作重複。2026-09-23 從 10 分鐘改成
+// 3 分鐘——使用者反映額溫槍/血氧計離線期間連續量測時，待傳佇列裡同類型/
+// 同來源的舊紀錄會被新的蓋掉（見下面 storage_append_record() 覆蓋邏輯的
+// 說明），縮短這個視窗讓「兩次量測間隔多久才不算重複」的判斷更貼近使用情境。
+#define DUPLICATE_SUPPRESS_WINDOW_MS (3ull * 60 * 1000)
 
 static void persist_pending_records(void);
 static void persist_upload_history(void);
@@ -336,28 +339,30 @@ bool storage_append_record(const vital_record_t *record) {
         return true;
     }
 
-    // 同一種類型「且同一個來源裝置」如果已經有一筆還沒上傳成功的舊紀錄（PENDING
-    // 或 FAILED），直接用這筆最新的蓋掉，不要讓同類型/同來源的資料一直堆積、
-    // 上傳好幾筆重複/過時的值（裝置量測完常常會持續廣播一段時間，同一輪可能被
-    // 連上好幾次）。source_kind 也要比對——VITAL_TYPE_PULSE_RATE 同時由血壓計
-    // 跟血氧計回報，只比對 type 的話兩種裝置的待傳脈搏紀錄會互相蓋掉，其中一筆
-    // 永遠不會被上傳（判重邏輯在上面已經有比對 source_kind，這裡要保持一致）。
+    // 只有「確定是同一筆測量」時才蓋掉舊的待傳紀錄（PENDING 或 FAILED）——
+    // 也就是雙方都帶裝置時間戳（目前是血壓計/MD6/GM700SB）且時間戳相同，代表
+    // 裝置對同一次測量回報了修正過的數值，不是新的一次量測。source_kind 也要
+    // 比對——VITAL_TYPE_PULSE_RATE 同時由血壓計跟血氧計回報，只比對 type 的話
+    // 兩種裝置的待傳脈搏紀錄會互相蓋掉，其中一筆永遠不會被上傳（判重邏輯在
+    // 上面已經有比對 source_kind，這裡要保持一致）。
     //
-    // 雙方都有裝置時間戳時（目前是血壓計/MD6），還要比對 device_measured_key
-    // 是不是同一筆才能蓋掉——2026-08-26 加上 MD6 往回翻頁抓歷史記錄後才發現
-    // 這裡原本會出事：一次連線內會抓到同一個 type 好幾筆「不同時間點」的記錄
-    // （例如好幾次測試各自的血糖值），照舊邏輯「同類型就蓋掉」的話，翻到比較
-    // 舊的那筆時會反而蓋掉剛剛才抓到的最新讀值，整批資料變成只剩最舊那筆能
-    // 上傳，見 PROJECT_PLAN.md 第 6.5 節的說明。額溫槍/血氧計沒有裝置時間戳
-    // （device_measured_key 恆為 0），維持舊行為：同類型/來源只保留最新一筆。
+    // 額溫槍/血氧計沒有裝置時間戳（device_measured_key 恆為 0）：2026-08-26
+    // 原本在這裡對它們也套用「同類型/來源就蓋掉」，理由是裝置量測完常常持續
+    // 廣播一段時間、同一輪可能被連上好幾次、避免同一次量測的重複值一直堆積
+    // ——但這個情境上面的 is_duplicate（數值相同 + 在 DUPLICATE_SUPPRESS_
+    // WINDOW_MS 視窗內）已經先擋掉了，走到這裡代表 is_duplicate 判定為
+    // false，也就是數值不同或已經超過視窗，幾乎可以確定是使用者真的又做了
+    // 一次獨立的量測，不該被當成「同一筆的更新值」蓋掉——2026-09-23 使用者
+    // 反映離線期間連續量測額溫槍/血氧計，待傳佇列筆數卻不會增加，才發現這裡
+    // 誤殺了合法的新量測，改成沒有裝置時間戳的紀錄一律不蓋、直接往下新增。
     for (size_t i = 0; i < s_record_count; i++) {
         if (s_records[i].type != record->type || s_records[i].source_kind != record->source_kind ||
             (s_records[i].status != UPLOAD_STATUS_PENDING && s_records[i].status != UPLOAD_STATUS_FAILED)) {
             continue;
         }
         bool both_have_keys = record->device_measured_key != 0 && s_records[i].device_measured_key != 0;
-        if (both_have_keys && record->device_measured_key != s_records[i].device_measured_key) {
-            continue; // 不是同一筆測量（不同時間點），留著，繼續找真的同一筆
+        if (!both_have_keys || record->device_measured_key != s_records[i].device_measured_key) {
+            continue; // 沒有裝置時間戳可比對，或不是同一筆測量，留著，繼續找真的同一筆
         }
         printf("[STORAGE] replacing pending record: type=%d source_kind=%d old_value=%d new_value=%d\n",
                record->type, record->source_kind, (int)s_records[i].value, (int)record->value);
