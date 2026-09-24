@@ -1289,7 +1289,19 @@ static void handle_advertising_report(uint8_t *packet) {
         return;
     }
 
-    if (!time_reached(s_kind_cooldown_until[kind])) {
+    // 2026-09-24 修正（交付 11 台之後才發現，見 PROJECT_PLAN.md）：GM700SB
+    // 走到這裡代表 s_rightest_manual_sync_active 視窗已經開了（KEY1／每天
+    // 定時／事件自動觸發三選一，見上面的說明），這已經是一道獨立的節流
+    // 關卡；事件自動觸發本身在「排定」那一步也已經檢查過冷卻時間才會開
+    // 視窗（見 handle_advertising_report() 前段的判斷）。這裡如果再套用
+    // 同一組冷卻（現在是 1 小時），會變成 KEY1 手動觸發也被擋住——而且
+    // 冷卻是整個裝置種類共用一組、不是分裝置各自算，只要有任一台 GM700SB
+    // 觸發過一次連線，接下來一小時內所有 GM700SB（含全新裝置）都會一起被
+    // 擋住。使用者拿已交付的機器實測發現按 KEY1 完全連不上、視窗直接逾時、
+    // 即使裝置明明有掃到，才發現這個問題：GM700SB 不該在視窗已開的情況下
+    // 再被這組冷卻擋第二次，其他裝置（沒有視窗機制、純粹靠這組冷卻節流）
+    // 不受影響。
+    if (kind != FORA_DEVICE_RIGHTEST_GM700SB && !time_reached(s_kind_cooldown_until[kind])) {
         return; // 這種裝置還在冷卻時間內，不要再打擾它
     }
 
