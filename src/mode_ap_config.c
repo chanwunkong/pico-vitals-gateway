@@ -1091,6 +1091,25 @@ static void parse_and_store_form(const char *body) {
         cfg.upload_api_key[sizeof(cfg.upload_api_key) - 1] = '\0';
     }
 
+    // 2026-09-24 新增：個案沒變就沿用舊的生效時間戳；個案換了（或這是第一次
+    // 設定）就歸零，標記「待補生效時間戳」，等下一次 NTP 校時成功時
+    // mode_upload.c 會補上，見 common.h device_config_t.patient_assigned_since_epoch_ms
+    // 的說明。用 strcmp 比對是因為 patient_id 換成空字串也要算「換了」
+    // （不能被上面「留空=沿用舊值」的慣例影響——這個欄位表單一定會送，不會
+    // 缺欄位，不套用那套 fallback）。
+    if (s_have_current_config && strcmp(cfg.patient_id, s_current_config.patient_id) == 0) {
+        cfg.patient_assigned_since_epoch_ms = s_current_config.patient_assigned_since_epoch_ms;
+    } else {
+        cfg.patient_assigned_since_epoch_ms = 0;
+        printf("[AP_CONFIG] patient_id changed (or first-time setup), resetting assignment cutoff.\n");
+        // 同步點是依(裝置種類,藍牙位址)存的，跟個案無關——如果不順便清掉，
+        // 舊個案用過的實體裝置換給這個新個案時，這台裝置的位址還留著舊的
+        // 同步點，會讓 mode_ble_receive.c 的「沒有既有同步點才保守處理」
+        // 保底機制被繞過（見該檔案 should_limit_backfill_to_latest_only()
+        // 的說明），在生效時間戳補上之前這段空檔就沒有任何防護。
+        storage_clear_all_backfill_anchors();
+    }
+
     cfg.valid = true;
 
     s_pending_config = cfg;

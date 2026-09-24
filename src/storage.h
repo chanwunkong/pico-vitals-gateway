@@ -84,14 +84,27 @@ size_t storage_get_upload_history_count(void);
 // 回傳實際取出筆數。畫面顯示「最近幾筆上傳紀錄」用。
 size_t storage_get_recent_upload_history(vital_record_t *out, size_t max_count);
 
-// 血壓計/MD6 backfill 用的「上次同步到哪一筆」定位點：8 bytes 是那個裝置
-// 種類最新一筆記錄的原始內容（不是解析過的數值，也不是裝置時間戳——裝置
-// 時鐘不可信任，改成直接比對原始 bytes 是不是同一筆，見 storage.c 裡
-// MAX_BACKFILL_ANCHOR_KINDS 的說明）。source_kind 當不透明的 uint8_t 用，
-// 跟 vital_record_t.source_kind 是同一組值（fora_device_kind_t）。
-// storage_get_backfill_anchor() 回傳 false 代表這個種類還沒有存過定位點
-// （例如第一次連線這種裝置）。
-bool storage_get_backfill_anchor(uint8_t source_kind, uint8_t out_anchor[8]);
-void storage_set_backfill_anchor(uint8_t source_kind, const uint8_t anchor[8]);
+// 血壓計/MD6/GM700SB backfill 用的「上次同步到哪一筆」定位點：8 bytes 是
+// 那個裝置最新一筆記錄的原始內容（不是解析過的數值，也不是裝置時間戳——
+// 裝置時鐘不可信任，改成直接比對原始 bytes 是不是同一筆）。2026-09-23 從
+// 「每個裝置種類一份」改成「每個(裝置種類, 藍牙位址)各自一份」——同一種類
+// 如果輪流接不同實機（例如血糖機換新的、或同一台 gateway 服務多位病患各自
+// 的血糖機），原本只認裝置種類的定位點會被最後連線過的那台覆蓋，導致其他
+// 台每次重連都被誤判成「全部沒同步過」重新整批上傳一次。source_kind 當
+// 不透明的 uint8_t 用，跟 vital_record_t.source_kind 是同一組值
+// （fora_device_kind_t）；device_addr 是 BTstack 的 bd_addr_t（6 bytes）。
+// storage_get_backfill_anchor() 回傳 false 代表這個(種類,位址)組合還沒有
+// 存過定位點（例如第一次連線這台裝置）。每組定位點各自存一個獨立小檔案
+// （見 storage.c），能同時追蹤幾台不受陣列大小限制，只受 flash 剩餘空間
+// 限制。
+bool storage_get_backfill_anchor(uint8_t source_kind, const uint8_t device_addr[6], uint8_t out_anchor[8]);
+void storage_set_backfill_anchor(uint8_t source_kind, const uint8_t device_addr[6], const uint8_t anchor[8]);
+
+// 個案換人時呼叫，把所有裝置的 backfill 同步點全部清掉——同步點是依
+// (裝置種類,藍牙位址) 存的，跟個案無關，換個案卻不清的話，舊個案用過的裝置
+// 如果被拿來給新個案繼續用，會讓 mode_ble_receive.c 的「沒有既有同步點才
+// 保守處理」保底機制被繞過，見該檔案 should_limit_backfill_to_latest_only()
+// 的說明。
+void storage_clear_all_backfill_anchors(void);
 
 #endif // STORAGE_H

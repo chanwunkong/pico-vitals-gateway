@@ -33,6 +33,21 @@ typedef struct {
     // 空字串 = 上傳請求不帶認證標頭（跟目前測試伺服器一樣不做驗證）。有值的話
     // upload_api.c 會加一個 X-API-Key 標頭，伺服器端要驗證這個值。
     char upload_api_key[UPLOAD_API_KEY_MAX_LEN];
+    // 2026-09-24 新增：這個個案（patient_id）開始使用這台 Gateway 的真實世界
+    // epoch ms 時間點，用來防止「換一台別的個案用過的血壓計/MD6/血糖機給這個
+    // 個案」時，裝置裡殘留的舊個案記錄被誤當成這個個案的資料上傳——backfill
+    // 往回翻頁讀到裝置時間戳「早於」這個時間點的記錄就不採信，見
+    // mode_ble_receive.c record_measured_after_patient_cutoff() 的說明，設計
+    // 討論見 PROJECT_PLAN.md 第 6.6 節。
+    //
+    // 0 代表「還沒補上」（AP_CONFIG 表單送出當下 Pico 還沒連上真正的網路、
+    // 沒辦法校時，沒有真實時間可以蓋）——mode_ap_config.c 偵測到 patient_id
+    // 換了（或這是第一次設定）就把這個欄位歸零，mode_upload.c 下一次 NTP
+    // 校時成功時看到 0 就補上當下的真實時間、存回 flash，用過一次就不會再是
+    // 0。這個欄位是 0 的期間（通常只有設定完成到第一次校時成功中間那一小段），
+    // backfill 邏輯改用更保守的規則頂著，見 mode_ble_receive.c
+    // should_limit_backfill_to_latest_only() 的說明。
+    uint64_t patient_assigned_since_epoch_ms;
     bool valid;
 } device_config_t;
 

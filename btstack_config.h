@@ -35,7 +35,13 @@
 #define MAX_NR_SM_LOOKUP_ENTRIES 3
 #define MAX_NR_WHITELIST_ENTRIES 1
 
-#define MAX_NR_LE_DEVICE_DB_ENTRIES 4
+// 2026-09-23 從 4 調到 16：只有 GM700SB 這條路徑會用到 bonding（見
+// mode_ble_receive.c），4 是照抄 pico-sdk kitchen_sink 範例的示範值，不是
+// 硬體限制，調大只多佔每筆 LTK/IRK 的固定大小記憶體，讓同一台 gateway
+// 一輩子輪流配對過的血糖機數量不容易撞到上限（真正無上限需要改
+// BTstack le_device_db_tlv.c 本身的固定筆數設計，這裡先抓一個實務上
+// 幾乎不可能用完的數字）。
+#define MAX_NR_LE_DEVICE_DB_ENTRIES 16
 
 // Limit number of ACL/SCO Buffer to use by stack to avoid cyw43 shared bus overrun
 #define MAX_NR_CONTROLLER_ACL_BUFFERS 3
@@ -49,7 +55,10 @@
 #define HCI_HOST_SCO_PACKET_NUM 3
 
 // Link Key DB and LE Device DB using TLV on top of Flash Sector interface
-#define NVM_NUM_DEVICE_DB_ENTRIES 4
+// 2026-09-23：跟上面 MAX_NR_LE_DEVICE_DB_ENTRIES 的說明一樣，這是實際落地到
+// flash TLV 的筆數，要跟著一起調大，不然記憶體裡的 DB 撐得住但 flash 端存
+// 不下第 5 筆以後的配對金鑰。
+#define NVM_NUM_DEVICE_DB_ENTRIES 16
 #define NVM_NUM_LINK_KEYS 4
 
 // 沒有給 btstack malloc，用固定大小的 ATT DB。

@@ -145,6 +145,19 @@ void mode_upload_run(void) {
     // 讓使用者能確認網路時間校得準不準，不是只有「有資料要傳」才做。
     wall_clock_sync(8000);
 
+    // 2026-09-24 新增：個案生效時間戳還沒補過（AP_CONFIG 表單送出時 Pico 還
+    // 沒連上真正的網路、沒辦法校時），現在校時成功了，補上當下的真實時間、
+    // 存回 flash，之後就不會再是 0——見 common.h
+    // device_config_t.patient_assigned_since_epoch_ms 的說明。只補一次，之後
+    // 同一個個案期間不會再變動；只要 config 改變不大（沒有換個案），沒必要
+    // 每次上傳都重寫 flash，所以用「== 0」判斷要不要補，不是每次都寫。
+    if (config.patient_assigned_since_epoch_ms == 0 && wall_clock_is_synced()) {
+        config.patient_assigned_since_epoch_ms = wall_clock_to_epoch_ms(to_ms_since_boot(get_absolute_time()));
+        storage_save_config(&config);
+        printf("[UPLOAD] stamped patient assignment cutoff (epoch_ms=%llu).\n",
+               (unsigned long long)config.patient_assigned_since_epoch_ms);
+    }
+
     if (count == 0) {
         display_status_show_upload(config.wifi_ssid, "Connected, nothing to send");
     } else {

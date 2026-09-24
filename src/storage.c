@@ -11,16 +11,13 @@
 #define CONFIG_FILENAME "config.bin"
 #define PENDING_FILENAME "pending.bin"
 #define HISTORY_FILENAME "history.bin"
-#define BACKFILL_ANCHOR_FILENAME "backfill_anchor.bin"
 
-// 血壓計/MD6 backfill 用的「上次同步到哪一筆」定位點，依裝置種類（fora_
-// device_kind_t，這裡當不透明的 uint8_t 用，理由跟 vital_record_t.source_kind
-// 一樣，見 common.h）分開存一份，每份是那個種類「最新一筆」記錄的原始 8
-// bytes（不是解析過的數值，也不是裝置時間戳——2026-08-26 使用者決定不能信任
-// 裝置時鐘，見 PROJECT_PLAN.md，改成直接比對原始 bytes 是不是同一筆）。
-// 8 是目前 fora_device_kind_t 實際種類數的好幾倍，抓寬一點餘裕，不會因為
-// 之後新增裝置種類就要改 flash 格式。
-#define MAX_BACKFILL_ANCHOR_KINDS 8
+// 血壓計/MD6/GM700SB backfill 用的「上次同步到哪一筆」定位點：2026-09-23
+// 從「一種類一份、存在單一 backfill_anchor.bin」改成「每個(種類,藍牙位址)
+// 各自存一個獨立小檔案」，見 storage.h storage_get/set_backfill_anchor()
+// 的說明——原設計一種類只認一台實機，換一台同型號裝置輪流連上就會互相覆蓋
+// 對方的定位點。檔名內嵌兩個 key，不需要另外維護索引，能同時追蹤幾台不受
+// 固定陣列大小限制，只受 flash 剩餘空間限制。
 
 // 2026-08-31 從 128 調高到 640（5 倍，不是原本要求的 10 倍）：10 倍會讓
 // .bss 從 264KB SRAM 的 66.7% 推到 83.8%，只剩約 43KB 給 heap/stack（WiFi
@@ -46,9 +43,6 @@ static size_t s_record_count = 0;
 static vital_record_t s_upload_history[MAX_UPLOAD_HISTORY];
 static uint32_t s_upload_history_count = 0;
 static uint32_t s_upload_history_next = 0;
-
-static uint8_t s_backfill_anchor[MAX_BACKFILL_ANCHOR_KINDS][8];
-static bool s_backfill_anchor_valid[MAX_BACKFILL_ANCHOR_KINDS];
 
 // 畫面顯示用的「最後一筆讀值」，跟上面待傳佇列分開存——待傳佇列裡的紀錄
 // 上傳成功後就會被移除（見 storage_mark_uploaded_for_group()），但螢幕仍然
@@ -115,7 +109,6 @@ void storage_init(void) {
     s_upload_history_next = 0;
     memset(s_last_reading_valid, 0, sizeof(s_last_reading_valid));
     s_last_upload_valid = false;
-    memset(s_backfill_anchor_valid, 0, sizeof(s_backfill_anchor_valid));
 
     s_lfs_mounted = lfs_mount_or_format();
     if (!s_lfs_mounted) {
@@ -163,17 +156,6 @@ void storage_init(void) {
         lfs_file_close(&s_lfs, &file);
     }
 
-    if (lfs_file_open(&s_lfs, &file, BACKFILL_ANCHOR_FILENAME, LFS_O_RDONLY) == 0) {
-        lfs_ssize_t valid_read = lfs_file_read(&s_lfs, &file, s_backfill_anchor_valid,
-                                                sizeof(s_backfill_anchor_valid));
-        lfs_ssize_t anchor_read = lfs_file_read(&s_lfs, &file, s_backfill_anchor, sizeof(s_backfill_anchor));
-        if (valid_read != (lfs_ssize_t)sizeof(s_backfill_anchor_valid) ||
-            anchor_read != (lfs_ssize_t)sizeof(s_backfill_anchor)) {
-            printf("[STORAGE] backfill_anchor.bin truncated/corrupt, discarding.\n");
-            memset(s_backfill_anchor_valid, 0, sizeof(s_backfill_anchor_valid));
-        }
-        lfs_file_close(&s_lfs, &file);
-    }
 }
 
 bool storage_load_config(device_config_t *out) {
@@ -237,36 +219,82 @@ static void persist_upload_history(void) {
     lfs_file_close(&s_lfs, &file);
 }
 
-static void persist_backfill_anchor(void) {
+// 檔名內嵌 (source_kind, device_addr) 兩個 key，例如
+// "bfa_07_AABBCCDDEEFF.bin"，不需要另外維護索引檔——見 storage.h
+// storage_get/set_backfill_anchor() 的說明。
+static void build_backfill_anchor_filename(
+    uint8_t source_kind, const uint8_t device_addr[6], char out_path[32]) {
+    snprintf(out_path, 32, "bfa_%02x_%02x%02x%02x%02x%02x%02x.bin", source_kind,
+              device_addr[0], device_addr[1], device_addr[2],
+              device_addr[3], device_addr[4], device_addr[5]);
+}
+
+bool storage_get_backfill_anchor(uint8_t source_kind, const uint8_t device_addr[6], uint8_t out_anchor[8]) {
+    if (!s_lfs_mounted) {
+        return false;
+    }
+    char path[32];
+    build_backfill_anchor_filename(source_kind, device_addr, path);
+    lfs_file_t file;
+    if (lfs_file_open(&s_lfs, &file, path, LFS_O_RDONLY) != 0) {
+        return false; // 這個(種類,位址)組合還沒存過定位點，例如第一次連線這台裝置
+    }
+    lfs_ssize_t n = lfs_file_read(&s_lfs, &file, out_anchor, 8);
+    lfs_file_close(&s_lfs, &file);
+    return n == 8;
+}
+
+void storage_set_backfill_anchor(uint8_t source_kind, const uint8_t device_addr[6], const uint8_t anchor[8]) {
     if (!s_lfs_mounted) {
         return;
     }
+    char path[32];
+    build_backfill_anchor_filename(source_kind, device_addr, path);
     lfs_file_t file;
-    if (lfs_file_open(&s_lfs, &file, BACKFILL_ANCHOR_FILENAME,
-                       LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) != 0) {
-        printf("[STORAGE] persist_backfill_anchor: lfs_file_open failed\n");
+    if (lfs_file_open(&s_lfs, &file, path, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) != 0) {
+        printf("[STORAGE] storage_set_backfill_anchor: lfs_file_open failed\n");
         return;
     }
-    lfs_file_write(&s_lfs, &file, s_backfill_anchor_valid, sizeof(s_backfill_anchor_valid));
-    lfs_file_write(&s_lfs, &file, s_backfill_anchor, sizeof(s_backfill_anchor));
+    lfs_file_write(&s_lfs, &file, anchor, 8);
     lfs_file_close(&s_lfs, &file);
 }
 
-bool storage_get_backfill_anchor(uint8_t source_kind, uint8_t out_anchor[8]) {
-    if (source_kind >= MAX_BACKFILL_ANCHOR_KINDS || !s_backfill_anchor_valid[source_kind]) {
-        return false;
-    }
-    memcpy(out_anchor, s_backfill_anchor[source_kind], 8);
-    return true;
-}
-
-void storage_set_backfill_anchor(uint8_t source_kind, const uint8_t anchor[8]) {
-    if (source_kind >= MAX_BACKFILL_ANCHOR_KINDS) {
+// 2026-09-24 新增：同步點是依 (裝置種類,藍牙位址) 存的，跟個案完全無關——
+// 換個案時如果不清掉，舊個案用過的實體裝置如果被拿來給新個案繼續用，
+// mode_ble_receive.c 的 should_limit_backfill_to_latest_only() 會因為「這台
+// 裝置的位址已經有同步點」誤判成「這台裝置在目前個案底下同步過」，繞過保守
+// 保底機制，讓舊個案殘留的資料有機會漏進新個案的待傳佇列（見該函式的說明，
+// 完整設計討論見 PROJECT_PLAN.md 第 6.6 節「換裝置給新個案」）。呼叫端
+// （mode_ap_config.c）偵測到 patient_id 變更時要呼叫這個函式。
+//
+// 檔名找出來先收集成一份清單、離開 lfs_dir_read() 迭代之後才刪，不在迭代
+// 過程中邊讀邊刪——littlefs 沒有明確保證邊迭代邊刪除目錄內容是安全的。
+#define MAX_BACKFILL_ANCHOR_FILES_TO_CLEAR 64
+void storage_clear_all_backfill_anchors(void) {
+    if (!s_lfs_mounted) {
         return;
     }
-    memcpy(s_backfill_anchor[source_kind], anchor, 8);
-    s_backfill_anchor_valid[source_kind] = true;
-    persist_backfill_anchor();
+    lfs_dir_t dir;
+    if (lfs_dir_open(&s_lfs, &dir, "/") != 0) {
+        printf("[STORAGE] storage_clear_all_backfill_anchors: lfs_dir_open failed\n");
+        return;
+    }
+    char names[MAX_BACKFILL_ANCHOR_FILES_TO_CLEAR][32];
+    size_t name_count = 0;
+    struct lfs_info info;
+    while (lfs_dir_read(&s_lfs, &dir, &info) > 0) {
+        if (info.type == LFS_TYPE_REG && strncmp(info.name, "bfa_", 4) == 0 &&
+            name_count < MAX_BACKFILL_ANCHOR_FILES_TO_CLEAR) {
+            strncpy(names[name_count], info.name, sizeof(names[name_count]) - 1);
+            names[name_count][sizeof(names[name_count]) - 1] = '\0';
+            name_count++;
+        }
+    }
+    lfs_dir_close(&s_lfs, &dir);
+    for (size_t i = 0; i < name_count; i++) {
+        lfs_remove(&s_lfs, names[i]);
+    }
+    printf("[STORAGE] cleared %u backfill anchor file(s) (patient reassigned).\n", (unsigned)name_count);
 }
 
 // 上傳成功的紀錄加進環狀歷史緩衝，跟待傳佇列（只保留還沒傳完的）是分開的兩份資料。

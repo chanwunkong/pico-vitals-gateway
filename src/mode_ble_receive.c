@@ -79,6 +79,13 @@ static uint32_t s_idle_timeout_ms;
 // （血氧計前面多了好幾個標準服務），handle 編號並不通用，混用會查詢失敗。
 static fora_device_kind_t s_current_kind = FORA_DEVICE_UNKNOWN;
 
+// 這一輪連線對象的藍牙位址，跟 s_current_kind 同時設定（掃描比對成功時）、
+// 同時清掉（斷線回到 IDLE 時），生命週期完全跟著這次連線走。2026-09-23
+// 加入，配合 storage_get/set_backfill_anchor() 改成用 (種類,位址) 分開存
+// 定位點——同一種類換了另一台實機（換血糖機、或同一台 gateway 輪流服務
+// 多台同型號裝置）時，彼此的同步進度不會再互相覆蓋，見 storage.h 的說明。
+static bd_addr_t s_current_device_addr;
+
 // 每種裝置拿到讀值之後，多久內不要再重新連線同一種裝置，讓裝置有機會走到
 // 它自己的休眠邏輯。這個冷卻時間**不是**每次進 BLE_RECEIVE 模式就重置，是
 // 跨越 BLE_RECEIVE/UPLOAD 模式切換持續有效的。依裝置種類分開追蹤，額溫槍的
@@ -103,15 +110,20 @@ static const uint32_t DEVICE_RECONNECT_COOLDOWN_MS[FORA_DEVICE_KIND_COUNT] = {
     // 同一次測試 session 其餘項目也抓完（見下面 record_backfill_state_t 的
     // 說明），冷卻時間跟這段翻頁無關。
     [FORA_DEVICE_MD6] = 10 * 1000,
-    // 2026-08-31 使用者實機測試後決定改長：GM700SB 的藍牙晶片是持續廣播的
-    // （不像其他裝置量測完才有動靜，見 handle_advertising_report() 的說明），
-    // 原本比照 MD6 抓 10 秒方便連續測試，但實機測試發現這代表 Gateway 幾乎
-    // 不間斷地重複連線/喚醒裝置，使用者希望比照其他裝置「量測完才連線」的
-    // 觀感，改成跟額溫槍一樣的 60 秒；同時見下面 HCI_EVENT_DISCONNECTION_
-    // COMPLETE 的處理，這個冷卻時間現在不管連線結果如何（成功讀到新資料、
+    // 2026-09-24 改成 1 小時，配合新加的「掃到廣播就自動觸發同步」設計
+    // （見 RIGHTEST_AUTO_TRIGGER_DELAY_MS 的說明）——2026-09-24 實測到
+    // GM700SB 斷線後會持續廣播約 27 分鐘才真的安靜下來，這個冷卻時間要蓋過
+    // 這段清醒時間，不然同一次清醒期間會被重複觸發好幾次自動同步（每次
+    // 觸發都會讓裝置發出提示音，見下面的說明），1 小時留了充裕的餘裕。
+    // 2026-08-31 原本改成 60 秒的理由（避免 MD6 那種 10 秒冷卻造成 Gateway
+    // 幾乎不間斷重複連線/喚醒裝置）已經不適用——當時還是「掃到就直接連」
+    // 的舊自動連線設計，那次實測後才改回「只有 KEY1／22:00 定時視窗內才
+    // 連」的保守版本；這次改成事件觸發＋夠長的冷卻，等於用今天量到的實測
+    // 數字重新驗證這個舊方向的可行性，見下面 HCI_EVENT_DISCONNECTION_
+    // COMPLETE 的處理，這個冷卻時間不管連線結果如何（成功讀到新資料、
     // 確認沒有新資料、解析失敗、逾時斷線）都會套用，不是只有
     // finish_rightest_session() 那幾個「乾淨結束」的路徑才有。
-    [FORA_DEVICE_RIGHTEST_GM700SB] = 60 * 1000,
+    [FORA_DEVICE_RIGHTEST_GM700SB] = 60 * 60 * 1000,
 };
 static absolute_time_t s_kind_cooldown_until[FORA_DEVICE_KIND_COUNT];
 
@@ -325,13 +337,21 @@ static bool s_rightest_sync_anchor_valid;
 // 2026-09-01 曾經改成純手動觸發，2026-09-02 一度改成跟 FORA 系列一樣的
 // 自動連線＋冷卻模式（見 git 歷史/PROJECT_PLAN.md §6.6），但實機測試發現
 // GM700SB 連線嘗試本身會讓裝置發出提示音——FORA 系列裝置只有量測完那段
-// 時間才廣播，自動連線自然稀疏；GM700SB 不管有沒有人在用都持續廣播，改成
-// 自動連線等於每次冷卻一到就再嘗試一次、再響一次，病患會持續被打擾。
-// **最終定案**：GM700SB 不做背景自動連線，只有兩種觸發來源會真的去比對/
-// 連線，見 s_rightest_manual_sync_active 宣告處的說明：
-//   1. KEY1 短按——護理人員臨時要用時手動觸發。
-//   2. 每天固定時間自動觸發一次——見 RIGHTEST_AUTO_SYNC_HOUR，一天最多讓
-//      裝置被連線嘗試/響一次，不是每次冷卻到期就響。
+// 時間才廣播，自動連線自然稀疏；GM700SB 不管有沒有人在用都持續廣播，當時
+// 冷卻只有 60 秒（比照額溫槍），改成自動連線等於裝置清醒的這段時間內每
+// 60 秒就再嘗試一次、再響一次，病患被連續打擾。**2026-09-02 因此改成
+// GM700SB 不做背景自動連線**，只有 KEY1 短按／每天定時觸發兩種來源才會
+// 比對/連線，見 s_rightest_manual_sync_active 宣告處的說明。
+//
+// **2026-09-24 重新加回事件觸發自動同步**：實測到 GM700SB 斷線後會持續
+// 廣播約 27 分鐘才真的安靜下來（見 PROJECT_PLAN.md 第 6.6 節），代表當初
+// 「自動連線=被打擾好幾次」的根因其實是冷卻時間（60 秒）遠比裝置清醒時間
+// （~27 分鐘）短，不是「事件觸發」這個機制本身有問題。改成：**第一次掃到
+// GM700SB 廣播就排定一個延遲觸發**（見 RIGHTEST_AUTO_TRIGGER_DELAY_MS），
+// 冷卻時間同時拉長到 1 小時（`DEVICE_RECONNECT_COOLDOWN_MS`），確保同一次
+// 清醒期間只會觸發一次、只響一聲。KEY1 手動觸發／每天 22:00 定時觸發兩條
+// 路徑原封不動保留當備援（裝置剛好沒被掃到、或想立即強制同步時還是用得
+// 到），三者不衝突，都是走同一個 s_rightest_manual_sync_active 視窗機制。
 //
 // KEY1_LONG_PRESS_HOLD_MS 同時是「短按觸發 GM700SB 同步」跟「長按觸發 WiFi/
 // 上傳」（見 mode_ble_receive_run() 主迴圈）的分界門檻——放開時按住時間小於
@@ -339,12 +359,24 @@ static bool s_rightest_sync_anchor_valid;
 // 的長按門檻（KEY0_ENTER_CONFIG_HOLD_MS）統一成 3 秒，避免同一台裝置上不同
 // 按鍵的「長按」判定標準不一致，容易誤觸或搞混。
 #define KEY1_LONG_PRESS_HOLD_MS 3000
-// 按了 KEY1 或每天定時觸發之後，最多等這麼久沒掃到 GM700SB 就自動放棄、
-// 恢復忽略 GM700SB 廣播——避免視窗無限期留著，之後裝置隨便什麼時候出現
-// 都會被自動連上、變相又回到全自動背景連線（就是要避免的提示音打擾）。
+// 按了 KEY1／每天定時觸發／事件自動觸發之後，最多等這麼久沒掃到 GM700SB
+// 就自動放棄、恢復忽略 GM700SB 廣播——避免視窗無限期留著，之後裝置隨便
+// 什麼時候出現都會被自動連上，變相又回到全自動背景連線（就是要避免的
+// 提示音打擾）。
 #define RIGHTEST_MANUAL_SYNC_WINDOW_MS (30 * 1000)
 static bool s_rightest_manual_sync_active = false;
 static absolute_time_t s_rightest_manual_sync_until;
+
+// 2026-09-24 新增：第一次掃到 GM700SB 廣播（不在既有視窗內、也還沒排定過
+// 延遲觸發、冷卻時間也已經過了）就記下這個時間點，排定多久之後要真的開啟
+// 同步視窗（等同軟體幫使用者按一次 KEY1）。**暫時設 0**（使用者 2026-09-24
+// 決定）——代表偵測到廣播後幾乎立刻觸發，不刻意等待；之後如果想給病患留
+// 一點時間把裝置收好再連線，只要調大這個數字即可，其餘邏輯不用動。真正
+// 防止同一次清醒期間被重複觸發好幾次的是冷卻時間（1 小時，見
+// DEVICE_RECONNECT_COOLDOWN_MS 的說明），不是這個延遲本身。
+#define RIGHTEST_AUTO_TRIGGER_DELAY_MS 0
+static bool s_rightest_auto_trigger_pending = false;
+static absolute_time_t s_rightest_auto_trigger_at;
 
 // 每天固定時間自動打開一次跟 KEY1 短按完全相同的同步視窗（等同軟體幫使用者
 // 按一次 KEY1），給居家照護情境用——個案端裝置留在家中跟 PICO 同一個空間，
@@ -359,6 +391,12 @@ static absolute_time_t s_rightest_manual_sync_until;
 static int64_t s_rightest_auto_sync_last_local_day = -1;
 
 static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+
+// 2026-09-24 新增，定義見 process_reading_payload() 前面——GM700SB 的
+// backfill（RIGHTEST_SESSION_WAIT_RECORD）在檔案裡的位置比定義處早，需要
+// 前向宣告才能呼叫。
+static bool record_measured_after_patient_cutoff(uint32_t device_measured_key);
+static bool should_limit_backfill_to_latest_only(bool anchor_valid);
 
 // 畫面顯示用的個案設定，開機/每次進入這個模式時讀一次 flash 就好（讀取本身
 // 很便宜），不需要每輪迴圈重讀。設定還沒存過（例如從沒進過 AP_CONFIG）的話
@@ -787,7 +825,8 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             // 每次連線一律從 index=1 開始往舊的方向讀，讀到跟舊定位點完全
             // 相同的內容就代表後面全部都同步過了，停手斷線。
             s_rightest_sync_anchor_valid =
-                storage_get_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, s_rightest_sync_anchor);
+                storage_get_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB,
+                                             s_current_device_addr, s_rightest_sync_anchor);
             if (s_rightest_summary.total_count == 0) {
                 printf("[BLE] rightest: device reports no records.\n");
                 finish_rightest_session();
@@ -796,6 +835,15 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             s_rightest_next_index = 1;
             s_rightest_target_count = s_rightest_summary.total_count > RECORD_BACKFILL_SAFETY_CAP
                 ? RECORD_BACKFILL_SAFETY_CAP : s_rightest_summary.total_count;
+            // 2026-09-24 新增：個案生效時間戳還沒補上、這台裝置位址又從沒
+            // 同步過——沒有依據分辨新舊個案，保守起見只讀 index=1（這次連線
+            // 當下最新那筆），不往回翻頁補歷史，見
+            // should_limit_backfill_to_latest_only() 的說明。
+            if (should_limit_backfill_to_latest_only(s_rightest_sync_anchor_valid) && s_rightest_target_count > 1) {
+                printf("[BLE] rightest: no sync anchor and patient cutoff not yet known, "
+                       "limiting to latest record only (not backfilling history).\n");
+                s_rightest_target_count = 1;
+            }
             printf("[BLE] rightest: reading records index=1..%u (newest first)...\n",
                    s_rightest_target_count);
             s_rightest_session_state = RIGHTEST_SESSION_WAIT_RECORD;
@@ -826,6 +874,16 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             vital_record_t record;
             bool parsed = rightest_protocol_parse_record(frame, frame_len, &record);
             rightest_reassembly_reset(&s_rightest_reassembly);
+            // 2026-09-24 新增：backfill 往回翻頁翻到「個案生效時間之前」量測
+            // 的記錄，代表後面（更舊的）全部都是別的個案留下的資料，直接
+            // 停手斷線，見 record_measured_after_patient_cutoff() 的說明。
+            if (parsed && !record_measured_after_patient_cutoff(record.device_measured_key)) {
+                printf("[BLE] rightest: index=%u measured before patient assignment cutoff, "
+                       "stopping backfill (older records likely belong to a different patient).\n",
+                       s_rightest_next_index);
+                finish_rightest_session();
+                return;
+            }
             // 這筆記錄有沒有真的「處理完」：解析失敗（checksum/Hi-flag/QC，
             // 不是病人數值）算處理完，以後都不用再理它；解析成功但
             // commit_records() 回傳 false（待傳佇列剛好滿了，見 storage.c
@@ -850,7 +908,8 @@ static void handle_rightest_notification(const uint8_t *value, uint16_t value_le
             // 結果無關；index=1 沒處理完（待傳佇列滿了）就不能更新，否則下次
             // 連線會誤判成「已經同步過」，這筆資料就永久遺失了。
             if (s_rightest_next_index == 1 && handled && frame_ok) {
-                storage_set_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB, record_identity);
+                storage_set_backfill_anchor((uint8_t)FORA_DEVICE_RIGHTEST_GM700SB,
+                                             s_current_device_addr, record_identity);
             }
             s_rightest_next_index++;
             if (s_rightest_next_index > s_rightest_target_count) {
@@ -922,6 +981,18 @@ static void handle_record_backfill_notification(const uint8_t *value, uint16_t v
 
             vital_record_t records[FORA_MAX_READINGS_PER_NOTIFICATION];
             size_t count = fora_protocol_parse_reading(s_current_kind, combined, sizeof(combined), records);
+            // 2026-09-24 新增：backfill 往回翻頁翻到「個案生效時間之前」量測的
+            // 記錄，代表後面（更舊的）全部都是別的個案留下的資料，直接停手
+            // 斷線，不採信這一筆、也不繼續往回翻，見
+            // record_measured_after_patient_cutoff() 的說明。
+            if (count > 0 && !record_measured_after_patient_cutoff(records[0].device_measured_key)) {
+                printf("[BLE] kind=%d index=%u measured before patient assignment cutoff, "
+                       "stopping backfill (older records likely belong to a different patient).\n",
+                       s_current_kind, s_record_backfill_next_index);
+                s_record_backfill_state = RECORD_BACKFILL_IDLE;
+                gap_disconnect(s_connection_handle);
+                break;
+            }
             if (count > 0) {
                 commit_records(records, count);
                 s_record_backfill_consecutive_skips = 0;
@@ -982,6 +1053,40 @@ static void handle_oximeter_reading(const vital_record_t *records, size_t record
     }
 }
 
+// 2026-09-24 新增：防止「換一台別的個案用過的血壓計/MD6/血糖機給這個個案」
+// 時，裝置裡殘留的舊個案記錄被誤當成這個個案的資料上傳——只有血壓計/MD6/
+// GM700SB 這幾種有裝置時間戳、會做 backfill 往回翻頁的裝置才需要這個檢查
+// （額溫槍/血氧計沒有 device_measured_key、也沒有歷史回補功能，不會呼叫到
+// 這裡）。設計討論見 PROJECT_PLAN.md 第 6.6 節「換裝置給新個案」。
+//
+// s_display_config.patient_assigned_since_epoch_ms 是 0 代表「這個個案的
+// 生效時間戳還沒補上」（通常是 AP_CONFIG 剛設定完、Pico 還沒校時成功的那一
+// 小段時間）——這種情況下這裡沒有依據可以判斷，一律放行，呼叫端要另外用
+// should_limit_backfill_to_latest_only() 決定要不要保守處理，兩個函式合起來
+// 才是完整的防護，見該函式的說明。
+static bool record_measured_after_patient_cutoff(uint32_t device_measured_key) {
+    if (!s_have_display_config || s_display_config.patient_assigned_since_epoch_ms == 0) {
+        return true;
+    }
+    if (device_measured_key == 0) {
+        return true; // 沒有裝置時間戳可比對的裝置不會走到 backfill，這裡純粹保險
+    }
+    uint64_t measured_epoch_ms = fora_protocol_measured_key_to_epoch_ms(device_measured_key);
+    return measured_epoch_ms >= s_display_config.patient_assigned_since_epoch_ms;
+}
+
+// 2026-09-24 新增：個案生效時間戳還沒補上（見 record_measured_after_patient_
+// cutoff() 的說明）、而且這台裝置的位址又是第一次同步（沒有既有的 backfill
+// 同步點）——這個組合下沒有任何依據能分辨「這是新個案自己剛量的資料」還是
+// 「裝置裡殘留的舊個案資料」，保守起見只收這次連線當下最新那一筆，不往回
+// 翻頁補歷史，寧可漏掉個案自己在生效前幾筆資料，也不要誤植別的個案的資料。
+// 只要裝置位址曾經同步成功過一次（anchor_valid），代表這台裝置從那之後就是
+// 在這個個案底下用的，不受這條規則限制，恢復正常 backfill。
+static bool should_limit_backfill_to_latest_only(bool anchor_valid) {
+    bool cutoff_known = s_have_display_config && s_display_config.patient_assigned_since_epoch_ms != 0;
+    return !cutoff_known && !anchor_valid;
+}
+
 // 三種裝置的 Notify payload 都送進這裡解析——共用同一份解析邏輯，但血氧計
 // 走觀察視窗（見 handle_oximeter_reading() 的說明），其他兩種裝置量到就直接
 // commit。不管走哪條路，處理完都主動斷線，回到掃描狀態等下一次連線。
@@ -1004,7 +1109,7 @@ static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
         // 定位點的地方，backfill 往回翻頁時用的是同一份，不會每翻一頁重讀。
         if (backfillable) {
             s_backfill_sync_anchor_valid =
-                storage_get_backfill_anchor((uint8_t)s_current_kind, s_backfill_sync_anchor);
+                storage_get_backfill_anchor((uint8_t)s_current_kind, s_current_device_addr, s_backfill_sync_anchor);
         }
         bool already_synced = backfillable && s_backfill_sync_anchor_valid && value_len >= 8 &&
             memcmp(value, s_backfill_sync_anchor, 8) == 0;
@@ -1017,16 +1122,37 @@ static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
             return;
         }
 
+        // 2026-09-24 新增：index=0（這次連線裝置回報的最新一筆）也要先過一次
+        // 個案生效時間戳的檢查——換一台別的個案用過的裝置時，如果 Gateway
+        // 剛好在裝置沒有真的量到新資料的情況下連上去（例如裝置還在冷卻廣播
+        // 期間），index=0 可能還是那台裝置殘留的舊個案資料，不能無條件當成
+        //「這次量到的新值」直接收。見 record_measured_after_patient_cutoff()
+        // 的說明。
+        bool index0_after_cutoff = record_measured_after_patient_cutoff(
+            record_count > 0 ? records[0].device_measured_key : 0);
+        if (!index0_after_cutoff) {
+            printf("[BLE] kind=%d index=0 measured before patient assignment cutoff, "
+                   "discarding (likely belongs to a different patient), not backfilling.\n",
+                   s_current_kind);
+            s_kind_cooldown_until[s_current_kind] = make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[s_current_kind]);
+            gap_disconnect(s_connection_handle);
+            return;
+        }
+
         commit_records(records, record_count);
         s_kind_cooldown_until[s_current_kind] = make_timeout_time_ms(DEVICE_RECONNECT_COOLDOWN_MS[s_current_kind]);
-        if (backfillable && s_record_backfill_state == RECORD_BACKFILL_IDLE) {
+        // 2026-09-24 新增：個案生效時間戳還沒補上、這台裝置位址又從沒同步過
+        // ——沒有依據分辨新舊個案，保守起見不往回翻頁補歷史，只收剛剛已經
+        // commit 的這一筆，見 should_limit_backfill_to_latest_only() 的說明。
+        bool limit_to_latest = should_limit_backfill_to_latest_only(s_backfill_sync_anchor_valid);
+        if (backfillable && s_record_backfill_state == RECORD_BACKFILL_IDLE && !limit_to_latest) {
             // 這是新資料，把它記成新的「上次同步到哪」定位點——注意這裡存的是
             // s_backfill_sync_anchor_valid/s_backfill_sync_anchor 載入時的舊值
             // 已經不需要了，可以放心覆寫成新值；backfill 往回翻頁比對用的是
             // 呼叫 storage_get_backfill_anchor() 當下複製出來的那份，不會受
             // 這裡 storage_set_backfill_anchor() 寫回 flash 影響。
             if (value_len >= 8) {
-                storage_set_backfill_anchor((uint8_t)s_current_kind, value);
+                storage_set_backfill_anchor((uint8_t)s_current_kind, s_current_device_addr, value);
             }
             // index=0 這筆已經正式存進待傳佇列了，先別斷線，繼續往回翻頁把
             // 這次連線視窗內裝置回報的其他記錄也抓完，見 record_backfill_state_t
@@ -1034,6 +1160,14 @@ static void process_reading_payload(const uint8_t *value, uint16_t value_len) {
             printf("[BLE] index=0 record committed, backfilling remaining records...\n");
             s_record_backfill_state = RECORD_BACKFILL_WAITING_COUNT;
             send_bp_get_record_count();
+            return;
+        } else if (backfillable && limit_to_latest && value_len >= 8) {
+            // 不往回翻頁，但這一筆已經正式收了，還是要把同步點設在這裡，
+            // 不然下次連線又會重新判斷一次（無害但多繞一輪）。
+            printf("[BLE] no sync anchor and patient cutoff not yet known, "
+                   "limiting to latest record only (not backfilling history).\n");
+            storage_set_backfill_anchor((uint8_t)s_current_kind, s_current_device_addr, value);
+            gap_disconnect(s_connection_handle);
             return;
         }
     }
@@ -1117,6 +1251,20 @@ static void handle_advertising_report(uint8_t *packet) {
 
     debug_print_advertisement(packet, adv_data, adv_len);
 
+    // 2026-09-24 新增：事件觸發自動同步——第一次掃到 GM700SB 廣播、目前沒有
+    // 視窗開著、也還沒排定過延遲觸發、冷卻時間也已經過了，就排定一個延遲
+    // 觸發（見 RIGHTEST_AUTO_TRIGGER_DELAY_MS 的說明，目前設 0）。這裡只負責
+    // 「排定」，真正開視窗/連線是主迴圈裡 time_reached() 判斷成立之後才做，
+    // 不在這個事件 callback 裡直接動作。
+    if (!s_rightest_manual_sync_active && !s_rightest_auto_trigger_pending &&
+        time_reached(s_kind_cooldown_until[FORA_DEVICE_RIGHTEST_GM700SB]) &&
+        rightest_protocol_matches_advertisement(adv_data, adv_len)) {
+        printf("[BLE] rightest: detected broadcast, scheduling auto-sync in %us...\n",
+               (unsigned)(RIGHTEST_AUTO_TRIGGER_DELAY_MS / 1000));
+        s_rightest_auto_trigger_pending = true;
+        s_rightest_auto_trigger_at = make_timeout_time_ms(RIGHTEST_AUTO_TRIGGER_DELAY_MS);
+    }
+
     fora_device_kind_t kind = FORA_DEVICE_UNKNOWN;
     bool matched = fora_protocol_matches_advertisement(adv_data, adv_len, &kind);
     if (!matched && s_rightest_manual_sync_active &&
@@ -1129,10 +1277,11 @@ static void handle_advertising_report(uint8_t *packet) {
         // 這個 Service UUID 粗篩是唯一的身份確認機制，見
         // PROJECT_PLAN.md 第 6.6 節（誤配對到其他 0xFEE0 裝置的風險見那裡）。
         // GM700SB 廣播是持續性的，平常掃描到就直接忽略，只有
-        // s_rightest_manual_sync_active 是 true 的這段期間（KEY1 短按或
-        // 每天定時觸發）才會真的比對/連線——刻意不比照 FORA 系列掃到就連，
-        // 因為連線嘗試本身會讓 GM700SB 發出提示音，背景持續自動連線會一直
-        // 打擾病患，見上面宣告處的說明。
+        // s_rightest_manual_sync_active 是 true 的這段期間（KEY1 短按、每天
+        // 定時觸發、或上面新加的事件自動觸發）才會真的比對/連線——不是
+        // 隨便掃到就連，是因為連線嘗試本身會讓 GM700SB 發出提示音，這三種
+        // 觸發來源都各自有節流機制（視窗逾時、每天一次、冷卻時間）避免
+        // 打擾病患太頻繁，見上面宣告處的說明。
         kind = FORA_DEVICE_RIGHTEST_GM700SB;
         matched = true;
     }
@@ -1149,6 +1298,7 @@ static void handle_advertising_report(uint8_t *packet) {
     bd_addr_type_t addr_type = gap_event_advertising_report_get_address_type(packet);
 
     s_current_kind = kind;
+    memcpy(s_current_device_addr, addr, sizeof(bd_addr_t));
     printf("[BLE] matched device %s (kind=%d), connecting...\n", bd_addr_to_str(addr), kind);
 
     gap_stop_scan();
@@ -1754,6 +1904,16 @@ mode_ble_receive_exit_t mode_ble_receive_run(uint32_t idle_timeout_ms) {
         if (s_rightest_manual_sync_active && time_reached(s_rightest_manual_sync_until)) {
             printf("[BLE] rightest: manual sync window expired without finding the device.\n");
             s_rightest_manual_sync_active = false;
+        }
+
+        // 2026-09-24 新增：事件觸發自動同步的延遲時間到了，開跟 KEY1 短按
+        // 完全一樣的同步視窗——見 handle_advertising_report() 排定這個計時器
+        // 的說明、RIGHTEST_AUTO_TRIGGER_DELAY_MS 宣告處的說明。
+        if (s_rightest_auto_trigger_pending && time_reached(s_rightest_auto_trigger_at)) {
+            printf("[BLE] rightest: auto-sync delay elapsed, opening sync window...\n");
+            s_rightest_auto_trigger_pending = false;
+            s_rightest_manual_sync_active = true;
+            s_rightest_manual_sync_until = make_timeout_time_ms(RIGHTEST_MANUAL_SYNC_WINDOW_MS);
         }
 
         // 每天 RIGHTEST_AUTO_SYNC_HOUR 點自動打開一次同步視窗，等同軟體幫
